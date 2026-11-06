@@ -201,6 +201,10 @@ impl Engine {
             return Ok(Runner::Cpu(m, State::new(&m.cfg)));
         };
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
+        // Before the first weight is uploaded: fail if a pipeline these weight types need does not fit the device's
+        // shared memory (Vulkan; a no-op elsewhere). No pipeline or model buffer exists yet.
+        let types = rusting_strata::gpu_model::gpu_weight_types(&m.w.g);
+        for b in &bk { b.preflight(&types, false)?; }
         let mut g = if self.parallel > 1 {
             if self.mtp() > 0 { eprintln!("--parallel: decoding without MTP drafts"); }
             self.mtp = Some(0);
