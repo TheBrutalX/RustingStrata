@@ -229,9 +229,10 @@ sampling noise from expert placement (`--fixed-experts`) or scheduling.
 Deviation note (below the 99% either-mode bar; issue #6 requirement "if below the bar, do not
 write verdict PASS"):
 
-- 629/640 (98.28%) is 5 positions short of the 634/640 gate and 1 position short of the 3060's
-  633/640 lower rep. The default path is *better* here (630/640), the opposite of the 3060
-  (98.85% default vs 99.32% parity mode).
+- 629/640 (98.28%) is 5 positions short of the 634/640 gate; the 3060 parity-mode runs scored
+  635-637/640 either-mode (99.32%), so this is 6-8 positions and ~1 point below that range.
+  The default path is *better* here (630/640), the opposite of the 3060 (98.85% default vs
+  99.32% parity mode).
 - The 3060 bar was measured against a **CPU** llama.cpp build; this run used the **CUDA** build
   with flash attention disabled by the build itself (issue #34 already saw 97.34% strict against
   a CUDA-build reference). llama.cpp's own two modes agree on only 630/640 (98.44%) here, so the
