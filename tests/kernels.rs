@@ -248,6 +248,20 @@ fn gemv_bandwidth() {
 
 fn f16r(v: f32) -> f32 { half::f16::from_f32(v).to_f32() }
 
+/// The f16 value the Vulkan f16 GEMM path (`packFloat2x16(f16vec2(..))`, SPIR-V `OpFConvert`) sees on this driver:
+/// the conversion truncates toward zero instead of rounding to nearest even. A reference built with it compares the
+/// kernel, not the driver's conversion; a 1-ulp input difference would otherwise read as a kernel error.
+fn f16tz(v: f32) -> f32 {
+    let h = half::f16::from_f32(v);
+    let b = h.to_bits();
+    let mag = b & 0x7fff;
+    if h.to_f32().abs() > v.abs() && mag > 1 { half::f16::from_bits((b & 0x8000) | (mag - 1)).to_f32() } else { h.to_f32() }
+}
+
+/// The f16 conversion the backend's f16 GEMM uses: CUDA `__float2half` rounds to nearest even; the Vulkan shader's
+/// `OpFConvert` truncates toward zero on the NVIDIA Volta driver.
+fn f16_in(bk: &str, v: f32) -> f32 { if bk == "vulkan" { f16tz(v) } else { f16r(v) } }
+
 /// Tensor-core GEMM over a tile list matches per-row dot products, for every type, with a gathered X and partial
 /// tiles. Types on the int8 path (`Gpu::mmq`) see X as int8 per 32 (as the GEMV path does), the others fp16 inputs.
 #[test]
@@ -283,7 +297,7 @@ fn gemm_matches_reference_for_every_type() {
                     want[i * rows + r] = if Gpu::mmq(t.ty) {
                         wr.iter().zip(as_seen(t.ty, xv)).map(|(a, b)| a * b).sum()
                     } else {
-                        wr.iter().zip(xv).map(|(a, b)| f16r(*a) * f16r(*b)).sum()
+                        wr.iter().zip(xv).map(|(a, b)| f16_in(bk, *a) * f16_in(bk, *b)).sum()
                     };
                 }
             }
@@ -1183,7 +1197,7 @@ fn gemv_partial_superblocks_and_q2_0() {
                     t.row(r, &mut wr);
                     for (i, xv) in xm.chunks(cols).enumerate() {
                         want[i * rows + r] = if Gpu::mmq(ty) && cols % 128 == 0 { wr.iter().zip(as_seen(ty, xv)).map(|(a, b)| a * b).sum() }
-                                             else { wr.iter().zip(xv).map(|(a, b)| f16r(*a) * f16r(*b)).sum() };
+                                             else { wr.iter().zip(xv).map(|(a, b)| f16_in(bk, *a) * f16_in(bk, *b)).sum() };
                     }
                 }
                 let e = rel_l2(&down::<f32>(gpu, &dym), &want);
@@ -1232,6 +1246,10 @@ fn vulkan_type_matrix() {
         let (mut dequant, mut gemv, mut gemvn, mut gemvq, mut moe_gemv, mut gemm_dense, mut gemm) =
             ("pass", "pass", "pass", "pass", "pass", "pass", "pass");
         let mut note = if matches!(ty, GgmlType::Q4_0 | GgmlType::Q5_0) { "native bytes; loader uploads Q8_0".to_string() } else { String::new() };
+        // The f16 GEMM path converts its operands with packFloat2x16; on this Volta driver OpFConvert truncates.
+        if matches!(ty, GgmlType::F32 | GgmlType::BF16 | GgmlType::IQ2XS | GgmlType::IQ2S) {
+            note = format!("{note}{}f16 GEMM inputs truncate (Volta OpFConvert); reference matches", if note.is_empty() { "" } else { "; " });
+        }
         let data = random_tensor(ty, ne * rows, cols, cols as u32 + ty as u32);
         let all = Tensor { ty, cols, rows: ne * rows, data: &data };
         let t = Tensor { rows, data: &data[..ty.row_bytes(cols as u64) * rows], ..all };
@@ -1329,7 +1347,7 @@ fn vulkan_type_matrix() {
                     t.row(r, &mut wr);
                     for (i, xv) in xm.chunks(cols).enumerate() {
                         want[i * rows + r] = if Gpu::mmq(ty) && cols % 128 == 0 { wr.iter().zip(as_seen(ty, xv)).map(|(a, b)| a * b).sum() }
-                                             else { wr.iter().zip(xv).map(|(a, b)| f16r(*a) * f16r(*b)).sum() };
+                                             else { wr.iter().zip(xv).map(|(a, b)| f16tz(*a) * f16tz(*b)).sum() };
                     }
                 }
                 let e = rel_l2(&down::<f32>(gpu, &dym), &want);
@@ -1354,7 +1372,7 @@ fn vulkan_type_matrix() {
                     for (i, &xri) in xrow.iter().enumerate() {
                         let xv = &xr[xri as usize * cols..][..cols];
                         want[i * rows + r] = if Gpu::mmq(ty) { wr.iter().zip(as_seen(ty, xv)).map(|(a, b)| a * b).sum() }
-                                             else { wr.iter().zip(xv).map(|(a, b)| f16r(*a) * f16r(*b)).sum() };
+                                             else { wr.iter().zip(xv).map(|(a, b)| f16tz(*a) * f16tz(*b)).sum() };
                     }
                 }
                 let e = rel_l2(&got, &want);
@@ -1472,7 +1490,12 @@ fn f16_weight_uploads_as_f32() {
         assert!(e <= 1e-5, "{bk} gemvn rel err {e}");
         let dy = gpu.zeros::<f32>(nt * rows).unwrap();
         gpu.gemm_dense(&dt, nt, dx.addr(), cols, dy.addr(), rows, 0).unwrap();
-        let e = rel_l2(&down::<f32>(gpu, &dy), &want);
+        // The prefill path converts x and w to f16; the decode paths above read them as f32.
+        let wantg: Vec<f32> = (0..nt * rows).map(|i| {
+            let (m, r) = (i / rows, i % rows);
+            (0..cols).map(|c| f16_in(bk, wf[r * cols + c]) as f64 * f16_in(bk, x[m * cols + c]) as f64).sum::<f64>() as f32
+        }).collect();
+        let e = rel_l2(&down::<f32>(gpu, &dy), &wantg);
         eprintln!("{bk}: gemm_dense rel err {e:.2e}");
         assert!(e <= 1e-5, "{bk} gemm_dense rel err {e}");
     }
