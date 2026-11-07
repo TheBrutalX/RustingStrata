@@ -297,6 +297,16 @@ fn gemm_matches_reference_for_every_type() {
             // The path this backend's launcher takes: int8 needs the type policy *and* the arch (sm_70 CUDA has no
             // int8 tensor cores) *and* 16-byte aligned q8 rows (src/cuda/mod.rs:342).
             let int8 = gpu.mmq(t.ty) && t.cols % 128 == 0;
+            // CUDA's `__float2half` rounds f16 operands, this Vulkan driver's `OpFConvert` truncates (f16tz/f16_in).
+            // Where the two disagree on this tensor's operands the two f16 GEMMs multiply different numbers.
+            let same_f16 = int8 || {
+                let mut all = x.iter().all(|&v| f16tz(v) == f16r(v));
+                for r in 0..rows {
+                    t.row(r, &mut wr);
+                    all &= wr.iter().all(|&v| f16tz(v) == f16r(v));
+                }
+                all
+            };
             for r in 0..rows {
                 t.row(r, &mut wr);
                 for (i, &xr) in xrow.iter().enumerate() {
@@ -313,19 +323,23 @@ fn gemm_matches_reference_for_every_type() {
             assert!(e <= 1e-4, "{} gemm ({name}): rel err {e}", ty.name());
             // Vulkan without cooperative matrices sums the f16 products in another order than mma.sync.
             if bk == "vulkan" && !int8 && std::env::var_os("STRATA_VK_NO_COOP").is_some() { continue; }
-            // Cross-backend: bit for bit between backends on the same GEMM path, except by tolerance where an sm_70
-            // CUDA backend is involved (its `mma16816` sums the same f16 products in another order). Two backends on
-            // different paths (sm_70 CUDA f16 vs Vulkan int8) differ by the int8 quantization of X, so that figure is
-            // recorded, not asserted: the per-backend reference above at 1e-4 is what catches a wrong kernel.
+            // Cross-backend: bit for bit between backends on the same GEMM math and f16 operands, except by tolerance
+            // where an sm_70 CUDA backend is involved (its `mma16816` sums the same f16 products in another order).
+            // Backends whose math differs (sm_70 CUDA f16 vs Vulkan int8 for an int8 type, a truncating f16
+            // conversion, and Vulkan order without cooperative matrices) are recorded, not asserted: the per-backend
+            // reference above at 1e-4 is what catches a wrong kernel, and the measured figure goes in the PR.
             let key = (name.clone(), int8);
             match first.entry(key) {
                 std::collections::hash_map::Entry::Vacant(v) => { v.insert((bk, gpu.volta(), got.clone())); }
                 std::collections::hash_map::Entry::Occupied(o) => {
                     let &(bk0, volta, ref f) = o.get();
                     let bits = got.iter().zip(f.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-                    if volta || gpu.volta() {
+                    if !same_f16 {
+                        eprintln!("{:8} {name}: {bk} vs {bk0} (different f16 input conversion, recorded): rel err {:.2e}",
+                            ty.name(), rel_l2(&got, f));
+                    } else if volta || gpu.volta() {
                         let e = rel_l2(&got, f);
-                        eprintln!("{:8} {name}: gemm on {bk} vs {bk0} (same path): rel err {e:.2e}", ty.name());
+                        eprintln!("{:8} {name}: gemm on {bk} vs {bk0} (same math): rel err {e:.2e}", ty.name());
                         assert!(e <= 1e-4, "{} gemm ({name}) on {bk}: rel err {e} vs {bk0}", ty.name());
                     } else {
                         assert_eq!(bits, 0, "{} gemm ({name}) on {bk}: {bits} values differ from {bk0}", ty.name());
@@ -334,7 +348,7 @@ fn gemm_matches_reference_for_every_type() {
             }
             if let Some((bk0, f0)) = last.insert(name.clone(), (bk, got.clone())) {
                 if bk0 != bk {
-                    eprintln!("{:8} {name}: {bk} vs {bk0} (different GEMM paths, recorded): rel err {:.2e}",
+                    eprintln!("{:8} {name}: {bk} vs {bk0} (different GEMM math, recorded): rel err {:.2e}",
                         ty.name(), rel_l2(&got, &f0));
                 }
             }
