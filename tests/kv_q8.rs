@@ -139,7 +139,8 @@ fn q8_multi_slot_matches_single() {
     for k in 0..3 {
         let rows: Vec<(usize, u32, bool)> = (0..3).map(|s| (s, toks[s][k], true)).collect();
         for (s, (t, l)) in gm.step_rows(&rows).unwrap().into_iter().enumerate() {
-            assert_eq!(t, toks[s][k], "slot {s} step {k}: greedy token");
+            // `t` is the argmax after the fed token: the next reference token, when there is one.
+            if let Some(&next) = toks[s].get(k + 1) { assert_eq!(t, next, "slot {s} step {k}: greedy token"); }
             got[s].push(l);
         }
     }
