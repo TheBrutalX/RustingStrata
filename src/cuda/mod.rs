@@ -239,16 +239,17 @@ fn dyn_shmem_optin(need: usize, stat: usize, optin: usize) -> Option<usize> {
     (need > DEFAULT).then(|| need.min(optin.saturating_sub(stat)))
 }
 
-/// `STRATA_SMEM_CARVEOUT`: `off` leaves the driver default (C1 baseline), `min` additionally picks the minimal
-/// fitting carveout for the static-only GEMM families (C1's gemm half), anything else is the R3 policy.
+/// `STRATA_SMEM_CARVEOUT`: the default `off` leaves the driver default, which the M2-T3 window measured as the
+/// fastest (C1 was rejected); `policy` enables the R3 decision, `min` additionally picks the minimal fitting
+/// carveout for the static-only GEMM families (C1's gemm half).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CarveoutMode { Off, Policy, Min }
 
 fn carveout_mode_from(v: Option<&str>) -> CarveoutMode {
     match v.map(str::trim) {
-        Some("0" | "off" | "none" | "false") => CarveoutMode::Off,
+        Some("policy") => CarveoutMode::Policy,
         Some("min") => CarveoutMode::Min,
-        _ => CarveoutMode::Policy,
+        _ => CarveoutMode::Off,
     }
 }
 
@@ -1250,10 +1251,10 @@ mod tests {
     #[test]
     fn carveout_mode_parsing() {
         assert_eq!(super::carveout_mode_from(Some("off")), super::CarveoutMode::Off);
-        assert_eq!(super::carveout_mode_from(Some("0")), super::CarveoutMode::Off);
+        assert_eq!(super::carveout_mode_from(None), super::CarveoutMode::Off);
         assert_eq!(super::carveout_mode_from(Some("min")), super::CarveoutMode::Min);
-        assert_eq!(super::carveout_mode_from(None), super::CarveoutMode::Policy);
         assert_eq!(super::carveout_mode_from(Some("policy")), super::CarveoutMode::Policy);
+        assert_eq!(super::carveout_mode_from(Some("0")), super::CarveoutMode::Off);
     }
 
     /// M2-T3, CPU-only: the carveout decision. Never request less than the launch needs, never request where the
