@@ -597,8 +597,11 @@ impl Gpu {
     /// `STRATA_RPW_DENSE` (k == 1) override one family, which is the granularity the M2-T5 sweep needs.
     fn rpw(rows: usize, cols: usize, k: usize) -> usize {
         // The vocab head: more rows per block amortize gemvn's per-block x quantization (nt = 2: 1158 -> 1027 us).
-        // Experts of 512 columns (35B down, 2 superblocks a row): 16 rows per warp, 116.1 -> 116.6 tok/s.
-        let d = if k > 1 { if cols <= 512 { 16 } else { (2048 / cols).max(1) } } else if rows >= 65536 { 8 } else if rows >= 8192 || rows == 2048 { 2 } else { 1 };
+        // Experts of 512 columns (35B down, 2 superblocks a row): 4 rows per warp, M2-T5 measured 208.7 -> 262.4
+        // and 265.2 -> 328.8 GB/s (+25.7 %/+24.0 %, 15.4 -> 12.2 us and 16.8 -> 13.6 us) while 16 rows per warp was
+        // chosen for a 4B model. Gate/up (2048 columns) keep 1: 4 rows per warp there lost 7.4 % on the 2.4 MB
+        // launch, i.e. the gain is per shape and belongs in the table, not in a single family value.
+        let d = if k > 1 { if cols <= 512 { 4 } else { (2048 / cols).max(1) } } else if rows >= 65536 { 8 } else if rows >= 8192 || rows == 2048 { 2 } else { 1 };
         let fam = if k > 1 { "STRATA_RPW_MOE" } else { "STRATA_RPW_DENSE" };
         let family = std::env::var(fam).ok();
         rpw_from(std::env::var("STRATA_RPW").ok().as_deref(), family.as_deref(), d)
