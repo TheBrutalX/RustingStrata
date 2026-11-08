@@ -426,8 +426,8 @@ impl Vk {
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, staged: 0, ops: 0, copied: (0, 0), bufs: BTreeMap::new(), err: Default::default(),
             prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None } };
         let cr = cond.then(|| ash::ext::conditional_rendering::Device::new(&instance, &dev));
-        let mmq_force = mmq_force(std::env::var("STRATA_VK_MMQ").ok().as_deref())?;
-        let f16_types = std::env::var("STRATA_VK_F16_TYPES").ok().map(|v| f16_types(&v)).transpose()?.unwrap_or_default();
+        let mmq_force = mmq_force(env_str("STRATA_VK_MMQ")?.as_deref())?;
+        let f16_types = env_str("STRATA_VK_F16_TYPES")?.map(|v| f16_types(&v)).transpose()?.unwrap_or_default();
         let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, coop, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), smem_limit, mmq_force, f16_types, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
@@ -879,8 +879,21 @@ fn mmq_for(policy: bool, force: Option<bool>, f16_list: &[GgmlType], ty: GgmlTyp
     force.unwrap_or(policy && !f16_list.contains(&ty))
 }
 
+/// The value of `name`, or `None` when it is unset. A value that is not UTF-8 is an error, not "unset": a corrupted
+/// knob must not silently measure the default arm (the same intent as rejecting a misspelled value).
+fn env_str(name: &str) -> anyhow::Result<Option<String>> { env_str_from(name, std::env::var_os(name)) }
+
+fn env_str_from(name: &str, v: Option<std::ffi::OsString>) -> anyhow::Result<Option<String>> {
+    match v {
+        None => Ok(None),
+        Some(v) => v.into_string().map(Some).map_err(|_| anyhow!("{name} is not valid UTF-8")),
+    }
+}
+
 /// `STRATA_VK_MMQ`: `0` forces the f16 `gemm_f_dp` for every type, `1` forces the int8 `gemmi_dp`; unset keeps the
-/// type policy. Any other value is a startup error, so a typo cannot silently measure the other arm.
+/// type policy. `1` is the old artifact only for the types the policy already ran as int8: it also moves IQ2_XS and
+/// IQ2_S, which the policy runs as f16 outside `--llama-numerics`, onto int8. Any other value is a startup error, so
+/// a typo cannot silently measure the other arm.
 fn mmq_force(v: Option<&str>) -> anyhow::Result<Option<bool>> {
     match v {
         None => Ok(None),
@@ -1299,6 +1312,17 @@ impl Backend for Vk {
 mod tests {
     use super::*;
     use GgmlType::*;
+
+    #[test]
+    fn env_str_rejects_non_utf8() {
+        assert_eq!(env_str_from("X", None).unwrap(), None);
+        assert_eq!(env_str_from("X", Some("1".into())).unwrap().as_deref(), Some("1"));
+        // A corrupted value is an error, not "unset": the arm must not silently fall back to the default.
+        #[cfg(unix)] {
+            use std::os::unix::ffi::OsStringExt;
+            assert!(env_str_from("STRATA_VK_MMQ", Some(std::ffi::OsString::from_vec(vec![0xff, b'1']))).is_err());
+        }
+    }
 
     #[test]
     fn mmq_force_takes_only_0_and_1() {
