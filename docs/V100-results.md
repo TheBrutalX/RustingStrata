@@ -2257,3 +2257,11 @@ subset at the cost of one near-tie position.
 
 Environment: `no Xid` before and after (count 42), `nvidia-smi` 0 MiB,
 `llama.router.service` inactive for the window and left free.
+
+**Coordinator decision (M3-T5, issue #44):** keep the int8 default and the current numbers as the
+documented ceiling. Both f16 arms are rejected: the blanket one passes the test but costs −20.7 % prefill
+at 4K, and the 5-type subset costs −17.7 % and still fails `prefill_matches_reference`, so neither can be
+shipped against the M3 Vulkan baseline (1425 tok/s at 4K). `STRATA_VK_MMQ` / `STRATA_VK_F16_TYPES` ship as
+measurement tooling only; **no default changes**. The accuracy work continues in #50
+(`[vulkan] int8 GEMM accuracy (M3-T5 follow-up)`). The default artifact remains 625 strict / 629
+either-mode with `prefill_matches_reference` failing (15019 vs 4938).
