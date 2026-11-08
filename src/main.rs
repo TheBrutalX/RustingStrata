@@ -1789,7 +1789,7 @@ mod bench_tests {
     }
 
     #[test]
-    fn record_schema_and_one_entry_per_pp_in_order() {
+    fn bench_record_schema_and_one_result_per_pp_in_order() {
         let st = |x: f64| Stat { mean: round1(x), min: round1(x), max: round1(x) };
         let results = [result(512, st(2135.7), st(129.5)), result(4096, st(1900.0), st(120.0)), result(32768, st(1500.0), st(80.0))];
         let v = parsed(&bench_record(&meta(), &results, None, 1_762_617_600));
@@ -1808,7 +1808,7 @@ mod bench_tests {
     }
 
     #[test]
-    fn rates_match_the_text_rendering() {
+    fn bench_record_rates_match_the_text_rendering() {
         let raw_p = [2144.9, 2129.6, 2132.6];
         let raw_d = [128.9, 129.8, 129.8];
         let (p, d) = (Stat::of(&raw_p), Stat::of(&raw_d));
@@ -1829,14 +1829,14 @@ mod bench_tests {
     }
 
     #[test]
-    fn expert_is_omitted_without_a_cache() {
+    fn bench_record_omits_expert_without_a_cache() {
         let v = parsed(&bench_record(&meta(), &[result(512, Stat { mean: 1.0, min: 1.0, max: 1.0 }, Stat { mean: 2.0, min: 2.0, max: 2.0 })], None, 0));
         assert!(v.get("expert").is_none());
         assert!(v["results"][0].get("expert").is_none());
     }
 
     #[test]
-    fn expert_object_uses_the_printed_numbers() {
+    fn bench_record_expert_object_uses_the_printed_numbers() {
         let stats = ExpertStats {
             hits: 1024, misses: 0, swaps: 3, resident: 10240, total: 10240,
             bytes_per_token: 329_006_694, cached: true, all_fast: true,
@@ -1866,7 +1866,7 @@ mod bench_tests {
     }
 
     #[test]
-    fn json_out_dash_is_rejected() {
+    fn bench_record_rejects_json_out_dash() {
         let e = Cli::try_parse_from(["strata", "bench", "--model", "m.gguf", "--json-out", "-"]).err().unwrap();
         assert!(e.to_string().contains("stdout carries the text block"), "{e}");
         assert!(Cli::try_parse_from(["strata", "bench", "--model", "m.gguf", "--json-out", "/tmp/x.json"]).is_ok());
