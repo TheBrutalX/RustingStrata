@@ -149,6 +149,7 @@ cell() { # escape a markdown table cell
 }
 
 plan_kv() { sed -n 's/.*KV \([0-9][0-9]*\) MB.*/\1/p' <<<"${1:-}" | head -n1; }
+plan_prefill() { sed -n 's/.*prefill \([0-9][0-9]*\) MB.*/\1/p' <<<"${1:-}" | head -n1; }
 plan_slots() {
     sed -n 's/.*expert slots \([0-9][0-9]*\) MB, resident experts \([0-9][0-9]*\)\/\([0-9][0-9]*\).*/\1 MB (\2\/\3)/p' \
         <<<"${1:-}" | head -n1
@@ -387,7 +388,9 @@ serve_row() {
 
     local dir=$LOG_DIR/$row.http body
     mkdir -p "$dir"
-    body=$(printf '{"messages":[{"role":"user","content":"Reply with one word."}],"max_tokens":128,"temperature":0,"chat_template_kwargs":{"enable_thinking":false}}')
+    # A prompt that keeps greedy decoding busy for the whole cap: "one word"
+    # answers stop after a single token and would measure latency, not decode.
+    body=$(printf '{"messages":[{"role":"user","content":"Repeat the word the 100 times, separated by spaces."}],"max_tokens":128,"temperature":0,"chat_template_kwargs":{"enable_thinking":false}}')
     local t0 t1 wall_ms total=0 ok=0 lat="" pids=() tid
     t0=$(date +%s%N)
     for i in $(seq 1 "$slots"); do
@@ -583,7 +586,8 @@ if ((DRY_RUN == 0)); then
         ENV_XID=$(journalctl -k --since "-40 min" 2>/dev/null | grep -i Xid | tail -n5 || true)
     fi
     [[ -z $ENV_XID ]] && ENV_XID="no Xid"
-    ENV_SERVICE=$(systemctl is-active llama.router.service 2>/dev/null || echo "unknown")
+    ENV_SERVICE=$(systemctl is-active llama.router.service 2>/dev/null || true)
+    [[ -z $ENV_SERVICE ]] && ENV_SERVICE="unknown"
 fi
 
 mean_of() { # mean_of ROW PP FIELD -> mean tok/s or empty
@@ -599,13 +603,17 @@ mean_of() { # mean_of ROW PP FIELD -> mean tok/s or empty
 }
 
 pct_delta() { # percent change of $2 from $1
-    awk -v a="$1" -v b="$2" 'BEGIN { if (a == 0) { print "n/a"; exit } printf "%+.1f%%", 100 * (b - a) / a }'
+    awk -v a="${1:-}" -v b="${2:-}" 'BEGIN {
+        if (a == "" || b == "" || a + 0 == 0) { print "n/a"; exit }
+        printf "%+.1f%%", 100 * (b - a) / a
+    }'
 }
 
 drift_lines() {
-    local c0p c0d n1p n1d m1d
+    local c0p c0d n1p n1d n2p n2d m1d
     c0p=$(mean_of C0 4096 prefill); c0d=$(mean_of C0 4096 decode)
     n1p=$(mean_of N1 4096 prefill); n1d=$(mean_of N1 4096 decode)
+    n2p=$(mean_of N2 4096 prefill); n2d=$(mean_of N2 4096 decode)
     m1d=$(mean_of M1 512 decode)
     echo "- C0 control at pp 4096: prefill ${c0p:-n/a} tok/s, decode ${c0d:-n/a} tok/s."
     if [[ -n ${n1p:-} && -n ${c0p:-} ]]; then
@@ -618,7 +626,38 @@ drift_lines() {
     else
         echo "- M1 vs C0: n/a (C0 or M1 not run in this pass)."
     fi
+    if [[ -n ${n2d:-} && -n ${c0d:-} ]]; then
+        echo "- N2 (graphs off) vs C0, informational: prefill $(pct_delta "$c0p" "$n2p"), decode $(pct_delta "$c0d" "$n2d"). This is the cost of re-recording every submission, not a pass/fail row."
+    fi
     echo "- K1 (q8 KV) is exempt from the drift guard: the numerics differ by design."
+}
+
+notes_lines() {
+    local c0p c0d k1p k1d k1min k1max kv0 kv1 c1p c2pf c2kv
+    c0p=$(mean_of C0 4096 prefill); c0d=$(mean_of C0 4096 decode)
+    if [[ -v STATUS[K1] ]]; then
+        k1p=$(mean_of K1 4096 prefill); k1d=$(mean_of K1 4096 decode)
+        k1min=$(jq -r '.results[] | select(.pp == 4096) | .prefill_tok_s.min' "$JSON_DIR/K1.json" 2>/dev/null | head -n1)
+        k1max=$(jq -r '.results[] | select(.pp == 4096) | .prefill_tok_s.max' "$JSON_DIR/K1.json" 2>/dev/null | head -n1)
+        kv0=$(plan_kv "${PLANLINE[C0]:-}"); kv1=$(plan_kv "${PLANLINE[K1]:-}")
+        local kvtext="KV ${kv1:-?} MB"
+        [[ -n ${kv0:-} ]] && kvtext+=" vs ${kv0} MB for C0"
+        echo "- K1: ${kvtext}. Prefill $(pct_delta "$c0p" "$k1p") and decode $(pct_delta "$c0d" "$k1d") against C0 (decode is exempt from the drift guard: numerics differ)."
+        if [[ -n ${k1min:-} && -n ${k1max:-} ]] && awk -v a="$k1min" -v b="$k1max" 'BEGIN { exit !(a > 0 && b / a > 1.05) }'; then
+            echo "  The wide min-max is the first (pipeline-compilation) repetition; the max is the steady state."
+        fi
+    fi
+    if [[ -v STATUS[C1] ]]; then
+        c1p=$(mean_of C1 4096 prefill)
+        echo "- C1: pp 4096 prefill is $(pct_delta "$c0p" "$c1p") against C0, expected with \`--chunk 512\` (more expert restaging per chunk); the pp 512 row keeps the short-prompt rate."
+    fi
+    if [[ -v STATUS[C2] ]]; then
+        c2pf=$(plan_prefill "${PLANLINE[C2]:-}"); c2kv=$(plan_kv "${PLANLINE[C2]:-}")
+        echo "- C2: \`--chunk 32768\` fits: prefill scratch ${c2pf:-?} MB, KV ${c2kv:-?} MB, expert slots unchanged."
+    fi
+    if [[ -v STATUS[N2] ]]; then
+        echo "- N2: the decode drop against C0 is the \`STRATA_NO_GRAPH\` re-record cost."
+    fi
 }
 
 json_record_lines() {
@@ -667,6 +706,10 @@ section() {
     echo "### Drift guard"
     echo
     drift_lines
+    echo
+    echo "### Notes"
+    echo
+    notes_lines
     echo
     if ((${#SANITY_ROWS[@]})); then
         echo "### Output sanity (\`strata generate -n $GEN_N\`)"
