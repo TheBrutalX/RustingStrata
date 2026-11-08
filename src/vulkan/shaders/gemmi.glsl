@@ -28,6 +28,13 @@ layout(push_constant) uniform P { U64 tiles; uint64_t wd; U32 x; I32 xrow; F32 y
 #ifndef SM
 #define SM 0
 #endif
+// Variant C (issue #47): the 32x32 tile a subgroup owns is a free choice. 0 is the baseline (rows from w >> 1,
+// columns from w & 1); 1 is the transposed assignment, where the two subgroups of a row pair also share their W
+// rows (bm from w & 1, bn from w >> 1). No shared bytes and no per-output order change either way. Build a variant
+// with `GLSL_DEFS=-DSUBMAP=1 tools/gen_spirv.sh` (see tools/gen_spirv.sh).
+#ifndef SUBMAP
+#define SUBMAP 0
+#endif
 // SM 1 (gemmi_s): only the tiles of at most 32 positions, as gemm_fs; X holds XM positions.
 const uint BM = 128, XM = SM != 0 ? 32 : BM;
 const uint KS = T == 42 || T == 2 || T == 3 || T == 6 || T == 7 || T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 || T == 21 || T == 23 ? 32 : 16;
@@ -120,7 +127,11 @@ void main() {
     // most expert tiles) only the 16 x 16 at bm, bn, in acc[0][0], so the 8 output tiles are spread over all 8
     // subgroups. Each output sums the same products in the same order either way.
     const bool sm = SM != 0;
+#if SUBMAP == 1
+    uint bm = sm ? 16 * (w & 1) : (w & 1) * 32, bn = sm ? 16 * (w >> 1) : (w >> 1) * 32;
+#else
     uint bm = sm ? 16 * (w & 1) : (w >> 1) * 32, bn = sm ? 16 * (w >> 1) : (w & 1) * 32;
+#endif
     // nv: the layout of mma.sync (element i at row g + 8 (i >> 2), column 2 t + (i & 1) + 8 ((i >> 1) & 1)), as on NVIDIA.
     uint g = gl_SubgroupInvocationID >> 2, t = gl_SubgroupInvocationID & 3;
 #if COOP
