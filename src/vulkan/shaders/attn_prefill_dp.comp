@@ -1,12 +1,23 @@
 #version 460
 // Prefill attention without cooperative matrices: attn_prefill.glsl's inputs and output, but Q and the softmax weights
 // stay f32 (rounded to f16 as in attn_prefill, parity measured lower, #124), one subgroup per query, lane l holding dims
-// l + 32 j, and keys taken one at a time with an online softmax. Workgroup (x, h): queries 4x .. 4x + 3 of head h.
+// l + 32 j, and keys taken one at a time with an online softmax (KEYBLOCK takes them in blocks, see below). Workgroup
+// (x, h): queries 4x .. 4x + 3 of head h.
 layout(local_size_x = 128) in;
 #include "common.glsl"
 layout(push_constant) uniform P { F32 q; U16 kc; U16 vc; F32 qg; F32 o; I32 step; uint t; uint nh; uint nkv; float scale; U32 qm; uint mw; } p;
 layout(constant_id = 1) const uint PER = 4;  // head_dim / 32
 const uint HD = 32 * PER;
+// KEYBLOCK (variant A of M3-T3, issue #51): keys per online-softmax step, i.e. one max/exp pass and one rescale of
+// `acc` per block instead of per key. 1 is the pre-change kernel and the default, so the committed SPIR-V is unchanged;
+// `tools/gen_spirv.sh` takes GLSL_DEFS, e.g. `GLSL_DEFS=-DKEYBLOCK=32 tools/gen_spirv.sh /tmp/spv`.
+#ifndef KEYBLOCK
+#define KEYBLOCK 1
+#endif
+#if KEYBLOCK > 1
+// Keys per online-softmax step.
+const uint BK = KEYBLOCK;
+#endif
 
 void main() {
     uint t = gl_WorkGroupID.x * 4 + gl_SubgroupID, h = gl_WorkGroupID.y, lane = gl_SubgroupInvocationID;
@@ -17,6 +28,7 @@ void main() {
         q[j] = p.q.v[(t * p.nh + h) * HD + lane + 32 * j] * p.scale;
         acc[j] = 0.0;
     }
+#if KEYBLOCK <= 1
     bool first = true;
     for (uint k = 0; k <= last; k++) {
         if (uint64_t(p.qm) != 0 && !qsa_bit(p.qm, p.mw, t, k)) continue;
@@ -29,6 +41,44 @@ void main() {
         [[unroll]] for (uint j = 0; j < PER; j++) acc[j] = fma(e, ldkv(p.vc, k * kvd + kvo + 32 * j, HD), acc[j] * c);
         m = mn;
     }
+#else
+    // Variant A: the block's scores are independent, so they are all computed first, then one max/exp and one rescale
+    // of `acc` and `l` per block instead of per key. Same recurrence as the loop above -- when the running max does
+    // not move (c = 1) the rescales are exact no-ops there too; only the summation order of `l` inside a block (and
+    // the rounding of one `l * c` per block) differs, which is why the A/B keeps the parity gate.
+    const float ninf = -3.402823466e38;
+    bool any = false;
+    for (uint k0 = 0; k0 <= last; k0 += BK) {
+        float s[BK];
+        [[unroll]] for (uint i = 0; i < BK; i++) {
+            uint k = k0 + i;
+            bool ok = k <= last && (uint64_t(p.qm) == 0 || qsa_bit(p.qm, p.mw, t, k));
+            float x = 0.0;
+            if (ok) {  // `ok` is uniform over the subgroup (t, k and the mask are), so is the reduction
+                [[unroll]] for (uint j = 0; j < PER; j++) x += q[j] * ldkv(p.kc, k * kvd + kvo + 32 * j, HD);
+                x = subgroupAdd(x);
+            }
+            s[i] = ok ? x : ninf;
+        }
+        float bm = ninf;
+        [[unroll]] for (uint i = 0; i < BK; i++) bm = max(bm, s[i]);
+        if (bm == ninf) continue;  // no visible key in the block (the mask or the tail): nothing to rescale
+        float mn = any ? max(m, bm) : bm, c = any ? expf_(m - mn) : 0.0;
+        if (any) {  // one rescale of the running sum and of acc for the whole block (variant A)
+            l *= c;
+            [[unroll]] for (uint j = 0; j < PER; j++) acc[j] *= c;
+        }
+        [[unroll]] for (uint i = 0; i < BK; i++) {
+            if (s[i] == ninf) continue;
+            float e = expf_(s[i] - mn);
+            l += e;
+            uint k = k0 + i;
+            [[unroll]] for (uint j = 0; j < PER; j++) acc[j] = fma(e, ldkv(p.vc, k * kvd + kvo + 32 * j, HD), acc[j]);
+        }
+        m = mn;
+        any = true;
+    }
+#endif
     [[unroll]] for (uint j = 0; j < PER; j++) {
         uint col = lane + 32 * j;
         float gate = uint64_t(p.qg) != 0 ? sigmoid(p.qg.v[t * p.nh * 2 * HD + h * 2 * HD + HD + col]) : 1.0;
