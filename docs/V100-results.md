@@ -1894,3 +1894,193 @@ A blanket f16 fallback costs **−20.7 % prefill at 4K** and −43 % at 512, whi
 would violate the M3 Vulkan baseline (1423.9 @4K). M3-T5 therefore needs a
 per-type ablation (f16 only for the types that cause the divergences) or an
 int8 accuracy fix before the parity gap can be closed at an acceptable cost.
+
+## 2026-11-08 — M3-T1 Vulkan profile of prefill and decode (graph off)
+
+Same model and machine (Tesla V100-SXM2-32GB, sm_70, driver 580.178.04,
+Vulkan 1.4.312), commit `645891f`, `strata` v1.2.0.
+`STRATA_VK_PROF` only writes timestamps outside a graph (`src/vulkan/mod.rs:754`,
+`:760`), so every run below uses `STRATA_NO_GRAPH=1`; all tables are
+**graph off**.
+
+Profile A measures prefill at 4096 tokens, B prefill + 256 decode steps at
+depth 4096, C a short-context decode (`pp 64 + 512 steps`, depth ≤ 576) as a
+cross-check of the B − A subtraction. B − A spans **255** decode steps (A decodes
+one token), which the call counts confirm: every per-token count is an exact
+integer (gemv_q 251, gemv_f 140, rms_norm 101, attn_decode 10).
+
+```
+M=/mnt/models/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf
+STRATA_NO_GRAPH=1 STRATA_VK_PROF=1 STRATA_VK_STATS=1 \
+  target/release/strata bench --model "$M" --gpu --backend vulkan \
+  --pp 4096 --tg 1 --reps 1 --ctx 4400 2>target/m3t1/A_prefill.log
+STRATA_NO_GRAPH=1 STRATA_VK_PROF=1 \
+  target/release/strata bench --model "$M" --gpu --backend vulkan \
+  --pp 4096 --tg 256 --reps 1 --ctx 4400 2>target/m3t1/B_decode.log
+STRATA_NO_GRAPH=1 STRATA_VK_PROF=1 \
+  target/release/strata bench --model "$M" --gpu --backend vulkan \
+  --pp 64 --tg 512 --reps 1 --ctx 4400 2>target/m3t1/C_decode_short.log
+# control: the same B run without the profiler, to size its own overhead
+STRATA_NO_GRAPH=1 \
+  target/release/strata bench --model "$M" --gpu --backend vulkan \
+  --pp 4096 --tg 256 --reps 1 --ctx 4400 2>target/m3t1/B_control_noprof.log
+```
+
+### Prefill at 4096 tokens (run A)
+
+| Kernel | self (ms) | share (%) | calls | µs/call | µs/token |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **`gemmi_dp`** (int8 GEMM) | 985.7 | 35.6 | 292 | 3375.75 | 240.65 |
+| **`gemm_f_dp`** (f16 GEMM) | 895.9 | 32.3 | 218 | 4109.67 | 218.73 |
+| **`attn_prefill_dp`** (attention) | 641.6 | 23.1 | 10 | 64164.49 | 156.64 |
+| `deltanet` | 153.9 | 5.6 | 60 | 2564.59 | 37.57 |
+| `moe_combine_seq` | 20.7 | 0.7 | 40 | 517.99 | 5.05 |
+| `quant_q8` | 18.2 | 0.7 | 200 | 90.86 | 4.44 |
+| `conv_seq` | 13.3 | 0.5 | 30 | 444.52 | 3.25 |
+| `rms_norm` | 13.2 | 0.5 | 202 | 65.44 | 3.22 |
+| `norm_gate` | 10.0 | 0.4 | 60 | 166.54 | 2.44 |
+| `l2_norm` | 6.5 | 0.2 | 30 | 218.28 | 1.59 |
+| **`attn_decode`** (decode attention, 1 step) | 0.6 | 0.0 | 10 | 60.42 | 0.15 |
+| other 16 kernels | 12.2 | 0.4 | 768 | — | 2.98 |
+| **sum of kernel self time** | **2771.8** | 100.0 | 1 920 | — | **676.71** |
+
+Round-off: shares are of the profiled kernel time, not of the wall clock
+(kernel time / wall = 34.2 % / 31.1 % / 22.3 % for the three top kernels).
+
+### Decode at depth 4096 (run B − run A, 255 steps)
+
+| Kernel | self (ms) | share (%) | calls | µs/call | µs/token |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **`gemv_q`** (int8-family GEMV) | 1026.8 | 39.3 | 64 005 | 16.04 | 4026.67 |
+| `moe_gemv_q` (MoE expert GEMV) | 263.6 | 10.1 | 10 200 | 25.84 | 1033.73 |
+| `gemv_f` (F32/BF16 GEMV) | 254.0 | 9.7 | 35 700 | 7.11 | 996.08 |
+| `rms_norm` | 230.8 | 8.8 | 25 755 | 8.96 | 905.10 |
+| `moe_down_combine` | 176.4 | 6.8 | 10 200 | 17.29 | 691.76 |
+| `moe_route` | 160.0 | 6.1 | 10 200 | 15.69 | 627.45 |
+| **`attn_decode`** (decode attention) | 141.9 | 5.4 | 2 550 | 55.65 | 556.47 |
+| `swiglu_q` | 130.3 | 5.0 | 20 400 | 6.39 | 510.98 |
+| `deltanet` | 97.9 | 3.7 | 7 650 | 12.80 | 383.92 |
+| `norm_gate` | 50.2 | 1.9 | 7 650 | 6.56 | 196.86 |
+| `conv_silu` | 46.1 | 1.8 | 7 650 | 6.03 | 180.78 |
+| `attn_merge` (decode attention) | 24.4 | 0.9 | 2 550 | 9.57 | 95.69 |
+| `argmax_rows` | 2.9 | 0.1 | 510 | 5.69 | 11.37 |
+| prefill-only kernels (no call delta) | 5.5 | 0.2 | 0 | — | 21.2 |
+| **sum of kernel self time** | **2610.8** | 100.0 | 205 020 | — | **10 238.4** |
+
+The "prefill-only" row is the subtraction residual of kernels that do not run
+in a decode step (`gemmi_dp` 2.5 ms, `attn_prefill_dp` 2.1 ms, `gemm_f_dp`
+0.8 ms): it is timer noise, 0.25 % of the prefill total of the same kernel,
+which is also the run-to-run noise of A.
+
+Cross-check with C (`pp 64 + 512 steps`, depth ≤ 576), µs/call: gemv_q 15.86 vs
+16.04, moe_gemv_q 25.95 vs 25.84, gemv_f 7.03 vs 7.11, rms_norm 8.95 vs 8.96,
+moe_down_combine 17.29 vs 17.29, moe_route 15.71 vs 15.69, swiglu_q 6.28 vs
+6.39, deltanet 12.85 vs 12.80, norm_gate 6.50 vs 6.56, conv_silu 6.04 vs 6.03.
+Only the attention differs, because it is the one kernel whose cost depends on
+the context depth: `attn_decode` 14.84 µs/call at depth ≤ 576 vs 55.65 µs/call
+at 4096 (×3.75) and `attn_merge` 8.15 vs 9.57. Everything else is depth-flat,
+so the subtraction is sound.
+
+### Coverage
+
+| Phase | kernel self time | wall time of the phase | coverage | unaccounted |
+| --- | ---: | ---: | ---: | ---: |
+| prefill (A, 4096 tok) | 2771.8 ms | 2879.4 ms (1422.5 tok/s) | 96.3 % | 107.6 ms (3.7 %) |
+| decode, depth 4096 (B−A, 255 steps) | 2610.8 ms | 3846.7 ms (15.09 ms/step) | 67.9 % | 1235.4 ms (32.1 %) |
+
+The profiler times only the dispatches: it excludes copies, submissions, waits,
+and every host gap between dispatches (`src/vulkan/mod.rs:232-235`), so the
+remainder is not GPU work that a shader change could recover. The timestamp
+period is effectively 1 ns on this driver: the prefill kernel sum matches the
+wall clock to 3.7 %, which rules out a scale error.
+
+The decode remainder is mostly the profiler itself. The same graph-off run
+without `STRATA_VK_PROF` decodes at 92.2 tok/s (10.85 ms/step) against
+66.3 tok/s (15.09 ms/step) with it: the per-submission
+`vkGetQueryPoolResults(... | WAIT)` (`src/vulkan/mod.rs:611-614`) serialises
+host and GPU, which costs ≈4.2 ms/step on a phase of 10.2 ms of kernels. That
+is why the decode *shares* are usable and the decode *tok/s* is not.
+
+### Sanity of the runs (tok/s as printed)
+
+| Run | prefill | decode |
+| --- | ---: | ---: |
+| A `pp 4096 --tg 1`, graph off + prof | 1422.5 | 33.0 (one step) |
+| B `pp 4096 --tg 256`, graph off + prof | 1421.9 | 66.3 |
+| C `pp 64 --tg 512`, graph off + prof | 181.5 | 68.0 |
+| control `pp 4096 --tg 256`, graph off, **no** prof | 1433.0 | 92.2 |
+| baseline for comparison (graphs on): | 1431.8 | 114.7 |
+
+So graph off alone costs ±0.1 % prefill and −19.6 % decode here (the earlier
+−23.1 % of M0-T6 N2 was measured at `ctx 32896`), and adding the profiler costs
+another −0.8 % prefill and −28 % decode. The first invocation after the build
+(idle GPU, clocks below boost) measured 812.3 tok/s prefill; the three runs
+above were made back-to-back on a warm GPU and agree within 0.8 %.
+
+### GEMM path per weight type
+
+The type census of this GGUF (733 tensors, 11.4 GiB of weights) and the policy
+in `Gpu::mmq` (`src/cuda/mod.rs:538`, called from `Vk::gemm_raw`,
+`src/vulkan/mod.rs:819`) decide the prefill path; the shader specializations
+seen in A confirm it (`wspec` passes the ggml type id, `src/vulkan/mod.rs:802`):
+
+| Type | Tensors | Weight bytes | Share of weights | Prefill path | Why |
+| --- | ---: | ---: | ---: | --- | --- |
+| IQ2_XS (id 17) | 78 | 5772.0 MB | 49.3 % | `gemm_f_dp` | excluded from int8 by default (#31: its scale per 16 makes the int8 path slower) |
+| IQ3_XXS (id 18) | 38 | 3724.0 MB | 31.8 % | `gemmi_dp` | `mmq` = true |
+| Q5_K (id 13) | 157 | 1030.6 MB | 8.8 % | `gemmi_dp` | `mmq` = true |
+| IQ4_XS (id 23) | 4 | 544.0 MB | 4.6 % | `gemmi_dp` | `mmq` = true |
+| Q4_K (id 12) | 1 | 272.8 MB | 2.3 % | no GEMM (GEMV only) | `output.weight`: logits come from `gemv_q`, also during prefill |
+| Q6_K (id 14) | 93 | 266.6 MB | 2.3 % | `gemmi_dp` | `mmq` = true |
+| F32 (id 0) | 361 | 99.7 MB | 0.9 % | `gemm_f_dp` | `float_ty` |
+| Q8_0 (id 8) | 1 | 1.1 MB | 0.0 % | `gemmi_dp` | `mmq` = true |
+
+Measured split of the prefill GEMM (**67.9 % of the profiled prefill kernel
+time**, 65.3 % of the wall clock): int8 `gemmi_dp` **985.7 ms, 35.6 %** vs f16
+`gemm_f_dp` **895.9 ms, 32.3 %**. The f16 side is not a small fallback on this
+model: it carries the IQ2_XS half of the weights. `gemm_f_dp` is also the slower
+kernel per call (4109.67 µs vs 3375.75 µs), so both are first-class targets for
+M3-T2. In decode there is no such split — `gemv_q` runs for every quantized
+type including IQ2_XS (`src/vulkan/mod.rs:1062-1076`) and `gemv_f` only for
+F32/BF16.
+
+### `STRATA_VK_STATS` per-pipeline statistics
+
+Supported by the 580 driver: one line per (kernel, specialization), 38 lines for
+the 27 kernels this bench dispatches (registers, binary size, shared bytes).
+Compact view (min–max over specializations):
+
+| Kernel | Specs | Registers | Binary (B) | Shared (B) |
+| --- | ---: | ---: | ---: | ---: |
+| `gemmi_dp` | 5 | 163–201 | 48 896–55 168 | 41 088–49 152 |
+| `gemm_f_dp` | 2 | 115 | 37 504–39 808 | 27 664 |
+| `attn_prefill_dp` | 1 | 48 | 11 136 | 0 |
+| `attn_decode` | 1 | 128 | 41 344 | 24 672 |
+| `attn_merge` | 1 | 26 | 7 168 | 1 024 |
+| `gemv_q` | 4 | 32 | 5 504–9 472 | 16 |
+| `moe_gemv_q` | 2 | 32–40 | 8 960–9 984 | 16 |
+| `gemv_f` | 1 | 64 | 8 320 | 0 |
+| `deltanet` | 1 | 123 | 16 896 | 0 |
+| `moe_route` | 1 | 64 | 17 024 | 7 184 |
+| others (17) | 1–2 | 16–63 | 256–13 696 | 0–1 032 |
+
+`gemmi_dp` is at the 49 152 B shared-memory limit for its largest
+specialization (Q6_K: 168 registers, 55 168 B of binary, 49 152 B of shared);
+the 41 088 B ones are Q5_K, IQ3_XXS, IQ4_XS and Q8_0. M3-T2 tuning that wants
+more shared memory per workgroup has none left on Volta.
+
+### Dominant kernels
+
+**At 4K prefill the dominant kernel is the int8 GEMM `gemmi_dp` (35.6 %), with
+the f16 GEMM `gemm_f_dp` a close second (32.3 %); at decode depth 4096 it is the
+GEMV `gemv_q` (39.3 %)**, not the attention (5.4 % + 0.9 %), which only grows
+with depth.
+
+For the roadmap: M3-T2 should tune `gemmi_dp` *and* `gemm_f_dp` (they are 68 %
+of prefill and `gemm_f_dp` already carries half the weights), while M3-T3
+(attention) has 23.1 % of prefill in `attn_prefill_dp` (641.6 ms, 64.2 ms per
+4K-position dispatch) but only 6.3 % of decode. A decode-side task that is not
+on the roadmap today is the 39.3 % `gemv_q`; the SSM/hybrid kernels
+(`deltanet`, `conv_*`, `norm_gate`) are 6.6 % of prefill and 7.4 % of decode.
+No Xid, no device-lost during any of the runs (`nvidia-smi -q` reports no Xid
+counter; the last `dmesg` Xid is the pre-fix SKEDCHECK18 of 2026-11-06).
