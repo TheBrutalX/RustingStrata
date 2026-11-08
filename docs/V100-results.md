@@ -1033,3 +1033,127 @@ nvidia-smi --query-gpu=...    # 0 MiB used, 47 C, 0 % utilisation at the end
 No `Xid`, no `device lost`, no trap. One `serve` process from the parallel test was still listening after
 the wrapper shell was signalled; it was sent SIGTERM and the GPU returned to 0 MiB before the Xid/`nvidia-smi`
 reading above. `llama.router.service` was left **stopped** for the coordinator.
+
+## 2026-11-08 — Cross-backend numerical consistency (M2-T7, CPU part)
+
+Issue #36, branch `task/36-cuda-consistency-report`, base `v100` after M2-T6. This block is the CPU
+half of the report: the reproducible comparison script, the legitimate-difference registry and the
+dry run that reproduces the documented 9/640 on the **pre-M2** artifacts. The M2-build numbers
+(per-op, parity, attribution arms, KLD) are appended in the GPU-window section right below, same
+heading, same artifacts.
+
+### The comparison script
+
+`tools/consistency.py` (new, no GPU, no model, no network) turns two `target/parity-result-<tag>.json`
+files into `docs/parity/cross-backend.json` plus the markdown rows of this section:
+
+- end-to-end: strict/either per backend, the cross-backend divergence count and its classification
+  (CUDA-only correct, Vulkan-only correct, both wrong);
+- the divergence list: prompt, position, both backends' token id, the llama.cpp reference token, the
+  one-batch llama.cpp token, each backend's top-5 gap at that position when the artifact carries
+  `top5` (recorded from this change on, `tools/parity.py`), and the registry entry that explains it;
+- the per-op table, aggregated from the `--nocapture` logs of `tests/kernels.rs`,
+  `tests/llama_numerics.rs` and `tests/kv_q8.rs` (`--kernels`), with CUDA-vs-CPU, Vulkan-vs-CPU and
+  CUDA-vs-Vulkan columns; measurement lines that no pattern matches are listed in
+  `per_op_unparsed` instead of being dropped;
+- attribution arms (`--arm name=file`) compared against the CUDA artifact: how many of the base
+  divergences an arm resolves and how many it leaves;
+- full-vocabulary KLD from two `perplexity --kld-base` dumps (`--kld`), pure Python (no numpy on
+  this host), computing mean/max KLD, RMS Δp, top-1 agreement and Σp as a normalization check;
+- exit 1 if any divergence is unexplained. Artifacts contain no `argmax`/`top5` arrays; the
+  committed summary is numbers only.
+
+### Dry run on the pre-M2 artifacts (history, not current evidence)
+
+```
+python3 -I tools/consistency.py \
+  --cuda   target/parity-result-cuda-sm70.json \
+  --vulkan target/parity-result-vk-sm70.json \
+  --cuda-tag cuda-sm70 --vulkan-tag vk-sm70 --status pre-m2 \
+  --out docs/parity/cross-backend.json     # exit 0
+```
+
+The CUDA artifact is from the M1 build `ae95739`, the Vulkan one from M0 `d6c2beb`: this run only
+proves the comparison reproduces the known 9/640 and that the registry covers it. It is **not**
+evidence about the M2 build.
+
+| backend | tag | strict | either | divergent vs the other backend |
+| --- | --- | ---: | ---: | ---: |
+| CUDA sm_70 | `cuda-sm70` (M1 `ae95739`) | 630/640 (98.44 %) | 636/640 (99.38 %) | 9 of 640 (1.41 %) |
+| Vulkan sm_70 | `vk-sm70` (M0 `d6c2beb`) | 625/640 (97.66 %) | 629/640 (98.28 %) | same positions |
+
+- CUDA matches the reference and Vulkan does not: 7 positions.
+- Vulkan matches the reference and CUDA does not: 2 positions (both are also the one-batch
+  llama.cpp token: a near-tie where llama.cpp's own two modes disagree).
+- both miss the reference: 0. unexplained: 0.
+- top-5 gaps: `n/a` in these artifacts, they predate the `top5` field; the M2 run fills them.
+
+### Divergent positions (pre-M2 dry run)
+
+| # | prompt | pos | CUDA | Vulkan | reference | llama one-batch | explained by |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 12 | A train leaves at 9:15 and travels 180 km at 72 km | 5 | 314 | 11 | 11 | 314 | `either-mode-ambiguity` |
+| 16 | What license terms apply here? Summarize: | 0 | 27775 | 760 | 27775 | 27775 | `gemm-int8-vs-f16` |
+| 16 | What license terms apply here? Summarize: | 23 | 3665 | 4530 | 3665 | 3665 | `gemm-int8-vs-f16` |
+| 17 | Find the error in this log: | 8 | 29269 | 12662 | 29269 | 29269 | `gemm-int8-vs-f16` |
+| 17 | Find the error in this log: | 13 | 8240 | 332 | 332 | 8240 | `either-mode-ambiguity` |
+| 17 | Find the error in this log: | 16 | 4490 | 1412 | 4490 | 4490 | `gemm-int8-vs-f16` |
+| 18 | Which of these cities is the largest by population | 30 | 364 | 12041 | 364 | 364 | `gemm-int8-vs-f16` |
+| 19 | List the keys whose value is false: | 0 | 27775 | 760 | 27775 | 27775 | `gemm-int8-vs-f16` |
+| 19 | List the keys whose value is false: | 3 | 4566 | 3766 | 4566 | 4566 | `gemm-int8-vs-f16` |
+
+This is the list first summarized from prose in the M1-T8 block above, now machine-generated. Seven
+positions are Vulkan-only misses that CUDA resolves; two are positions where llama.cpp's own
+token-by-token and one-batch runs disagree and the backends split across the tie.
+
+### Per-op table (M2 build)
+
+TBD (GPU window). Commands:
+
+```sh
+STRATA_MODEL=$M STRATA_TEST_BACKENDS=cuda,vulkan \
+  cargo test --release --no-fail-fast --test kernels -- --nocapture --test-threads=1 2>&1 | tee /tmp/m2t7-kernels.txt
+STRATA_MODEL=$M STRATA_TEST_BACKENDS=cuda,vulkan \
+  cargo test --release --no-fail-fast --test llama_numerics -- --nocapture --test-threads=1 2>&1 | tee /tmp/m2t7-llama.txt
+STRATA_MODEL=$M STRATA_TEST_BACKENDS=cuda,vulkan \
+  cargo test --release --no-fail-fast --test kv_q8 -- --test-threads=1
+```
+
+The script's per-op section (rows: op, case/shape, CUDA vs CPU, Vulkan vs CPU, CUDA vs Vulkan,
+explained by) is pasted here from `--kernels /tmp/m2t7-kernels.txt --kernels /tmp/m2t7-llama.txt`.
+
+### End-to-end on the M2 build
+
+TBD (GPU window): CUDA and Vulkan parity re-run on the same build and the same cached reference
+(`--tag m2-cuda-sm70` / `--tag m2-vk-sm70`), the `STRATA_MMQ=` Vulkan arm and the optional
+`STRATA_GEMM_FMA=1` CUDA arm, then `--kld` on the two `perplexity --kld-base` dumps. The M1/M0
+figures above are history and are not reused as current evidence.
+
+### Legitimate-difference registry
+
+| id | mechanism | measured so far (pre-M2) | arm that isolates it | follow-up |
+| --- | --- | --- | --- | --- |
+| `gemm-int8-vs-f16` | int8-quantized GEMM (Vulkan) vs f16 tensor-core GEMM (CUDA); sm_70 CUDA has no int8 tensor cores | 3.17e-3 .. 4.08e-3 relative L2 per-op (M1-T7 block) | `STRATA_MMQ=` forces the f16 GEMM on Vulkan | M3-T5 |
+| `f16-round-vs-trunc` | f16 conversion: CUDA `__float2half` rounds, this driver's `OpFConvert` truncates | 5.41e-4 (IQ2_XS), 4.79e-5 (F32) relative L2, recorded not asserted (`tests/kernels.rs:409`) | — | M3-T5 |
+| `summation-order` | `mma.sync.m8n8k4` tile order vs Vulkan workgroup reduction vs FMA accumulation | 2.6e-7 .. 8.2e-7 per backend vs its own reference; 1e-6 .. 1e-4 cross-backend on the same math | `STRATA_VK_NO_COOP=` / `STRATA_GEMM_FMA=1` | — |
+| `no-coop-matrices` | Vulkan 1.4.312 on this host exposes no `VK_KHR_cooperative_matrix` | 1e-6 .. 5e-4 relative L2 where only the reduction tree differs (M2-T2 block) | `STRATA_VK_NO_COOP=` | M3-T5 |
+| `q8-kv` | `--kv q8` stores K/V as int8 with per-32 scales; not combinable with `--llama-numerics` by design | 1.55e-3 .. 2.06e-3 relative L2 q8 vs f16; KV 341/642 = 53.1 % (M2-T6) | `--kv q8` | — |
+| `expert-slot-layout` | MoE slot gather/combine order differs; parity passes `--fixed-experts` so routing is identical | not measured above the summation-order floor yet; re-recorded in the window | `--fixed-experts` | — |
+| `either-mode-ambiguity` | llama.cpp's token-by-token and one-batch runs disagree here; both backends sit on a near-tie | llama.cpp self-agreement 630/640 (`docs/m6-results.md`) | — | — |
+
+### Unexplained
+
+None on the pre-M2 artifacts: all 9 cross-backend positions map to a registry entry, and 7 of them
+to the same one (`gemm-int8-vs-f16`, owned by M3-T5). The M2-build run re-checks this; the gate is
+`unexplained == 0`.
+
+### Commands (CPU part)
+
+```sh
+cargo build --release
+cargo test --release --lib cuda::            # 21 passed
+python3 -I tools/consistency.py --cuda target/parity-result-cuda-sm70.json \
+  --vulkan target/parity-result-vk-sm70.json --cuda-tag cuda-sm70 --vulkan-tag vk-sm70 \
+  --status pre-m2 --out docs/parity/cross-backend.json    # 9 of 640, unexplained 0, exit 0
+```
+
