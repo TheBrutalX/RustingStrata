@@ -1060,8 +1060,10 @@ files into `docs/parity/cross-backend.json` plus the markdown rows of this secti
   divergences an arm resolves and how many it leaves;
 - full-vocabulary KLD from two `perplexity --kld-base` dumps (`--kld`), pure Python (no numpy on
   this host), computing mean/max KLD, RMS Δp, top-1 agreement and Σp as a normalization check;
-- exit 1 if any divergence is unexplained. Artifacts contain no `argmax`/`top5` arrays; the
-  committed summary is numbers only.
+- exit 1 if any divergence is unexplained. The committed summary has no full-vocabulary arrays: no
+  640-position `argmax` and no per-position logprobs. The only arrays are the five `(token, logprob)`
+  pairs at each divergent position, for both backends (7 positions × 2 × 5 in the M2 run) — the
+  evidence the report needs for the top-5 gaps, not a logits dump.
 
 ### Dry run on the pre-M2 artifacts (history, not current evidence)
 
@@ -1144,7 +1146,7 @@ report and must weigh it.
 | 16 | What license terms apply here? Summarize: | 0 | 27775 | 760 | 27775 | 27775 | `gemm-int8-vs-f16` | 0.3123 | 0.0319 |
 | 16 | What license terms apply here? Summarize: | 23 | 3665 | 4530 | 3665 | 3665 | `gemm-int8-vs-f16` | 0.5384 | 0.4321 |
 | 17 | Find the error in this log: | 13 | 8240 | 332 | 332 | 8240 | `either-mode-ambiguity` | 0.03493 | 0.02267 |
-| 17 | Find the error in this log: | 16 | 4490 | 1412 | 4490 | 4490 | `gemm-int8-vs-f16` | 0.2655 | 0.2728 |
+| 17 | Find the error in this log: | 16 | 4490 | 1412 | 4490 | 4490 | `no-coop-matrices` | 0.2655 | 0.2728 |
 | 18 | Which of these cities is the largest by population | 30 | 364 | 12041 | 364 | 364 | `gemm-int8-vs-f16` | 0.249 | 0.1016 |
 | 19 | List the keys whose value is false: | 3 | 4566 | 3766 | 4566 | 4566 | `gemm-int8-vs-f16` | 0.2722 | 0.2307 |
 
@@ -1163,12 +1165,20 @@ report and must weigh it.
   summation order of M2-T1/M2-T2, not a kernel error. Both positions are near-ties (CUDA top-2 gaps
   at 17/8 = 0.1714, at 19/0 = 0.0642).
 - The Vulkan `STRATA_MMQ=` (empty, f16 GEMM) arm moves **8 positions** and reaches **629/640 strict,
-  635/640 either** (up from 625/629): 6 of the 7 cross-backend divergences disappear, so the Vulkan
-  parity gap is the int8 GEMM path, not attention or the KV cache (M3-T5's hypothesis, now measured).
-  It leaves 2 divergences, both at the positions where M2 CUDA left the reference (17/8, 19/0):
-  there the f16 Vulkan GEMM is *on* the reference and CUDA is not.
-- LLM sampler/argmax, KV store, MoE combine and the elementwise set are bit-identical across
-  backends (per-op table below), so the end-to-end differences are GEMM arithmetic only.
+  635/640 either** (up from 625/629). It resolves **6 of the 7** cross-backend divergences, so those
+  six are the int8 GEMM path, not attention or the KV cache (M3-T5's hypothesis, now measured). It
+  leaves **3** divergences:
+  - prompt 17 pos 16 **persists**: the f16 Vulkan GEMM still picks 1412 where CUDA and the reference
+    take 4490. The arm refutes `gemm-int8-vs-f16` for this position: it is the same-math reduction
+    order of a f16 GEMM without cooperative matrices, so it is attributed to `no-coop-matrices`
+    (M3-T5) instead.
+  - prompt 17 pos 8 and prompt 19 pos 0 become divergences **in the opposite direction**: the f16
+    Vulkan GEMM is on the reference there and the M2 CUDA tensor-core path is not (the two positions
+    isolated by the FMA arm above).
+- Where the table below shows `0 bits`, the kernels are bit-identical across backends (decode
+  attention, DeltaNet, KV store, dequant, GEMV); the end-to-end differences are GEMM arithmetic only.
+  MoE combine, conv, router top-k, norm/rope/gate and swiglu/add are assert-only in the first window
+  and get measured rows from the follow-up window's logs.
 
 ### Per-op table (M2 build)
 
@@ -1321,10 +1331,13 @@ territory and not re-recorded here.
 ### Per-op highlights
 
 - dequant is **bit-exact** on every type on both backends (`max 0.00e+00` against the CPU reference);
-  GEMV/Gemm-vs-CPU is 4.1e-7 … 9.6e-7 for CUDA and 0 … 8.2e-7 for Vulkan.
-- GEMM on the same math: CUDA vs Vulkan 1e-6 … 1e-6 (f16 tensor cores vs f16 workgroup reduction),
-  the Q4_K … IQ4_XS int8-vs-f16 rows 3.17e-3 … 4.08e-3, the f16-conversion rows 4.79e-5 (F32) and
-  5.41e-4 (IQ2_XS) — reproducing the pre-M2 registry magnitudes on the M2 build.
+  GEMV vs CPU is **4.12e-7 … 8.36e-7** on both backends (identical figures: the GEMV outputs are the
+  same bits), GEMM vs CPU is 4.0e-7 … 9.6e-7.
+- GEMM across backends: the Q4_K … IQ4_XS int8-vs-f16 rows are 3.17e-3 … 4.08e-3 and the
+  f16-conversion rows 4.79e-5 (F32) and 5.41e-4 (IQ2_XS) — the pre-M2 registry magnitudes,
+  reproduced on the M2 build. No `[same math]` row is produced in this window: for every type the
+  two backends either take different GEMM math (int8 vs f16) or different f16 input conversions, so
+  the test's same-math branch is never entered.
 - attention: decode is **bit-identical** across backends (0 differing bits, 18 shapes, rel err vs
   CPU 9.6e-8 … 1.4e-7); prefill is 3.0e-5 … 7.3e-5 cross-backend (tensor cores vs no cooperative
   matrices), prefill-vs-decode 1.2e-7 … 4.4e-7 on Vulkan and 3.0e-5 … 7.3e-5 on CUDA — i.e. the M2
@@ -1350,10 +1363,12 @@ territory and not re-recorded here.
 ### Unexplained
 
 None, on the pre-M2 dry run (9/640) or on the M2 build (**7/640**). Every M2 divergence maps to a
-registry entry: 5 to `gemm-int8-vs-f16` (Vulkan int8 GEMM, M3-T5) and 2 to `either-mode-ambiguity`
+registry entry: 4 to `gemm-int8-vs-f16` (Vulkan int8 GEMM, M3-T5), 2 to `either-mode-ambiguity`
 (prompt 12 pos 5, prompt 17 pos 13 — CUDA takes the one-batch llama.cpp token, Vulkan the reference
-token). The `STRATA_MMQ=` arm independently confirms the first group; the FMA arm confirms that the
-two positions lost against the M1 parity record are tensor-core summation order, not a fault.
+token) and 1 to `no-coop-matrices` (prompt 17 pos 16, where the `STRATA_MMQ=` f16 arm does not move
+the token at all, so quantization cannot be the cause). The arm evidence sets each attribution's
+`confidence`; the FMA arm confirms that the two positions lost against the M1 parity record are
+tensor-core summation order, not a fault.
 
 **Open follow-ups** (not fixed here, per the issue's out-of-scope): M3-T5 for the Vulkan int8 GEMM
 gap (with the arm as evidence), and the CUDA 628/634 vs M1 630/636 tensor-core delta for M2-T8.

@@ -20,7 +20,9 @@
 #     --kld target/kld-cuda.bin target/kld-vk.bin \
 #     --date 2026-11-XX --out docs/parity/cross-backend.json --markdown /tmp/m2t7-rows.md
 #
-# No GPU, no model, no network. The committed summary never contains `argmax`/`top5` arrays.
+# No GPU, no model, no network. The committed summary has no full-vocabulary arrays: no 640-position
+# `argmax` and no per-position logprobs. The only arrays are the five (token, logprob) pairs at each of
+# the divergent positions, for both backends, which the report needs to show the top-5 gap.
 import argparse
 import datetime
 import json
@@ -153,8 +155,14 @@ def same_layout(c, v):
             sys.exit(f"{a['prompt']!r}: {len(a['argmax'])} vs {len(b['argmax'])} positions")
 
 
-def divergences(c, v, ref, alt, prompts):
-    """Every position where the two backends' greedy argmax differs, with its attribution."""
+def divergences(c, v, ref, alt, prompts, f16=None):
+    """Every position where the two backends' greedy argmax differs, with its attribution.
+
+    `f16` is the Vulkan `STRATA_MMQ=` (f16 GEMM) arm's rows. When it is available it decides between
+    the two named GEMM mechanisms: a position the f16 arm still gets wrong is *not* explained by the
+    int8 quantization (the arm would have fixed it) and falls to the same-math reduction order.
+    Without the arm the attribution is a registry hypothesis and says so in `confidence`.
+    """
     out = []
     for pi, (cr, vr) in enumerate(zip(c["rows"], v["rows"])):
         for pos, (a, b) in enumerate(zip(cr["argmax"], vr["argmax"])):
@@ -178,8 +186,16 @@ def divergences(c, v, ref, alt, prompts):
                 else:
                     follow_up = "CUDA misses a position Vulkan matches: open CUDA follow-up"
             elif cuda_ok is True and vk_ok is False:
-                explained_by, follow_up = "gemm-int8-vs-f16", "M3-T5"
-                confidence = "registry (STRATA_MMQ= arm pending)" if c["total"] else "registry"
+                follow_up = "M3-T5"
+                if f16 is not None:
+                    arm_tok = f16[pi]["argmax"][pos]
+                    if arm_tok == b:
+                        # The f16 GEMM picks the same token as the int8 one: quantization is not the cause.
+                        explained_by, confidence = "no-coop-matrices", "arm (STRATA_MMQ= does not move it)"
+                    else:
+                        explained_by, confidence = "gemm-int8-vs-f16", "arm (STRATA_MMQ= moves it)"
+                else:
+                    explained_by, confidence = "gemm-int8-vs-f16", "registry (no arm evidence)"
             elif ref_tok is not None:
                 follow_up = "both backends miss the reference here: open follow-up"
             d = {
@@ -218,6 +234,13 @@ NUM = r"(-?[\d.]+(?:e[-+]?\d+)?)"
 # Each entry: (compiled regex, builder(match) -> (op, case, column, metric, value, explained_by))
 # `column` is one of cuda_vs_cpu, vulkan_vs_cpu, cuda_vs_vulkan. `{bk}` in the line resolves to the
 # section's backend; a cross line names both backends explicitly.
+# Ops whose cross-backend figure is a known same-math reduction-order difference rather than a fault.
+REGISTRY_HINT = {"conv": "summation-order", "conv_state": "summation-order", "conv_seq": "summation-order",
+                 "conv_l2_norm": "summation-order", "moe_gemv": "expert-slot-layout",
+                 "moe_combine": "expert-slot-layout", "ssm_gates": "summation-order",
+                 "ssm_gates_g": "summation-order", "router_topk": None, "swiglu": None, "add": None,
+                 "rms_norm": None, "l2_norm": None, "rope_neox": None, "norm_gate": None}
+
 PATTERNS = [
     # tests/kernels.rs:56 / :66 — dequant + GEMV per type
     (re.compile(r"^\s*(\w+)\s+(\S+): dequant max diff " + NUM + r", gemv rel err " + NUM),
@@ -269,6 +292,15 @@ PATTERNS = [
     (re.compile(r"^prefill hd (\d+): llama mode vs f64 " + NUM + r", tensor-core kernel vs f64 " + NUM),
      lambda m, bk: [("attn_prefill_llama", f"hd {m[1]}", "llama_vs_cpu", "rel_l2", float(m[2]), None),
                     ("attn_prefill_llama", f"hd {m[1]}", "default_vs_cpu", "rel_l2", float(m[3]), None)]),
+    # tests/kernels.rs — measurement-only lines added by M2-T7 ("op <name> <bk> [<case>]: ...")
+    (re.compile(r"^op (\w+) (cuda|vulkan) \[(.*)\]: rel err vs CPU " + NUM + r", (\d+) of (\d+) differ from the first backend"),
+     lambda m, bk: [(m[1], m[3], f"{m[2]}_vs_cpu", "rel_l2", float(m[4]), REGISTRY_HINT.get(m[1])),
+                    (m[1], m[3], "cuda_vs_vulkan", "differing_bits", int(m[5]), REGISTRY_HINT.get(m[1]))]),
+    (re.compile(r"^op (\w+) (cuda|vulkan) \[(.*)\]: max abs " + NUM + r", (\d+) of (\d+) differ from the first backend"),
+     lambda m, bk: [(m[1], m[3], f"{m[2]}_vs_cpu", "max_abs", float(m[4]), REGISTRY_HINT.get(m[1])),
+                    (m[1], m[3], "cuda_vs_vulkan", "differing_bits", int(m[5]), REGISTRY_HINT.get(m[1]))]),
+    (re.compile(r"^op (\w+) (cuda|vulkan) \[(.*)\]: (\d+) of (\d+) differ from the first backend"),
+     lambda m, bk: [(m[1], m[3], "cuda_vs_vulkan", "differing_bits", int(m[4]), REGISTRY_HINT.get(m[1]))]),
     # tests/kv_q8.rs:79 — q8 KV vs f16 KV
     (re.compile(r"^nh (\d+) nkv (\d+) hd (\d+) kernel (\d+): q8 vs f16 decode " + NUM
                 + r", q8 prefill vs decode " + NUM),
@@ -623,6 +655,8 @@ def main():
     ap.add_argument("--kernels", action="append", default=[], help="--nocapture test log (repeatable)")
     ap.add_argument("--arm", action="append", default=[], metavar="NAME=FILE",
                     help="attribution arm result file, compared against --cuda (repeatable)")
+    ap.add_argument("--f16-arm", metavar="FILE",
+                    help="Vulkan STRATA_MMQ= (f16 GEMM) parity result; decides int8-vs-same-math attribution")
     ap.add_argument("--kld", nargs=2, metavar=("BASE", "OTHER"), help="two perplexity --kld-base files")
     ap.add_argument("--date", default=datetime.date.today().isoformat())
     ap.add_argument("--status", default="pre-m2", choices=["pre-m2", "m2", "dry-run"],
@@ -668,7 +702,13 @@ def main():
     prompts = json.load(open(rp(args.prompts))) if rp(args.prompts).is_file() else None
     c["file"], v["file"] = rel(args.cuda), rel(args.vulkan)
 
-    div = divergences(c, v, ref, alt, prompts)
+    f16 = None
+    if args.f16_arm:
+        if not pathlib.Path(args.f16_arm).is_file():
+            sys.exit(f"--f16-arm {args.f16_arm}: no such file")
+        f16 = load_parity(args.f16_arm)["rows"]
+        same_layout(c, {"rows": f16})
+    div = divergences(c, v, ref, alt, prompts, f16)
 
     arms = []
     for spec in args.arm:
@@ -677,7 +717,7 @@ def main():
             sys.exit(f"--arm {spec}: no such file")
         a = load_parity(path)
         same_layout(c, a)
-        ad = divergences(c, a, ref, alt, prompts)
+        ad = divergences(c, a, ref, alt, prompts, f16)
         base = {(d0["prompt"], d0["position"]) for d0 in div}
         arm_pos = {(d0["prompt"], d0["position"]) for d0 in ad}
         arms.append({

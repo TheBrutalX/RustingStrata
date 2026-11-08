@@ -111,7 +111,7 @@
    "vulkan_matches_reference": false,
    "cuda_matches_alt": true,
    "explained_by": "gemm-int8-vs-f16",
-   "confidence": "registry (STRATA_MMQ= arm pending)",
+   "confidence": "arm (STRATA_MMQ= moves it)",
    "follow_up": "M3-T5",
    "cuda_top5": [
     [
@@ -172,7 +172,7 @@
    "vulkan_matches_reference": false,
    "cuda_matches_alt": true,
    "explained_by": "gemm-int8-vs-f16",
-   "confidence": "registry (STRATA_MMQ= arm pending)",
+   "confidence": "arm (STRATA_MMQ= moves it)",
    "follow_up": "M3-T5",
    "cuda_top5": [
     [
@@ -293,8 +293,8 @@
    "cuda_matches_reference": true,
    "vulkan_matches_reference": false,
    "cuda_matches_alt": true,
-   "explained_by": "gemm-int8-vs-f16",
-   "confidence": "registry (STRATA_MMQ= arm pending)",
+   "explained_by": "no-coop-matrices",
+   "confidence": "arm (STRATA_MMQ= does not move it)",
    "follow_up": "M3-T5",
    "cuda_top5": [
     [
@@ -355,7 +355,7 @@
    "vulkan_matches_reference": false,
    "cuda_matches_alt": true,
    "explained_by": "gemm-int8-vs-f16",
-   "confidence": "registry (STRATA_MMQ= arm pending)",
+   "confidence": "arm (STRATA_MMQ= moves it)",
    "follow_up": "M3-T5",
    "cuda_top5": [
     [
@@ -416,7 +416,7 @@
    "vulkan_matches_reference": false,
    "cuda_matches_alt": true,
    "explained_by": "gemm-int8-vs-f16",
-   "confidence": "registry (STRATA_MMQ= arm pending)",
+   "confidence": "arm (STRATA_MMQ= moves it)",
    "follow_up": "M3-T5",
    "cuda_top5": [
     [
