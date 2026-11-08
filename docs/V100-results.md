@@ -1660,7 +1660,7 @@ the historical Nov 6 entries. The GPU was left at 0 MiB and
 | M2-T5 decode GEMV bandwidth | #30 / #31 (`b4d7408`) | 214.2 GB/s = 23.9 % of the 898.0 GB/s roofline, decode +3.2-3.3 % |
 | M2-T6 CUDA flags: KV q8, parallel, MTP | #32 / #33 (`54a0c1f`) | q8 halves KV at equal speed, `--serve --parallel 4` = 1.67x, MTP k=2 +64 % on the 27B |
 | M2-T7 cross-backend numerical consistency | #36 / #37 (`78dbbcd`) | CUDA 634/640 either-mode (2 near-tie positions from tensor-core summation order), Vulkan 629/640 (int8 GEMM, M3-T5) |
-| M2-T8 CUDA performance gate | #38 / this PR | prefill @4096 2945.7 tok/s (met), decode 129.4/125.1/110.6 with a coordinator-approved revised target, no `Xid`, Vulkan prefill @4096 -0.4 % (M3-T4) |
+| M2-T8 CUDA performance gate | #38 / #39 (`07e2cba`) | prefill @4096 2945.7 tok/s (met), decode 129.4/125.1/110.6 with a coordinator-approved revised target, no `Xid`, Vulkan prefill @4096 -0.4 % (M3-T4) |
 
 Net M2 effect, as recorded by the individual tasks: prefill @512 +123.6 % and
 @4096 +90.7 % from the Volta tensor cores (T1), a further prefill gain of
