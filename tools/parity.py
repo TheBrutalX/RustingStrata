@@ -131,7 +131,7 @@ for pi, p in enumerate(prompts[a.start :], a.start):
             "top5": res["top5"],
         }
     )
-    print({k: v for k, v in rows[-1].items() if k != "argmax"}, flush=True)
+    print({k: v for k, v in rows[-1].items() if k not in ("argmax", "top5")}, flush=True)
 pct = 100 * agree / total
 print(f"TOP1 AGREEMENT {agree}/{total} = {pct:.2f}%")
 if alt is not None:

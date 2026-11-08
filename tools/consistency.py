@@ -457,7 +457,10 @@ def summary(c, v, div, arms, per_op, other_measurements, unparsed, skipped, kld,
         "date": args.date,
         "generator": "tools/consistency.py",
         "status": args.status,
-        "note": (None if args.status == "m2" else
+        "note": ("Computed on the M2 build in the M2-T7 GPU window (2026-11-08): both backends re-run "
+                 "on the same cached reference, plus the STRATA_MMQ= (f16 GEMM) and STRATA_GEMM_FMA=1 "
+                 "attribution arms. Per-op rows come from the --nocapture logs of tests/kernels.rs and "
+                 "tests/llama_numerics.rs." if args.status == "m2" else
                  "Computed from the pre-M2 artifacts (CUDA from M1 ae95739, Vulkan from M0 d6c2beb): "
                  "a CPU dry run that reproduces the documented 9/640. History only; the M2-T7 GPU "
                  "window replaces this file with the current-build run."),
