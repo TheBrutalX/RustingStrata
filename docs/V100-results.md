@@ -2181,3 +2181,123 @@ commit `5a551eb` + `gemmi.glsl` variant A (`1646a9f`/`2ca5718` rebased), model
 kernels whose committed `.spv` predate the local glslc (pre-existing drift);
 `gemmi_dp.spv` and the cooperative `gemmi`/`gemmi_s` build byte-identically
 from the final source.
+## 2026-11-08 — Per-type f16 GEMM ablation on Vulkan (M3-T5, issue #44)
+
+Built from `task/44-vulkan-int8-gemm` `07673a7` (the `STRATA_VK_MMQ` /
+`STRATA_VK_F16_TYPES` knobs; `d8e5b1c` before the rebase onto `v100`), in an isolated worktree. Reference model, Vulkan
+sm_70, `--llama-numerics --fixed-experts`; parity tags `m3t5-*` in `target/`.
+The 7 int8-attributed positions of this run (0-based prompt, 0-based position
+of the 32-token continuation) are `(15,0) (15,23) (16,8) (17,30) (18,0) (18,3)`
+plus the `no-coop-matrices` residual `(16,16)`. Four further misses
+`(6,9) (9,9) (9,28) (10,30)` are in every arm (evidence by both llama modes
+absent) and are not part of the int8 gap.
+
+### Single-type arms (`STRATA_VK_F16_TYPES=<id>`)
+
+| type | id | either-mode | int8 positions fixed | new misses |
+| --- | ---: | ---: | ---: | --- |
+| — (default int8) | — | 629/640 | 0/7 | — |
+| Q4_K | 12 | 629/640 | 0/7 | — |
+| Q5_K | 13 | 631/640 | 3/7 | (1,12) |
+| Q6_K | 14 | 630/640 | 2/7 | (16,20) |
+| IQ2_XS | 17 | 631/640 | 3/7 | (17,29) |
+| IQ3_XXS | 18 | 630/640 | 3/7 | (1,12) (14,2) |
+| IQ4_XS | 23 | 633/640 | 5/7 | (16,20) |
+| Q8_0 | 8 | 631/640 | 3/7 | (16,20) |
+| all int8 types (`STRATA_VK_MMQ=0`) | — | **635/640** | 6/7 | — |
+
+### Subsets (either-mode; 640 positions)
+
+| subset (ids) | either-mode |
+| --- | ---: |
+| 23,17 | 633/640 |
+| 23,14 / 23,13 | 630/640 |
+| 23,8 | 632/640 |
+| 23,17,13 | 633/640 |
+| 23,17,8 | 630/640 |
+| 23,17,13,8 | 632/640 |
+| 17,18,23,8 / 13,18,23,8 | 631/640 |
+| **13,17,18,23,8** (Q5_K, IQ2_XS, IQ3_XXS, IQ4_XS, Q8_0) | **634/640** |
+| 14,17,18,23,8 | 633/640 |
+| 13,14,18,23,8 | 633/640 |
+| 13,14,17,23,8 | 631/640 |
+| 13,14,17,18,8 | 631/640 |
+| 13,14,17,18,23,8 (all int8 types minus Q4_K) | 635/640 |
+
+The smallest subset reaching the parity bar is five types, and it still leaves
+the `no-coop-matrices` residual `(16,16)`; adding one more type flips the
+near-tie positions again (per-type gains are not additive).
+
+### Cost and numeric gate of the winning subset
+
+`--pp 512,4096 --tg 32 --reps 2 --ctx 4200`, mean (min–max), same window:
+
+| arm | pp 512 | pp 4096 | decode @4096 | `prefill_matches_reference` |
+| --- | ---: | ---: | ---: | --- |
+| default (int8) | 771.9 (770.1–773.7) | 1425.4 (1421.0–1429.8) | 115.2 (114.8–115.7) | FAIL (15019) |
+| `STRATA_VK_F16_TYPES=13,17,18,23,8` | 604.5 (602.3–606.7) | 1172.9 (1171.5–1174.3) | 114.6 (112.9–116.2) | **FAIL** (3302 vs 4938, max abs dlogit 1.5835) |
+| `STRATA_VK_MMQ=0` (blanket) | — | — | — | PASS (4938, max abs dlogit 0.7616) |
+
+The blanket row is **not** from this window: its 1135.2 tok/s (−20.7 %) and its
+`prefill_matches_reference` PASS are those of the earlier
+2026-11-08 "Cost of the f16 GEMM fallback on Vulkan" block (same
+`--pp 512,4096 --tg 32 --reps 2 --ctx 4200` command, different run). Only the
+subset row and the default row were measured here.
+
+The subset costs **−17.7 % prefill at 4096** (−21.7 % at 512) and, although it
+reaches 634/640 either-mode, **still fails `prefill_matches_reference`**
+(next-step argmax 3302 against CPU 4938). Decode is unchanged within noise
+(−0.5 %).
+
+### Decision
+
+Per the coordinator's rule (stop above 5 % prefill cost) and the original T3
+tier (>15 %): **no default change**. The knobs ship as measurement tooling
+only, and the parity bar alone does not identify an admissible subset: the one
+subset that meets it fails the model-level numeric test and costs 17.7 % at
+4K. Closing the gap needs either the blanket f16 arm (635/640 and a green
+test, −20.7 % at 4K from the earlier cost block) accepted with an M3
+exit-criterion amendment, or an int8 GEMM accuracy fix (follow-up). Q4_K and
+Q6_K do not move any position they are solely needed for: Q4_K moves nothing,
+Q6_K can be dropped from the 5-type subset at the cost of one near-tie
+position. The subset rows above are the complete measured set; the earlier dev
+report grouped `13,14,18,23,8 / 13,14,17,23,8 / 13,14,17,18,8` as 631–633,
+which is the range of those three rows (633, 631, 631).
+
+Environment: `no Xid` before and after (count 42), `nvidia-smi` 0 MiB,
+`llama.router.service` inactive for the window and left free.
+
+**Coordinator decision (M3-T5, issue #44):** keep the int8 default and the current numbers as the
+documented ceiling. Both f16 arms are rejected: the blanket one passes the test but costs −20.7 % prefill
+at 4K, and the 5-type subset costs −17.7 % and still fails `prefill_matches_reference`, so neither can be
+shipped against the M3 Vulkan baseline (1425 tok/s at 4K). `STRATA_VK_MMQ` / `STRATA_VK_F16_TYPES` ship as
+measurement tooling only; **no default changes**. The accuracy work continues in #50
+(`[vulkan] int8 GEMM accuracy (M3-T5 follow-up)`). The default artifact remains 625 strict / 629
+either-mode with `prefill_matches_reference` failing (15019 vs 4938).
+
+## 2026-11-08 — M3-T5 control evidence, review round (issue #44)
+
+Same reference model and machine, on `task/44-vulkan-int8-gemm` rebased onto `v100` `25b85d4`
+(knobs commit `07673a7`), from the isolated worktree; one short window, GPU free, service stopped.
+
+### Parity controls (`--llama-numerics --fixed-experts`, 20 prompts × 32 tokens)
+
+| arm | top-1 | either-mode | divergent positions |
+| --- | ---: | ---: | --- |
+| default (no env) | 625/640 | 629/640 | 11, as recorded in the ablation block |
+| `STRATA_VK_MMQ=1` (int8 control, tag `m3t5-mmq1`) | 625/640 | 629/640 | **identical set** to the default |
+| CUDA (`--backend cuda`, tag `m3-cuda-sm70`) | 628/640 | **634/640** | 6 `(6,9) (9,9) (9,28) (10,30) (16,8) (18,0)` |
+
+The control reproduces the old artifact's parity and positions. Qualification: `STRATA_VK_MMQ=1`
+is the old path only for the types the policy already runs as int8 — it also forces IQ2_XS/IQ2_S onto
+int8, whereas the policy runs them as f16 outside `--llama-numerics`. With `--llama-numerics` both were
+int8 already, so the control and the default are identical here.
+
+### Per-op int8 GEMM (`tests/kernels.rs::gemm_matches_reference_for_every_type`, Vulkan)
+
+PASS, one `MATRIX` line per reference-model type against the per-backend scalar reference (assertion
+1e-4): Q5_K 8.16e-7, IQ3_XXS 4.02e-7, Q6_K 4.12e-7, IQ2_XS 0.00e0, F32 0.00e0, IQ4_XS 4.39e-7,
+Q8_0 4.12e-7, Q4_K 7.71e-7 relative L2 — the `Backend::mmq` routing keeps the int8 kernel green.
+
+Environment: `no Xid` before and after (count 42), `nvidia-smi` back to idle, `llama.router.service`
+inactive and left stopped.

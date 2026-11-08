@@ -158,6 +158,12 @@ struct Inner {
     /// `maxComputeSharedMemorySize` of the device (or STRATA_VK_SMEM_LIMIT, a test hook): no pipeline may need more
     /// `Workgroup` bytes than this (`Vk::pipeline`), or the driver accepts it and faults at dispatch (Xid 13 on Volta).
     smem_limit: u32,
+    /// STRATA_VK_MMQ: `Some(false)` forces the f16 `gemm_f_dp` and `Some(true)` the int8 `gemmi_dp` prefill GEMM for
+    /// every type (measurement knob); unset keeps `Gpu::mmq`'s type policy. See `mmq_for`.
+    mmq_force: Option<bool>,
+    /// STRATA_VK_F16_TYPES: the ggml types forced onto the f16 prefill GEMM, the others keeping the type policy.
+    /// Parsed at device setup (`f16_types`), so a typo fails at startup, not silently on the first GEMM.
+    f16_types: Vec<GgmlType>,
     /// STRATA_VK_STATS: print the driver's statistics (registers, ...) of each pipeline as it is created.
     stats: bool,
     /// The one pipeline layout: a 128-byte push constant range (the Vulkan minimum), no descriptor sets.
@@ -420,7 +426,9 @@ impl Vk {
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, staged: 0, ops: 0, copied: (0, 0), bufs: BTreeMap::new(), err: Default::default(),
             prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None } };
         let cr = cond.then(|| ash::ext::conditional_rendering::Device::new(&instance, &dev));
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, coop, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), smem_limit, stats, layout, st: Mutex::new(st) };
+        let mmq_force = mmq_force(env_str("STRATA_VK_MMQ")?.as_deref())?;
+        let f16_types = env_str("STRATA_VK_F16_TYPES")?.map(|v| f16_types(&v)).transpose()?.unwrap_or_default();
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, coop, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), smem_limit, mmq_force, f16_types, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -448,7 +456,14 @@ impl Vk {
         let s = |c: &[std::ffi::c_char]| unsafe { std::ffi::CStr::from_ptr(c.as_ptr()) }.to_string_lossy().into_owned();
         let yn = |b: bool| if b { "yes" } else { "no" };
         let amd = if v.0.amd_plain || v.0.amd_coherent { format!(", device-coherent memory {}", yn(v.0.amd_coherent)) } else { String::new() };
-        eprintln!("vulkan: {name} ({} {}){amd}, cooperative matrix f16 {} int8 {}, conditional rendering {}, maxComputeSharedMemorySize {}",
+        let gg = if let Some(f) = v.0.mmq_force {
+            format!(", prefill GEMM forced {} (STRATA_VK_MMQ)", if f { "int8" } else { "f16" })
+        } else if !v.0.f16_types.is_empty() {
+            format!(", prefill GEMM f16 for {} (STRATA_VK_F16_TYPES)", v.0.f16_types.iter().map(|t| t.name()).collect::<Vec<_>>().join(","))
+        } else {
+            String::new()
+        };
+        eprintln!("vulkan: {name} ({} {}){amd}, cooperative matrix f16 {} int8 {}, conditional rendering {}{gg}, maxComputeSharedMemorySize {}",
             s(&drv.driver_name), s(&drv.driver_info), yn(v.0.coop), yn(v.0.coop_i8), yn(v.0.cr.is_some() && !v.0.st().no_cond), v.0.smem_limit);
         Ok(v)
     }
@@ -808,7 +823,7 @@ impl Vk {
 
 impl Vk {
     /// `gemm` over a tile list, or (tiles = 0) the dense matrix `wd` over positions 0 .. nd; as `gemm_raw` in
-    /// src/cuda/mod.rs, with the same choice of f16 or int8 products (`Gpu::mmq`).
+    /// src/cuda/mod.rs, with the same choice of f16 or int8 products (`self.mmq`).
     fn gemm_raw(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, wd: u64, nd: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
         // Partial super-blocks (Q2_0's 640 columns, BF16's 320) are fine: K steps are 64 deep.
         ensure!(cols % 64 == 0, "{} matrix with {cols} columns: GEMM needs a multiple of 64", ty.name());
@@ -816,7 +831,7 @@ impl Vk {
         let (spec, grid, nk) = (self.wspec(ty), [rows.div_ceil(64), n_tiles, 1], (cols / 64) as u32);
         // A dense GEMM of few workgroups runs as gemm_fs/gemmi_s (cooperative matrices only), 32 positions a
         // workgroup (as on CUDA).
-        let f = !crate::cuda::Gpu::mmq(ty) || cols % 128 != 0;
+        let f = !self.mmq(ty) || cols % 128 != 0;
         let sm = tiles == 0 && grid[0] * grid[1] < 112 && if f { self.0.coop } else { self.0.coop_i8 };
         let grid = if sm { [grid[0], nd.div_ceil(32), 1] } else { grid };
         let (same, act) = (act & SAME_X != 0, act & !SAME_X);
@@ -855,6 +870,51 @@ fn gemv_cols(llama: u32, ty: GgmlType, cols: usize) -> anyhow::Result<u32> {
     Ok(cols as u32)
 }
 
+/// The Vulkan prefill GEMM decision for `ty`: the static type policy (`Gpu::mmq`, shared with CUDA) with the
+/// measurement knobs on top. A blanket `STRATA_VK_MMQ` force dominates the `STRATA_VK_F16_TYPES` list, which only
+/// moves types the policy already runs as int8 onto the f16 path. F32 and BF16 never take the int8 path (the policy
+/// says so and the preflight does not check `gemmi` for them), so the blanket knob cannot move them either.
+fn mmq_for(policy: bool, force: Option<bool>, f16_list: &[GgmlType], ty: GgmlType) -> bool {
+    if matches!(ty, GgmlType::F32 | GgmlType::BF16) { return false; }
+    force.unwrap_or(policy && !f16_list.contains(&ty))
+}
+
+/// The value of `name`, or `None` when it is unset. A value that is not UTF-8 is an error, not "unset": a corrupted
+/// knob must not silently measure the default arm (the same intent as rejecting a misspelled value).
+fn env_str(name: &str) -> anyhow::Result<Option<String>> { env_str_from(name, std::env::var_os(name)) }
+
+fn env_str_from(name: &str, v: Option<std::ffi::OsString>) -> anyhow::Result<Option<String>> {
+    match v {
+        None => Ok(None),
+        Some(v) => v.into_string().map(Some).map_err(|_| anyhow!("{name} is not valid UTF-8")),
+    }
+}
+
+/// `STRATA_VK_MMQ`: `0` forces the f16 `gemm_f_dp` for every type, `1` forces the int8 `gemmi_dp`; unset keeps the
+/// type policy. `1` is the old artifact only for the types the policy already ran as int8: it also moves IQ2_XS and
+/// IQ2_S, which the policy runs as f16 outside `--llama-numerics`, onto int8. Any other value is a startup error, so
+/// a typo cannot silently measure the other arm.
+fn mmq_force(v: Option<&str>) -> anyhow::Result<Option<bool>> {
+    match v {
+        None => Ok(None),
+        Some("0") => Ok(Some(false)),
+        Some("1") => Ok(Some(true)),
+        Some(s) => Err(anyhow!("STRATA_VK_MMQ must be 0 (f16 GEMM) or 1 (int8 GEMM), not {s:?}")),
+    }
+}
+
+/// `STRATA_VK_F16_TYPES`: comma-separated ggml type ids (e.g. `12,13` for Q4_K and Q5_K) whose prefill GEMM is forced
+/// onto the f16 `gemm_f_dp` path; the other types keep the policy. Empty entries are ignored, an unknown id is an
+/// error (see `GgmlType::from_u32` for the names).
+fn f16_types(v: &str) -> anyhow::Result<Vec<GgmlType>> {
+    v.split(',').map(str::trim).filter(|s| !s.is_empty())
+        .map(|s| {
+            let id: u32 = s.parse().map_err(|_| anyhow!("STRATA_VK_F16_TYPES: {s:?} is not a ggml type id"))?;
+            GgmlType::from_u32(id).map_err(|e| anyhow!("STRATA_VK_F16_TYPES: {e}"))
+        })
+        .collect()
+}
+
 #[allow(unused_variables)]
 impl Backend for Vk {
     fn name(&self) -> &'static str { "vulkan" }
@@ -864,6 +924,10 @@ impl Backend for Vk {
     }
 
     fn alloc(&self, bytes: usize) -> anyhow::Result<Buf> { Ok(self.buf(bytes, DEVICE)?.0) }
+
+    /// The prefill GEMM decision of this device: `Gpu::mmq`'s type policy with the `STRATA_VK_MMQ` and
+    /// `STRATA_VK_F16_TYPES` knobs (`gemm_raw` and the preflight both call this, so they cannot drift apart).
+    fn mmq(&self, ty: GgmlType) -> bool { mmq_for(crate::cuda::Gpu::mmq(ty), self.0.mmq_force, &self.0.f16_types, ty) }
 
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> {
         ensure!(off + src.len() <= dst.len(), "htod: {} bytes at {off} into {}", src.len(), dst.len());
@@ -1241,5 +1305,63 @@ impl Backend for Vk {
             &err, &(rows as u32), &((cols / 256) as u32), &((t * k) as u32), &(k as u32), &(y_off as u32), &(rpw as u32)])?;
         if mb != 0 { self.0.skip_rest(&mut self.0.st())?; }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use GgmlType::*;
+
+    #[test]
+    fn env_str_rejects_non_utf8() {
+        assert_eq!(env_str_from("X", None).unwrap(), None);
+        assert_eq!(env_str_from("X", Some("1".into())).unwrap().as_deref(), Some("1"));
+        // A corrupted value is an error, not "unset": the arm must not silently fall back to the default.
+        #[cfg(unix)] {
+            use std::os::unix::ffi::OsStringExt;
+            assert!(env_str_from("STRATA_VK_MMQ", Some(std::ffi::OsString::from_vec(vec![0xff, b'1']))).is_err());
+        }
+    }
+
+    #[test]
+    fn mmq_force_takes_only_0_and_1() {
+        assert_eq!(mmq_force(None).unwrap(), None);
+        assert_eq!(mmq_force(Some("0")).unwrap(), Some(false));
+        assert_eq!(mmq_force(Some("1")).unwrap(), Some(true));
+        assert!(mmq_force(Some("2")).is_err());
+        assert!(mmq_force(Some("")).is_err());
+        assert!(mmq_force(Some("f16")).is_err());
+    }
+
+    #[test]
+    fn f16_types_parses_ggml_ids() {
+        assert_eq!(f16_types("12,13,14").unwrap(), vec![Q4K, Q5K, Q6K]);
+        assert!(f16_types("").unwrap().is_empty());
+        assert_eq!(f16_types(" 12 , ,14 ").unwrap(), vec![Q4K, Q6K]);
+        assert_eq!(f16_types("18,17,23,8").unwrap(), vec![IQ3XXS, IQ2XS, IQ4XS, Q8_0]);
+        assert!(f16_types("12,999").is_err(), "unknown ggml id");
+        assert!(f16_types("q4_k").is_err(), "names are not ids");
+        assert!(f16_types("12,13.0").is_err(), "not an integer id");
+    }
+
+    #[test]
+    fn mmq_decision_matrix() {
+        // No knob: the static type policy (true = int8 `gemmi_dp`, false = f16 `gemm_f_dp`).
+        assert!(mmq_for(true, None, &[], Q4K));
+        assert!(!mmq_for(false, None, &[], Q4K));
+        // Per-type list: only the listed types drop to f16, and only within the int8 policy.
+        assert!(!mmq_for(true, None, &[Q4K], Q4K));
+        assert!(mmq_for(true, None, &[Q4K], Q5K));
+        assert!(!mmq_for(false, None, &[Q4K], Q4K));
+        assert!(!mmq_for(true, None, &[Q4K, Q5K], Q5K));
+        // Blanket force dominates the per-type list and the policy.
+        assert!(mmq_for(true, Some(true), &[Q4K], Q4K));
+        assert!(mmq_for(false, Some(true), &[], Q4K));
+        assert!(!mmq_for(true, Some(false), &[], Q4K));
+        assert!(!mmq_for(true, Some(false), &[Q4K], Q5K));
+        // Float weights keep their f16 kernel even under STRATA_VK_MMQ=1.
+        assert!(!mmq_for(false, Some(true), &[], F32));
+        assert!(!mmq_for(false, Some(true), &[], BF16));
     }
 }
