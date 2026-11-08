@@ -28,10 +28,11 @@ layout(push_constant) uniform P { U64 tiles; uint64_t wd; U32 x; I32 xrow; F32 y
 #ifndef SM
 #define SM 0
 #endif
-// Variant C (issue #47): the 32x32 tile a subgroup owns is a free choice. 0 is the baseline (rows from w >> 1,
-// columns from w & 1); 1 is the transposed assignment, where the two subgroups of a row pair also share their W
-// rows (bm from w & 1, bn from w >> 1). No shared bytes and no per-output order change either way. Build a variant
-// with `GLSL_DEFS=-DSUBMAP=1 tools/gen_spirv.sh` (see tools/gen_spirv.sh).
+// Variant C (issue #47): the 32x32 tile a subgroup owns is a free choice. The tile is 128 rows x 64 columns, i.e.
+// 4 row tiles and 2 column tiles, so the map must keep two bits for the row and one for the column. 0 is the
+// baseline (row = w >> 1, column = w & 1); 1 takes the column from w >> 2, so neighbouring subgroups share their W
+// rows and read the same global weight rows at the same time. No shared bytes and no per-output order change
+// either way. Build a variant with `GLSL_DEFS=-DSUBMAP=1 tools/gen_spirv.sh` (see tools/gen_spirv.sh).
 #ifndef SUBMAP
 #define SUBMAP 0
 #endif
@@ -128,7 +129,8 @@ void main() {
     // subgroups. Each output sums the same products in the same order either way.
     const bool sm = SM != 0;
 #if SUBMAP == 1
-    uint bm = sm ? 16 * (w & 1) : (w & 1) * 32, bn = sm ? 16 * (w >> 1) : (w >> 1) * 32;
+    // Two row bits from w & 1 and w >> 1, the column from w >> 2 (the sm path keeps its own 2 x 4 map).
+    uint bm = sm ? 16 * (w & 1) : ((w & 1) | (w >> 1 & 1) << 1) * 32, bn = sm ? 16 * (w >> 1) : (w >> 2) * 32;
 #else
     uint bm = sm ? 16 * (w & 1) : (w >> 1) * 32, bn = sm ? 16 * (w >> 1) : (w & 1) * 32;
 #endif
