@@ -490,6 +490,22 @@
  ],
  "per_op": [
   {
+   "op": "add",
+   "case": "n 1000, not a block multiple",
+   "cells": {
+    "cuda_vs_cpu": {
+     "rel_l2": 6.03e-09
+    },
+    "vulkan_vs_cpu": {
+     "rel_l2": 6.03e-09
+    },
+    "cuda_vs_vulkan": {
+     "differing_bits": 0
+    }
+   },
+   "explained_by": null
+  },
+  {
    "op": "attn_decode",
    "case": "pos 0 nh 24 nkv 2 hd 256 gq_min 0",
    "cells": {
@@ -1050,6 +1066,58 @@
    "explained_by": null
   },
   {
+   "op": "conv",
+   "case": "ch 300 kw 4, 2 steps",
+   "cells": {
+    "cuda_vs_cpu": {
+     "rel_l2": 5.49e-08
+    },
+    "vulkan_vs_cpu": {
+     "rel_l2": 5.49e-08
+    },
+    "cuda_vs_vulkan": {
+     "differing_bits": 0
+    }
+   },
+   "explained_by": "summation-order"
+  },
+  {
+   "op": "conv_l2_norm",
+   "case": "ch 424 kw 4",
+   "cells": {
+    "cuda_vs_vulkan": {
+     "differing_bits": 0
+    }
+   },
+   "explained_by": "summation-order"
+  },
+  {
+   "op": "conv_seq",
+   "case": "T 10 ch 96 kw 4",
+   "cells": {
+    "cuda_vs_vulkan": {
+     "differing_bits": 0
+    }
+   },
+   "explained_by": "summation-order"
+  },
+  {
+   "op": "conv_state",
+   "case": "ch 300 kw 4, 2 steps",
+   "cells": {
+    "cuda_vs_cpu": {
+     "rel_l2": 0.0
+    },
+    "vulkan_vs_cpu": {
+     "rel_l2": 0.0
+    },
+    "cuda_vs_vulkan": {
+     "differing_bits": 0
+    }
+   },
+   "explained_by": "summation-order"
+  },
+  {
    "op": "deltanet",
    "case": "ilv false",
    "cells": {
@@ -1216,16 +1284,6 @@
   },
   {
    "op": "gemm",
-   "case": "F32 blk.0.ffn_gate_inp.weight [different GEMM math]",
-   "cells": {
-    "cuda_vs_vulkan": {
-     "rel_l2": 4.79e-05
-    }
-   },
-   "explained_by": "gemm-int8-vs-f16"
-  },
-  {
-   "op": "gemm",
    "case": "F32 blk.0.ffn_gate_inp.weight [different f16 input conversion]",
    "cells": {
     "cuda_vs_vulkan": {
@@ -1246,16 +1304,6 @@
     }
    },
    "explained_by": null
-  },
-  {
-   "op": "gemm",
-   "case": "IQ2_XS blk.0.ffn_gate_exps.weight [different GEMM math]",
-   "cells": {
-    "cuda_vs_vulkan": {
-     "rel_l2": 0.000541
-    }
-   },
-   "explained_by": "gemm-int8-vs-f16"
   },
   {
    "op": "gemm",
@@ -1414,6 +1462,182 @@
     },
     "vulkan_vs_cpu": {
      "rel_l2": 6.92e-07
+    }
+   },
+   "explained_by": null
+  },
+  {
+   "op": "l2_norm",
+   "case": "128 x 2 per token, 3 tokens",
+   "cells": {
+    "cuda_vs_cpu": {
+     "rel_l2": 5.89e-09
+    },
+    "vulkan_vs_cpu": {
+     "rel_l2": 5.89e-09
+    },
+    "cuda_vs_vulkan": {
+     "differing_bits": 0
+    }
+   },
+   "explained_by": null
+  },
+  {
+   "op": "moe_combine",
+   "case": "shared false",
+   "cells": {
+    "cuda_vs_cpu": {
+     "rel_l2": 3.71e-08
+    },
+    "vulkan_vs_cpu": {
+     "rel_l2": 3.71e-08
+    },
+    "cuda_vs_vulkan": {
+     "differing_bits": 0
+    }
+   },
+   "explained_by": "expert-slot-layout"
+  },
+  {
+   "op": "moe_combine",
+   "case": "shared true",
+   "cells": {
+    "cuda_vs_cpu": {
+     "rel_l2": 4.45e-08
+    },
+    "vulkan_vs_cpu": {
+     "rel_l2": 4.45e-08
+    },
+    "cuda_vs_vulkan": {
+     "differing_bits": 0
+    }
+   },
+   "explained_by": "expert-slot-layout"
+  },
+  {
+   "op": "moe_gemv",
+   "case": "3 experts 512x2048 IQ2_XS",
+   "cells": {
+    "cuda_vs_cpu": {
+     "rel_l2": 8.86e-07
+    },
+    "vulkan_vs_cpu": {
+     "rel_l2": 8.86e-07
+    },
+    "cuda_vs_vulkan": {
+     "differing_bits": 0
+    }
+   },
+   "explained_by": "expert-slot-layout"
+  },
+  {
+   "op": "norm_gate",
+   "case": "4 heads of 128",
+   "cells": {
+    "cuda_vs_cpu": {
+     "rel_l2": 4.31e-08
+    },
+    "vulkan_vs_cpu": {
+     "rel_l2": 4.31e-08
+    },
+    "cuda_vs_vulkan": {
+     "differing_bits": 0
+    }
+   },
+   "explained_by": null
+  },
+  {
+   "op": "rms_norm",
+   "case": "2048 x 3 rows",
+   "cells": {
+    "cuda_vs_cpu": {
+     "rel_l2": 4.3e-07
+    },
+    "vulkan_vs_cpu": {
+     "rel_l2": 4.3e-07
+    },
+    "cuda_vs_vulkan": {
+     "differing_bits": 0
+    }
+   },
+   "explained_by": null
+  },
+  {
+   "op": "rope_neox",
+   "case": "hd 128, 64 rotated, pos 30000",
+   "cells": {
+    "cuda_vs_cpu": {
+     "rel_l2": 2.52e-08
+    },
+    "vulkan_vs_cpu": {
+     "rel_l2": 2.52e-08
+    },
+    "cuda_vs_vulkan": {
+     "differing_bits": 0
+    }
+   },
+   "explained_by": null
+  },
+  {
+   "op": "router_topk",
+   "case": "n 256 k 8 t 3",
+   "cells": {
+    "cuda_vs_cpu": {
+     "max_abs": 1.19e-07
+    },
+    "vulkan_vs_cpu": {
+     "max_abs": 1.19e-07
+    },
+    "cuda_vs_vulkan": {
+     "differing_bits": 0
+    }
+   },
+   "explained_by": null
+  },
+  {
+   "op": "ssm_gates",
+   "case": "beta, 3 tokens of 5 heads",
+   "cells": {
+    "cuda_vs_cpu": {
+     "rel_l2": 3e-08
+    },
+    "vulkan_vs_cpu": {
+     "rel_l2": 3e-08
+    },
+    "cuda_vs_vulkan": {
+     "differing_bits": 0
+    }
+   },
+   "explained_by": "summation-order"
+  },
+  {
+   "op": "ssm_gates_g",
+   "case": "g, 3 tokens of 5 heads",
+   "cells": {
+    "cuda_vs_cpu": {
+     "rel_l2": 1.44e-10
+    },
+    "vulkan_vs_cpu": {
+     "rel_l2": 1.44e-10
+    },
+    "cuda_vs_vulkan": {
+     "differing_bits": 1
+    }
+   },
+   "explained_by": "summation-order"
+  },
+  {
+   "op": "swiglu",
+   "case": "n 1000, not a block multiple",
+   "cells": {
+    "cuda_vs_cpu": {
+     "rel_l2": 4.24e-09
+    },
+    "vulkan_vs_cpu": {
+     "rel_l2": 4.24e-09
+    },
+    "cuda_vs_vulkan": {
+     "differing_bits": 0
     }
    },
    "explained_by": null
