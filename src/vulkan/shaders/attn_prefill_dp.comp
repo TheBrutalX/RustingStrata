@@ -1,34 +1,60 @@
 #version 460
 // Prefill attention without cooperative matrices: attn_prefill.glsl's inputs and output, but Q and the softmax weights
 // stay f32 (rounded to f16 as in attn_prefill, parity measured lower, #124), one subgroup per query, lane l holding dims
-// l + 32 j, and keys taken one at a time with an online softmax (KEYBLOCK takes them in blocks, see below). Workgroup
-// (x, h): queries 4x .. 4x + 3 of head h.
+// l + 32 j, and keys taken one at a time with an online softmax (KEYBLOCK / STAGE take them in blocks, see below).
+// Workgroup (x, h): queries 4x .. 4x + 3 of head h.
 layout(local_size_x = 128) in;
 #include "common.glsl"
 layout(push_constant) uniform P { F32 q; U16 kc; U16 vc; F32 qg; F32 o; I32 step; uint t; uint nh; uint nkv; float scale; U32 qm; uint mw; } p;
 layout(constant_id = 1) const uint PER = 4;  // head_dim / 32
 const uint HD = 32 * PER;
-// KEYBLOCK (variant A of M3-T3, issue #51): keys per online-softmax step, i.e. one max/exp pass and one rescale of
-// `acc` per block instead of per key. 1 is the pre-change kernel and the default, so the committed SPIR-V is unchanged;
-// `tools/gen_spirv.sh` takes GLSL_DEFS, e.g. `GLSL_DEFS=-DKEYBLOCK=32 tools/gen_spirv.sh /tmp/spv`.
+// Tuning knobs of the M3-T3 A/B (issue #51). The defaults are the pre-change kernel, so the committed SPIR-V is
+// unchanged: one key per online-softmax step, every K/V value read straight from the cache. `tools/gen_spirv.sh`
+// takes GLSL_DEFS, e.g. `GLSL_DEFS=-DKEYBLOCK=32 tools/gen_spirv.sh /tmp/spv`.
+//   KEYBLOCK (variant A): keys per online-softmax step, i.e. one max/exp pass and one rescale of `acc` per block
+//     instead of per key. 1 is the baseline.
+//   STAGE (variant B): stage the block's K and V rows in shared, loaded once by all 128 threads. The 4 queries of the
+//     workgroup share head h and so read the same rows. Needs barriers, so the workgroup must walk the same blocks:
+//     the last query of the group fixes the block count and the other queries mask the extra keys (at most 3).
+//     STAGE_BK is the block (default 32); STAGE_MAXHD bounds HD at compile time because a shared array needs a
+//     constant length (the pipeline's shared-bytes preflight uses the bound, so A/B builds pass the model's HD:
+//     128 for the reference model -> 2 * 32 * 128 * 2 B = 16384 B).
 #ifndef KEYBLOCK
 #define KEYBLOCK 1
 #endif
-#if KEYBLOCK > 1
-// Keys per online-softmax step.
-const uint BK = KEYBLOCK;
+#ifndef STAGE
+#define STAGE 0
+#endif
+#ifndef STAGE_BK
+#define STAGE_BK 32
+#endif
+#ifndef STAGE_MAXHD
+#define STAGE_MAXHD 256
+#endif
+#if STAGE || KEYBLOCK > 1
+// Keys per online-softmax step. Variant B needs one to have something to stage.
+const uint BK = STAGE != 0 ? STAGE_BK : KEYBLOCK;
+#endif
+#if STAGE
+shared uint16_t kv_s[2 * STAGE_BK * STAGE_MAXHD];  // K tile then V tile, f16 bits (ldkv's value is f16-exact)
 #endif
 
 void main() {
     uint t = gl_WorkGroupID.x * 4 + gl_SubgroupID, h = gl_WorkGroupID.y, lane = gl_SubgroupInvocationID;
+#if !STAGE
     if (t >= p.t) return;
+#else
+    // The shared tile is sized at compile time; a build narrower than the model's head dim fails loudly here instead
+    // of reading past the tile (uniform over the workgroup, so it is safe before a barrier).
+    if (HD > STAGE_MAXHD) return;
+#endif
     uint kvo = h / (p.nh / p.nkv) * HD + lane, kvd = p.nkv * HD, last = uint(p.step.v[0]) + t;
     float q[PER], acc[PER], m = 0.0, l = 0.0;
     [[unroll]] for (uint j = 0; j < PER; j++) {
         q[j] = p.q.v[(t * p.nh + h) * HD + lane + 32 * j] * p.scale;
         acc[j] = 0.0;
     }
-#if KEYBLOCK <= 1
+#if !(STAGE || KEYBLOCK > 1)
     bool first = true;
     for (uint k = 0; k <= last; k++) {
         if (uint64_t(p.qm) != 0 && !qsa_bit(p.qm, p.mw, t, k)) continue;
@@ -47,15 +73,35 @@ void main() {
     // not move (c = 1) the rescales are exact no-ops there too; only the summation order of `l` inside a block (and
     // the rounding of one `l * c` per block) differs, which is why the A/B keeps the parity gate.
     const float ninf = -3.402823466e38;
-    bool any = false;
+    bool any = false, live = true;
+#if STAGE
+    // Barrier uniformity: every thread walks the same blocks, the last query of the group setting the last key.
+    live = t < p.t;
+    uint lastw = uint(p.step.v[0]) + min(gl_WorkGroupID.x * 4 + 3, p.t - 1), kvh = kvo - lane;
+    for (uint k0 = 0; k0 <= lastw; k0 += BK) {
+        barrier();  // the previous block's reads are done, the tile can be overwritten
+        for (uint kk = 0; kk < BK; kk++) {
+            uint kd = min(k0 + kk, lastw) * kvd + kvh;  // past the end: re-read the last row, masked below
+            for (uint d = gl_LocalInvocationID.x; d < HD; d += 128) {
+                kv_s[kk * HD + d] = uint16_t(f2h(ldkv(p.kc, kd + d, HD)));
+                kv_s[STAGE_BK * STAGE_MAXHD + kk * HD + d] = uint16_t(f2h(ldkv(p.vc, kd + d, HD)));
+            }
+        }
+        barrier();
+#else
     for (uint k0 = 0; k0 <= last; k0 += BK) {
+#endif
         float s[BK];
         [[unroll]] for (uint i = 0; i < BK; i++) {
             uint k = k0 + i;
-            bool ok = k <= last && (uint64_t(p.qm) == 0 || qsa_bit(p.qm, p.mw, t, k));
+            bool ok = live && k <= last && (uint64_t(p.qm) == 0 || qsa_bit(p.qm, p.mw, t, k));
             float x = 0.0;
             if (ok) {  // `ok` is uniform over the subgroup (t, k and the mask are), so is the reduction
+#if STAGE
+                [[unroll]] for (uint j = 0; j < PER; j++) x += q[j] * float(kv_s[i * HD + lane + 32 * j]);
+#else
                 [[unroll]] for (uint j = 0; j < PER; j++) x += q[j] * ldkv(p.kc, k * kvd + kvo + 32 * j, HD);
+#endif
                 x = subgroupAdd(x);
             }
             s[i] = ok ? x : ninf;
@@ -72,12 +118,20 @@ void main() {
             if (s[i] == ninf) continue;
             float e = expf_(s[i] - mn);
             l += e;
+#if STAGE
+            [[unroll]] for (uint j = 0; j < PER; j++)
+                acc[j] = fma(e, float(kv_s[STAGE_BK * STAGE_MAXHD + i * HD + lane + 32 * j]), acc[j]);
+#else
             uint k = k0 + i;
             [[unroll]] for (uint j = 0; j < PER; j++) acc[j] = fma(e, ldkv(p.vc, k * kvd + kvo + 32 * j, HD), acc[j]);
+#endif
         }
         m = mn;
         any = true;
     }
+#endif
+#if STAGE
+    if (!live) return;  // a query row past p.t took part in the barriers only, its output row does not exist
 #endif
     [[unroll]] for (uint j = 0; j < PER; j++) {
         uint col = lane + 32 * j;
