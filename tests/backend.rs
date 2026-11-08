@@ -69,7 +69,7 @@ fn host_mailbox_is_shared_with_kernels() {
 fn shared_memory_matches_the_committed_spirv() {
     let q2k = [0, 10, 84, 0, 0];  // T = Q2_K (10), SBB = 84: KS = 16
     let iq3s = [0, 21, 110, 0, 0];  // T = IQ3_S (21), SBB = 110: KS = 32
-    assert_eq!(rusting_strata::vulkan::spv_smem::shared_bytes("gemmi_dp", &q2k, false).unwrap(), 49152, "gemmi_dp with Q2_K");
+    assert_eq!(rusting_strata::vulkan::spv_smem::shared_bytes("gemmi_dp", &q2k, false).unwrap(), 40960, "gemmi_dp with Q2_K");
     assert_eq!(rusting_strata::vulkan::spv_smem::shared_bytes("gemmi_dp", &iq3s, false).unwrap(), 40960, "gemmi_dp with IQ3_S");
     // The COOP variant keeps the IQ lookup tables in shared memory: the 49168 bytes that lost the V100 (Xid 13).
     assert_eq!(rusting_strata::vulkan::spv_smem::shared_bytes("gemmi", &q2k, false).unwrap(), 49168, "gemmi with Q2_K");
@@ -82,12 +82,13 @@ fn shared_memory_matches_the_committed_spirv() {
 fn shared_memory_refusal_names_kernel_spec_bytes_and_limit() {
     use rusting_strata::vulkan::spv_smem::check_shared_memory;
     let spec = [0u32, 10, 84, 0, 0];
-    let e = format!("{:#}", check_shared_memory("gemmi_dp", &spec, false, 40960).unwrap_err());
-    for want in ["gemmi_dp", "[0, 10, 84, 0, 0]", "49152", "40960", "maxComputeSharedMemorySize"] {
+    let e = format!("{:#}", check_shared_memory("gemmi_dp", &spec, false, 40959).unwrap_err());
+    for want in ["gemmi_dp", "[0, 10, 84, 0, 0]", "40960", "40959", "maxComputeSharedMemorySize"] {
         assert!(e.contains(want), "{e:?} does not contain {want:?}");
     }
-    // Exactly at the limit is accepted: the V100 reports 49152 and `gemmi_dp` with Q2_K needs 49152.
-    assert_eq!(check_shared_memory("gemmi_dp", &spec, false, 49152).unwrap(), 49152);
+    // Exactly at the limit is accepted: `gemmi_dp` with Q2_K needs 40960 bytes after the packed KS = 16 W rows
+    // (variant A, issue #47), as it already did for KS = 32.
+    assert_eq!(check_shared_memory("gemmi_dp", &spec, false, 40960).unwrap(), 40960);
 }
 
 /// The preflight over the reference model's weight types only (no weights uploaded): every pair must fit. Skips

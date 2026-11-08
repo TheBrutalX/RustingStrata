@@ -306,7 +306,7 @@ mod tests {
     /// The measured values of the committed SPIR-V (also asserted by `tests/backend.rs shared_memory`).
     #[test]
     fn shared_memory_matches_the_committed_spirv() {
-        assert_eq!(shared_bytes("gemmi_dp", &[0, 10, 84, 0, 0], false).unwrap(), 49152);  // Q2_K: KS = 16
+        assert_eq!(shared_bytes("gemmi_dp", &[0, 10, 84, 0, 0], false).unwrap(), 40960);  // Q2_K: KS = 16, packed W rows
         assert_eq!(shared_bytes("gemmi_dp", &[0, 21, 110, 0, 0], false).unwrap(), 40960);  // IQ3_S: KS = 32
         // The COOP variant carries the 16-byte IQ lookup tables: the historical 49168-byte request.
         assert_eq!(shared_bytes("gemmi", &[0, 10, 84, 0, 0], false).unwrap(), 49168);
@@ -314,11 +314,11 @@ mod tests {
 
     #[test]
     fn shared_memory_refusal_names_the_kernel_spec_and_both_sizes() {
-        let e = check_shared_memory("gemmi_dp", &[0, 10, 84, 0, 0], false, 40960).unwrap_err().to_string();
-        for want in ["gemmi_dp", "[0, 10, 84, 0, 0]", "49152", "40960", "maxComputeSharedMemorySize"] {
+        let e = check_shared_memory("gemmi_dp", &[0, 10, 84, 0, 0], false, 40959).unwrap_err().to_string();
+        for want in ["gemmi_dp", "[0, 10, 84, 0, 0]", "40960", "40959", "maxComputeSharedMemorySize"] {
             assert!(e.contains(want), "{e:?} does not contain {want:?}");
         }
-        assert_eq!(check_shared_memory("gemmi_dp", &[0, 10, 84, 0, 0], false, 49152).unwrap(), 49152);
+        assert_eq!(check_shared_memory("gemmi_dp", &[0, 10, 84, 0, 0], false, 40960).unwrap(), 40960);
     }
 
     /// Every weight kernel the preflight names has a computable Workgroup size for every GPU weight type: a shader or
@@ -355,9 +355,9 @@ mod tests {
         }
         eprintln!("largest Workgroup size: {} bytes ({}, {:?}); without cooperative matrices: {} bytes ({}, {:?})",
             worst.0, worst.1, worst.2, worst_v100.0, worst_v100.1, worst_v100.2);
-        // On Volta the _dp kernels must fit 49152 exactly (gemmi_dp with Q2_K needs all of it); the COOP gemmi
-        // variants carry the IQ lookup tables and go over it, which is why they are only created where cooperative
-        // matrices (and a larger limit) exist.
+        // On Volta the _dp kernels must fit 49152 (after variant A of issue #47, gemmi_dp with Q2_K needs 40960, as
+        // for KS = 32); the COOP gemmi variants carry the IQ lookup tables and go over it, which is why they are
+        // only created where cooperative matrices (and a larger limit) exist.
         assert!(worst_v100.0 <= 49152, "{} needs {} bytes of Workgroup memory with cooperative matrices off",
             worst_v100.1, worst_v100.0);
     }
