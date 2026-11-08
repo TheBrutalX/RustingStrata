@@ -2084,3 +2084,100 @@ on the roadmap today is the 39.3 % `gemv_q`; the SSM/hybrid kernels
 (`deltanet`, `conv_*`, `norm_gate`) are 6.6 % of prefill and 7.4 % of decode.
 No Xid, no device-lost during any of the runs (`nvidia-smi -q` reports no Xid
 counter; the last `dmesg` Xid is the pre-fix SKEDCHECK18 of 2026-11-06).
+
+## 2026-11-08 — Non-cooperative prefill GEMM: packed KS = 16 W rows, tile map (M3-T2, #47)
+
+Target from the M3-T1 profile above: **`gemmi_dp`** (35.6 % of prefill, 982 ms
+for 292 calls), the non-cooperative int8 GEMM the reference model actually
+runs. `gemm_f_dp` (32.3 %) is not reachable here: it only runs for non-`mmq`
+types (`src/vulkan/mod.rs:819`), i.e. not for this model's quantized weights.
+
+### Variant A — drop the 16 zero words of a KS = 16 W row (adopted)
+
+`COOP 0` reads 16 int8 per `h` while `coopMatLoad` reads 32, so the KS = 16 W
+row only padded each 16 int8 with 16 zeros to keep the `h * 8` word offset.
+The packed layout stores the four decoded words contiguously and reads them at
+`h * KS / 4` (the same `h * 8` for KS = 32). Same words, same `h` order, same
+`dotPacked4x8EXT` groups, so the int32 sums stay bit-exact; the cooperative
+path keeps `PW = 36`.
+
+| `gemmi_dp` Workgroup bytes | KS = 16 (Q6_K, IQ2_XS) | KS = 32 (Q5_K, IQ3_XXS, IQ4_XS, Q8_0) |
+| --- | ---: | ---: |
+| `xq` 2·128·20 words | 20 480 | 20 480 |
+| `wq` 2·64·PW words | **10 240** (was 18 432) | 10 240 |
+| `xd` + `xsum` + `wsc` + `wmn` | 10 240 | 10 240 |
+| **total** | **40 960** (was exactly 49 152) | 40 960 |
+
+Driver statistics (`STRATA_VK_STATS=1`, this model's types): 163–201 registers,
+48 896–54 656 B binary, 41 088 B shared (the driver adds 128 B to the 40 960
+accounting). Preflight: 60 `(kernel, specialization)` pairs, largest 40 960 of
+49 152.
+
+Isolated GEMM (ms, min–max of 3 runs; the pre-A commit `5a551eb` was measured
+from its committed `gemmi_dp.spv` in the same session):
+
+| tensor | pre-A | A |
+| --- | ---: | ---: |
+| Q5_K `attn_qkv` 8192x2048 x4096 | 8.04–8.05 | 8.02–8.12 |
+| Q5_K `attn_gate` 4096x2048 x4096 | 3.96–3.97 | 3.95–3.96 |
+| Q6_K `ssm_out` 2048x4096 x4096 | 4.07–4.08 | 4.07–4.08 |
+| IQ2_XS `ffn_gate_exps` 512x2048 x4096 | 0.94–0.96 | 0.94–0.95 |
+| IQ3_XXS `ffn_down_exps` 2048x512 x4096 | 0.52–0.53 | 0.52–0.52 |
+
+Expert tiles (ms, min–max of 3 runs): IQ2_XS 8/32/64 positions per expert
+5.84–5.86 / 5.95–5.97 / 6.05–6.07 before, 5.84–5.86 / 5.94–5.98 / 6.05–6.09
+after; IQ3_XXS 2.65–2.67 / 2.94–2.95 / 3.07–3.08 before, 2.66–2.66 / 2.94–2.95 /
+3.07–3.07 after. **No measurable per-kernel change**, as expected: the variant
+removes shared bytes and one zero-fill pass, not traffic.
+
+End to end (warm, `--pp 4096 --tg 128 --reps 3 --ctx 32896`, 5 measurements):
+**prefill 1424.9–1432.5 tok/s (mean 1427.4), decode 116.0–117.8 tok/s**. The
+M3-T1 baseline with the `pp 512,4096` command is 1431.8 (1426.3–1437.2): A is
+neutral inside the ~0.5 % noise and stays above the 1423.9 M3 exit bar, while
+freeing 8 192 B of shared memory and removing the exact-49 152 cliff.
+
+Bit-exactness: `gemm_matches_reference_for_every_type` green (Q5_K 8.16e-7,
+Q6_K 4.12e-7, IQ2_XS 0, IQ3_XXS 4.02e-7, IQ4_XS 4.39e-7, Q8_0 4.12e-7).
+Parity: `--llama-numerics --fixed-experts --tag m3t2-vk-sm70` gives 625/640
+top-1, 629/640 either-mode, per prompt identical to `m2-vk-sm70` (0 differing
+prompts). No new Xid (last one is the pre-fix 2026-11-06 SKEDCHECK18).
+
+### Variant C — subgroup → tile permutation (measured, rejected)
+
+The 128x64 tile is 4 row tiles by 2 column tiles, so the map must keep two row
+bits and one column bit. `SUBMAP 0` (default) is row = `w >> 1`, column =
+`w & 1`; `SUBMAP 1` takes the column from `w >> 2`, so neighbouring subgroups
+share their W rows. A first attempt that swapped the bits wholesale put `bn`
+up to 96 in a 64-column tile: out-of-range shared reads, caught by the
+per-type GEMM test (Q5_K rel err 0.79) and discarded (the wrong writes also
+made the dispatch look 20 % faster). The corrected map was measured:
+
+- end to end: prefill 1418.2–1419.7 tok/s, i.e. **−0.6 % vs A**;
+- isolated: Q5_K `attn_qkv` 8.17–8.28 ms (+2 %), Q6_K 4.07–4.09, IQ2_XS
+  0.95, IQ3_XXS 0.52; expert IQ3_XXS 64 positions 3.237–3.243 ms vs
+  3.069–3.074 (+5 %).
+
+Rejected: no gain, a small loss. `SUBMAP` stays 0 and is only a scaffold for a
+future experiment (`GLSL_DEFS=-DSUBMAP=1 tools/gen_spirv.sh /tmp/spv`).
+
+### No headroom for the other levers
+
+- **B (occupancy):** A frees 8 KB with no time change, so the 48 KB was not the
+  limiter. A Volta SM has 96 KB of shared memory, but the driver's L1/shared
+  split is not controllable from Vulkan and two workgroups per SM are not
+  guaranteed; nothing here can force or verify it. `BM`/`BK` changes need
+  `src/vulkan/mod.rs` (#44) — `BK = 128` alone needs >= 62 KB at `XM = 128`.
+- **D (`gemm_f_dp`):** 27 664 B for this model's specializations, but it only
+  runs for non-`mmq` types, so it is not a target of the reference workload.
+- **E (local size):** `local_size_x = 256` is derived from the X loader (2
+  threads per row x 128) and the W loader (4 per row x 64); it can only change
+  together with `BM` (out of scope, #44).
+
+### Environment
+
+Tesla V100-SXM2-32GB, sm_70, driver 580.178.04, Vulkan 1.4.312, glslc 2025.2,
+commit `5a551eb` + `gemmi.glsl` variant A (`1646a9f`/`2ca5718` rebased), model
+`Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf`. `spirv_is_fresh` stays red for the 40
+kernels whose committed `.spv` predate the local glslc (pre-existing drift);
+`gemmi_dp.spv` and the cooperative `gemmi`/`gemmi_s` build byte-identically
+from the final source.

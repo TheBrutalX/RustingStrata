@@ -28,12 +28,31 @@ layout(push_constant) uniform P { U64 tiles; uint64_t wd; U32 x; I32 xrow; F32 y
 #ifndef SM
 #define SM 0
 #endif
+// Variant C (issue #47): the 32x32 tile a subgroup owns is a free choice. The tile is 128 rows x 64 columns, i.e.
+// 4 row tiles and 2 column tiles, so the map must keep two bits for the row and one for the column. 0 is the
+// baseline (row = w >> 1, column = w & 1); 1 takes the column from w >> 2, so neighbouring subgroups share their W
+// rows and read the same global weight rows at the same time. No shared bytes and no per-output order change
+// either way. Build a variant with `GLSL_DEFS=-DSUBMAP=1 tools/gen_spirv.sh` (see tools/gen_spirv.sh).
+#ifndef SUBMAP
+#define SUBMAP 0
+#endif
 // SM 1 (gemmi_s): only the tiles of at most 32 positions, as gemm_fs; X holds XM positions.
 const uint BM = 128, XM = SM != 0 ? 32 : BM;
 const uint KS = T == 42 || T == 2 || T == 3 || T == 6 || T == 7 || T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 || T == 21 || T == 23 ? 32 : 16;
-// Rows in words. The int8 products are 32 deep: for KS = 16, w row holds each 16 values followed by 16 zeros (so
-// the 16 x values after each 16 add nothing).
-const uint PX = 20, PW = KS == 32 ? 20 : 36;
+// Rows in words. coopMatLoad reads 32 int8 per h, so on the cooperative path a KS = 16 W row holds each 16 values
+// followed by 16 zeros (the 16 x values after each 16 add nothing) and PW = 36. COOP 0 reads 16 int8 per h, so the
+// zero half is dropped and the row is the same 20 words as for KS = 32 (variant A, issue #47): wq 18432 -> 10240
+// bytes, bit-exact because the dot groups and their order are unchanged.
+const uint PX = 20;
+#if COOP
+const uint PW = KS == 32 ? 20 : 36;
+// Where the 4 words (16 int8) an invocation decodes go in the row: padded to 32 int8 per h for coopMatLoad.
+#define WOFF (wi * 128 / KS)
+#else
+const uint PW = 20;
+// Packed: the same contiguous 4 words per invocation, one per h (h * KS / 4), with no 16-int8 zero tail.
+#define WOFF (wi * 4)
+#endif
 // X and W are double buffered: step kb + 1 is stored while step kb's products run, so one barrier per step.
 shared uint xq[2 * XM * PX], wq[2 * 64 * PW];
 shared float xd[2][XM][2], xsum[2][XM][4], wsc[2][64][4], wmn[2][64][4];
@@ -100,14 +119,21 @@ void main() {
     const uint IX = XM * PX;
     for (uint i = tid; i < 256; i += 256) { xq[IX + i] = i / 16; xq[IX + 256 + i] = i % 16; }
 #endif
-    if (KS == 16) for (uint i = tid; i < 2 * 64 * PW; i += 256) wq[i] = 0;
+#if COOP
+    if (KS == 16) for (uint i = tid; i < 2 * 64 * PW; i += 256) wq[i] = 0;  // the 16-int8 zero tail of each h
+#endif
     load_tables();
     barrier();
     // Subgroup w multiplies rows bm .. bm + 31 by columns bn .. bn + 31 of the tile, or with sm (at most 32 positions,
     // most expert tiles) only the 16 x 16 at bm, bn, in acc[0][0], so the 8 output tiles are spread over all 8
     // subgroups. Each output sums the same products in the same order either way.
     const bool sm = SM != 0;
+#if SUBMAP == 1
+    // Two row bits from w & 1 and w >> 1, the column from w >> 2 (the sm path keeps its own 2 x 4 map).
+    uint bm = sm ? 16 * (w & 1) : ((w & 1) | (w >> 1 & 1) << 1) * 32, bn = sm ? 16 * (w >> 1) : (w >> 2) * 32;
+#else
     uint bm = sm ? 16 * (w & 1) : (w >> 1) * 32, bn = sm ? 16 * (w >> 1) : (w & 1) * 32;
+#endif
     // nv: the layout of mma.sync (element i at row g + 8 (i >> 2), column 2 t + (i & 1) + 8 ((i >> 1) & 1)), as on NVIDIA.
     uint g = gl_SubgroupInvocationID >> 2, t = gl_SubgroupInvocationID & 3;
 #if COOP
@@ -134,7 +160,7 @@ void main() {
     uvec4 wv; float d, m;
     ldw(wt, wr, wi, wok, n0, 0, wv, d, m);
     if (xr < XM) ldx(xr, xh, xok, xo, cols, 0, 0);
-    [[unroll]] for (uint j = 0; j < 4; j++) wq[wr * PW + wi * 128 / KS + j] = wv[j];
+    [[unroll]] for (uint j = 0; j < 4; j++) wq[wr * PW + WOFF + j] = wv[j];
     wsc[0][wr][wi] = d; wmn[0][wr][wi] = m;
     for (uint kb = 0; kb < p.nk; kb++) {
         uint xb = kb & 1;
@@ -178,7 +204,7 @@ void main() {
                     int c[8];
                     [[unroll]] for (uint j = 0; j < KS / 4; j++) {
                         [[unroll]] for (uint e = 0; e < 2; e++) xw[e][j] = xq[(xb * XM + bm + 16 * mt + RI(4 * e)) * PX + h * KS / 4 + j];
-                        [[unroll]] for (uint e = 0; e < 4; e++) ww[e][j] = wq[(xb * 64 + bn + 16 * nt + CI(e)) * PW + h * 8 + j];
+                        [[unroll]] for (uint e = 0; e < 4; e++) ww[e][j] = wq[(xb * 64 + bn + 16 * nt + CI(e)) * PW + h * KS / 4 + j];
                     }
                     [[unroll]] for (uint i = 0; i < 8; i++) {
                         c[i] = I2F_BIAS;
@@ -201,7 +227,7 @@ void main() {
                 }
         }
         if (kb + 1 < p.nk) {
-            [[unroll]] for (uint j = 0; j < 4; j++) wq[((xb ^ 1) * 64 + wr) * PW + wi * 128 / KS + j] = wv[j];
+            [[unroll]] for (uint j = 0; j < 4; j++) wq[((xb ^ 1) * 64 + wr) * PW + WOFF + j] = wv[j];
             wsc[xb ^ 1][wr][wi] = d; wmn[xb ^ 1][wr][wi] = m;
         }
     }
