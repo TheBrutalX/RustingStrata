@@ -6,6 +6,7 @@
 //! uploaded (and before any pipeline or buffer exists). It is SPIR-V plus spec-constant arithmetic only.
 
 use anyhow::Result;
+use crate::backend::Backend;
 use crate::quant::GgmlType;
 use super::{Vk, spv_smem};
 use std::collections::HashSet;
@@ -60,8 +61,8 @@ impl Vk {
             let ws = self.wspec(ty).to_vec();
             let float = matches!(ty, GgmlType::F32 | GgmlType::BF16);
             let mut push = |name: &'static str, spec: Vec<u32>| pairs.push((name, spec));
-            // gemm_raw: `f = !mmq(ty) || cols % 128 != 0`; the float kernel takes every type, the int8 one the rest.
-            if float || !crate::cuda::Gpu::mmq(ty) {
+            // gemm_raw: `f = !self.mmq(ty) || cols % 128 != 0`; the float kernel takes every type, the int8 one the rest.
+            if float || !self.mmq(ty) {
                 if self.0.coop { push("gemm_f", ws.clone()); push("gemm_fs", ws.clone()); }
                 else { push("gemm_f_dp", ws.clone()); }
             }

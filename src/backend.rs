@@ -119,7 +119,8 @@ pub trait Backend: Send {
     fn stalled(&self) -> bool { false }
     /// Whether the prefill GEMM for `ty` runs on int8 tensor cores on this backend: the type policy of `Gpu::mmq`,
     /// gated on the device. Tests build their reference math from this, since the CUDA launcher takes the f16
-    /// `gemm_*` path where the arch has no int8 tensor cores (sm_70) even for an int8 type.
+    /// `gemm_*` path where the arch has no int8 tensor cores (sm_70) even for an int8 type. The Vulkan backend
+    /// overrides it with the `STRATA_VK_MMQ` / `STRATA_VK_F16_TYPES` measurement knobs (`Vk::mmq`).
     fn mmq(&self, ty: GgmlType) -> bool { crate::cuda::Gpu::mmq(ty) }
     /// Whether this backend runs the Volta (sm_70) CUDA fallbacks, whose kernels sum the same f16 products in
     /// another order than `mma.sync`. A cross-backend comparison against or from such a backend is by tolerance.
