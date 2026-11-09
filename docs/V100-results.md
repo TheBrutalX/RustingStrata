@@ -2456,3 +2456,219 @@ Parity: `python3 -I tools/parity.py "$M" --extra "--gpu --backend vulkan"
 --tag m3t3-vk` → **either 630/640, agree 626/640** (gate ≥ 629 / ≥ 625; the
 M2-T5 baseline was 629/625), i.e. no parity change. No Xid: `dmesg | grep -ic
 Xid` = 42 before and after, no device lost.
+
+## 2026-11-09 — M3 close-out: Vulkan regression gate (M3-T4, V100)
+
+Environment: Tesla V100-SXM2-32GB, sm_70, driver 580.178.04, Vulkan 1.4.312,
+`maxComputeSharedMemorySize` 49 152 B, model `Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf`.
+**Final build:** `v100` `a54d5c5` (M3-T1 profile + M3-T2 GEMM variant A + the
+M3-T3 default `attn_prefill`; the committed `.spv` as shipped).
+**Same-session control:** `5a551eb` (the M3-T1 commit, i.e. before the M3-T2/T3
+shader work), built in an isolated worktree
+(`/tmp/opencode/m3t4-control`, `CARGO_TARGET_DIR=/tmp/opencode/m3t4-control-target`,
+binary copied to `/tmp/strata-control-5a551eb`).
+CPU: `cargo build --release` green; `cargo test --release` green except the
+pre-existing `spirv_is_fresh` red state (40 `.spv` older than the local glslc,
+documented above, explicitly out of scope for M3-T4).
+
+### Gate rule (frozen before measuring, quoted from issue #53)
+
+Baseline = the stored 2026-11-06 table earlier in this file: prefill
+635.6 / 1423.9 / 523.5 tok/s at pp 512/4096/32768 and decode
+109.8 / 108.6 / 95.7 tok/s at the same depths.
+
+1. **Absolute pass.** Every one of the six cells ≥ its stored value.
+2. **Same-session control pass.** If any cell is below its stored value, PASS is
+   still allowed iff **both** hold: every cell ≥ stored − 3 %, **and** every
+   cell ≥ the same-session control mean − 0.5 %.
+3. **Fail.** Otherwise.
+4. **Parity** is absolute: either-mode ≥ 629/640, top-1 ≥ 625/640, no new
+   divergent position.
+
+The stored baseline is from a different session; the gate is decided against the
+same-session control.
+
+### Window pre-checks (2026-11-09 00:38 UTC)
+
+```
+systemctl is-active llama.router.service         -> inactive
+nvidia-smi --query-gpu=memory.used,...           -> 0 MiB, 0 %, 46 C, 1530 MHz
+dmesg -T | grep -ci xid                          -> 42
+git rev-parse HEAD                               -> a54d5c5c7b0350d5a2b5d52139b9332ba68c9d14
+```
+
+### Final build — run 1 (2026-11-09 00:38 UTC)
+
+```
+$ strata bench --backend vulkan --pp 512,4096,32768 --tg 128 --reps 3 --ctx 32896 --json-out /tmp/strata-bench.I1Qipb.json
+vulkan device 0: Tesla V100-SXM2-32GB
+vulkan: Tesla V100-SXM2-32GB (NVIDIA 580.178.04), cooperative matrix f16 no int8 no, conditional rendering yes, maxComputeSharedMemorySize 49152
+vulkan: shared-memory preflight: 60 (kernel, specialization) pairs checked, largest 40960 bytes (gemmi_dp) of 49152 allowed, 1.1 ms
+plan: weights+state+scratch 2580 MB (KV 642 MB for 32896 tokens, prefill 512 MB), expert slots 10040 MB, resident experts 10240/10240
+expert traffic: 10.4 MB per layer active set (top-8), 313.8 MB per token over 40 MoE layers
+pp    512: prefill 766.8 (759.4-772.0) tok/s | tg 128: decode 123.1 (121.5-124.1) tok/s
+expert traffic: 313.8 MB/token -> 40.8 GB/s at 123.9 tok/s
+pp   4096: prefill 1405.5 (1404.5-1406.5) tok/s | tg 128: decode 117.7 (117.1-118.2) tok/s
+expert traffic: 313.8 MB/token -> 38.8 GB/s at 118.0 tok/s
+pp  32768: prefill 520.8 (519.6-522.0) tok/s | tg 128: decode 95.5 (95.4-95.6) tok/s
+expert traffic: 313.8 MB/token -> 31.4 GB/s at 95.5 tok/s
+expert hit rate 100.0% (0 misses), cache swaps 0
+worker busy 111.6 µs/token, worker stalls 0
+mailbox traffic: 80 GPU writes, 46080 host routing reads (fast path off, 10240/10240 experts resident)
+```
+
+```json
+{"backend":"vulkan","backend_arg":"vulkan","chunk":4096,"ctx":32896,"device":[0],"expert":{"bytes_per_token":328990720,"hit_rate_pct":100.0,"mb_per_token":313.8,"misses":0,"resident":10240,"swaps":0,"total":10240},"kv":"f16","model":{"name":"Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf","path":"/mnt/models/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf"},"mtp":0,"reps":3,"results":[{"decode_tok_s":{"max":124.1,"mean":123.1,"min":121.5},"expert":{"at_decode_tok_s":123.9,"bytes_per_token":328990720,"gb_per_s":40.8,"mb_per_token":313.8},"pp":512,"prefill_tok_s":{"max":772.0,"mean":766.8,"min":759.4}},{"decode_tok_s":{"max":118.2,"mean":117.7,"min":117.1},"expert":{"at_decode_tok_s":118.0,"bytes_per_token":328990720,"gb_per_s":38.8,"mb_per_token":313.8},"pp":4096,"prefill_tok_s":{"max":1406.5,"mean":1405.5,"min":1404.5}},{"decode_tok_s":{"max":95.6,"mean":95.5,"min":95.4},"expert":{"at_decode_tok_s":95.5,"bytes_per_token":328990720,"gb_per_s":31.4,"mb_per_token":313.8},"pp":32768,"prefill_tok_s":{"max":522.0,"mean":520.8,"min":519.6}}],"schema":"strata.bench.v1","tg":128,"unix_time":1794184921}
+```
+
+### Final build — run 2 (2026-11-09 00:49 UTC)
+
+```
+$ strata bench --backend vulkan --pp 512,4096,32768 --tg 128 --reps 3 --ctx 32896 --json-out /tmp/strata-bench.JxeP0Y.json
+vulkan device 0: Tesla V100-SXM2-32GB
+vulkan: Tesla V100-SXM2-32GB (NVIDIA 580.178.04), cooperative matrix f16 no int8 no, conditional rendering yes, maxComputeSharedMemorySize 49152
+vulkan: shared-memory preflight: 60 (kernel, specialization) pairs checked, largest 40960 bytes (gemmi_dp) of 49152 allowed, 1.2 ms
+plan: weights+state+scratch 2580 MB (KV 642 MB for 32896 tokens, prefill 512 MB), expert slots 10040 MB, resident experts 10240/10240
+expert traffic: 10.4 MB per layer active set (top-8), 313.8 MB per token over 40 MoE layers
+pp    512: prefill 762.7 (756.4-766.2) tok/s | tg 128: decode 122.9 (121.1-123.9) tok/s
+expert traffic: 313.8 MB/token -> 40.7 GB/s at 123.7 tok/s
+pp   4096: prefill 1394.2 (1393.2-1394.8) tok/s | tg 128: decode 117.7 (117.5-117.9) tok/s
+expert traffic: 313.8 MB/token -> 38.8 GB/s at 117.9 tok/s
+pp  32768: prefill 520.0 (519.6-520.4) tok/s | tg 128: decode 95.4 (95.3-95.6) tok/s
+expert traffic: 313.8 MB/token -> 31.4 GB/s at 95.4 tok/s
+expert hit rate 100.0% (0 misses), cache swaps 0
+worker busy 110.4 µs/token, worker stalls 0
+mailbox traffic: 80 GPU writes, 46080 host routing reads (fast path off, 10240/10240 experts resident)
+```
+
+```json
+{"backend":"vulkan","backend_arg":"vulkan","chunk":4096,"ctx":32896,"device":[0],"expert":{"bytes_per_token":328990720,"hit_rate_pct":100.0,"mb_per_token":313.8,"misses":0,"resident":10240,"swaps":0,"total":10240},"kv":"f16","model":{"name":"Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf","path":"/mnt/models/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf"},"mtp":0,"reps":3,"results":[{"decode_tok_s":{"max":123.9,"mean":122.9,"min":121.1},"expert":{"at_decode_tok_s":123.7,"bytes_per_token":328990720,"gb_per_s":40.7,"mb_per_token":313.8},"pp":512,"prefill_tok_s":{"max":766.2,"mean":762.7,"min":756.4}},{"decode_tok_s":{"max":117.9,"mean":117.7,"min":117.5},"expert":{"at_decode_tok_s":117.9,"bytes_per_token":328990720,"gb_per_s":38.8,"mb_per_token":313.8},"pp":4096,"prefill_tok_s":{"max":1394.8,"mean":1394.2,"min":1393.2}},{"decode_tok_s":{"max":95.6,"mean":95.4,"min":95.3},"expert":{"at_decode_tok_s":95.4,"bytes_per_token":328990720,"gb_per_s":31.4,"mb_per_token":313.8},"pp":32768,"prefill_tok_s":{"max":520.4,"mean":520.0,"min":519.6}}],"schema":"strata.bench.v1","tg":128,"unix_time":1794185603}
+```
+
+### Same-session control `5a551eb` — run 1 (2026-11-09 00:42 UTC)
+
+`STRATA_BIN=/tmp/strata-control-5a551eb`:
+prefill 538.3 / 1396.4 / 518.8, decode 97.4 / 103.3 / 95.6. The pp 512 and
+decode means are cold-start artifacts of the first launch of a binary with
+different pipelines: the ranges are 80.1–767.8 (pp 512) and 45.3–123.6
+(decode 512), 74.7–117.8 (decode 4096). Discarded as a warm-up, not used for
+the gate; recorded so the raw A/B is complete.
+
+### Same-session control `5a551eb` — run 2, warm (2026-11-09 00:46 UTC)
+
+```
+$ strata bench --backend vulkan --pp 512,4096,32768 --tg 128 --reps 3 --ctx 32896 --json-out /tmp/strata-bench.UslL9U.json
+vulkan device 0: Tesla V100-SXM2-32GB
+vulkan: Tesla V100-SXM2-32GB (NVIDIA 580.178.04), cooperative matrix f16 no int8 no, conditional rendering yes, maxComputeSharedMemorySize 49152
+vulkan: shared-memory preflight: 60 (kernel, specialization) pairs checked, largest 49152 bytes (gemmi_dp) of 49152 allowed, 1.1 ms
+plan: weights+state+scratch 2580 MB (KV 642 MB for 32896 tokens, prefill 512 MB), expert slots 10040 MB, resident experts 10240/10240
+expert traffic: 10.4 MB per layer active set (top-8), 313.8 MB per token over 40 MoE layers
+pp    512: prefill 760.6 (751.0-767.1) tok/s | tg 128: decode 123.0 (121.3-124.0) tok/s
+expert traffic: 313.8 MB/token -> 40.7 GB/s at 123.8 tok/s
+pp   4096: prefill 1395.1 (1394.2-1396.0) tok/s | tg 128: decode 117.7 (117.5-117.8) tok/s
+expert traffic: 313.8 MB/token -> 38.7 GB/s at 117.7 tok/s
+pp  32768: prefill 518.4 (517.9-519.0) tok/s | tg 128: decode 95.7 (95.6-95.8) tok/s
+expert traffic: 313.8 MB/token -> 31.5 GB/s at 95.6 tok/s
+expert hit rate 100.0% (0 misses), cache swaps 0
+worker busy 109.9 µs/token, worker stalls 0
+mailbox traffic: 80 GPU writes, 46080 host routing reads (fast path off, 10240/10240 experts resident)
+```
+
+```json
+{"backend":"vulkan","backend_arg":"vulkan","chunk":4096,"ctx":32896,"device":[0],"expert":{"bytes_per_token":328990720,"hit_rate_pct":100.0,"mb_per_token":313.8,"misses":0,"resident":10240,"swaps":0,"total":10240},"kv":"f16","model":{"name":"Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf","path":"/mnt/models/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf"},"mtp":0,"reps":3,"results":[{"decode_tok_s":{"max":124.0,"mean":123.0,"min":121.3},"expert":{"at_decode_tok_s":123.8,"bytes_per_token":328990720,"gb_per_s":40.7,"mb_per_token":313.8},"pp":512,"prefill_tok_s":{"max":767.1,"mean":760.6,"min":751.0}},{"decode_tok_s":{"max":117.8,"mean":117.7,"min":117.5},"expert":{"at_decode_tok_s":117.7,"bytes_per_token":328990720,"gb_per_s":38.7,"mb_per_token":313.8},"pp":4096,"prefill_tok_s":{"max":1396.0,"mean":1395.1,"min":1394.2}},{"decode_tok_s":{"max":95.8,"mean":95.7,"min":95.6},"expert":{"at_decode_tok_s":95.6,"bytes_per_token":328990720,"gb_per_s":31.5,"mb_per_token":313.8},"pp":32768,"prefill_tok_s":{"max":519.0,"mean":518.4,"min":517.9}}],"schema":"strata.bench.v1","tg":128,"unix_time":1794185380}
+```
+
+### Gate evaluation
+
+Final = mean of the two final runs; control = the warm control run (a single
+cluster of three reps; the cold control run is excluded, which is the
+conservative choice — its contaminated means are *lower*). Δ vs control is the
+final mean over the control mean.
+
+| cell | stored baseline | final (r1 / r2, mean) | Δ % vs stored | control (warm) | Δ % vs control | stored − 3 % | control − 0.5 % |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| prefill pp 512 | 635.6 | 766.8 / 762.7 → **764.8** | **+20.3** | 760.6 | **+0.55** | 616.5 ✓ | 756.8 ✓ |
+| prefill pp 4096 | **1423.9** | 1405.5 / 1394.2 → **1399.9** | **−1.69** | 1395.1 | **+0.34** | 1381.2 ✓ | 1388.1 ✓ |
+| prefill pp 32768 | 523.5 | 520.8 / 520.0 → **520.4** | **−0.59** | 518.4 | **+0.39** | 507.8 ✓ | 515.8 ✓ |
+| decode pp 512 | **109.8** | 123.1 / 122.9 → **123.0** | **+12.0** | 123.0 | **0.00** | 106.5 ✓ | 122.4 ✓ |
+| decode pp 4096 | 108.6 | 117.7 / 117.7 → **117.7** | **+8.4** | 117.7 | **0.00** | 105.3 ✓ | 117.1 ✓ |
+| decode pp 32768 | 95.7 | 95.5 / 95.4 → **95.5** | **−0.26** | 95.7 | **−0.26** | 92.8 ✓ | 95.2 ✓ |
+
+The baseline cells that the roadmap cites:
+
+- **prefill @4096: 1399.9 vs 1423.9 (−1.69 %), but +0.34 % vs the same-session
+  control `5a551eb`: within the noise band.** The deficit is the session, not
+  the M3 code: the control is the pre-M3-T2/T3 shader tree that measured 1431.8
+  in the M3-T1 window, and it reads 1395.1 here.
+- **decode @4096: 117.7 vs 109.8: +8.4 %.**
+
+Absolute gate fails on prefill @4096, prefill @32768 and decode @32768 (the only
+cells under their stored value); all six are ≥ stored − 3 % and all six are ≥
+control − 0.5 %, so the control leg of rule 2 decides the gate.
+
+### Parity (`--tag m3t4-vk-sm70`)
+
+`python3 -I tools/parity.py "$M" --extra "--gpu --backend vulkan --llama-numerics --fixed-experts" --tag m3t4-vk-sm70`
+→ **top-1 625/640 (97.66 %), either-mode 629/640 (98.28 %)**, gate ≥ 625 / ≥ 629:
+**PASS**. Artifact: `docs/parity/m3t4-vk-sm70.json`.
+
+Per-prompt misses (top-1 short of 32/32):
+
+| prompt | agree | first miss | top2 gap at miss |
+| --- | ---: | ---: | ---: |
+| Give a bash one-liner that finds the 10 largest files | 31/32 | 9 | 0.0329 |
+| Объясни, что такое квантовая запутанность… | 28/32 | 3 | 0.5055 |
+| 请用简单的语言解释什么是机器学习。 | 30/32 | 23 | 0.0837 |
+| Give me a simple recipe for pancakes. | 31/32 | 11 | 0.1449 |
+| What license terms apply here? Summarize: | 30/32 | 0 | 0.0319 |
+| Find the error in this log: | 30/32 | 8 | 0.1615 |
+| Which of these cities is the largest by population? | 31/32 | 30 | 0.1016 |
+| List the keys whose value is false: | 30/32 | 0 | 0.3904 |
+
+Delta vs the committed baselines:
+
+- vs `m2-vk-sm70` (625/629, `docs/parity/vk-sm70.json`): **identical per prompt,
+  0 differing prompts, 0 new divergent positions.**
+- vs the M3-T3 window (626/630, `target/parity-result-m3t3-vk.json`): 11 prompts
+  differ in first-miss position or agreement (bash one-liner, Kyiv, quantum
+  entanglement, ML, train, pancakes, design doc, license, log, cities, keys).
+  The two runs are **not flag-identical**: M3-T3 used `--extra "--gpu --backend
+  vulkan"`, while this run uses the M3 gate arm `--llama-numerics
+  --fixed-experts`, so the numeric path (and expert routing) differs by
+  construction. This run reproduces the committed M2 profile row for row, so the
+  M3-T3 run's +1 top-1 / +1 either is a different-arm reading, not a lift.
+  **No position is new relative to the committed M0-T7/M2 baseline**; every miss
+  is at a documented `top2_gap` (0.03–0.51, all near-ties except the
+  already-accepted 0.5055 on prompt 10), and 630/640 is the llama.cpp
+  self-agreement ceiling from M0-T7, so 629 is inside the ceiling.
+
+### Preflight (`strata check --model "$M" --backend vulkan`)
+
+```
+vulkan: shared-memory preflight: 60 (kernel, specialization) pairs checked,
+        largest 40960 bytes (gemmi_dp) of 49152 allowed, 2.6 ms
+```
+
+60 pairs, largest `gemmi_dp` 40 960 / 49 152 B (M3-T2 variant A; the control
+reports 49 152 of 49 152 for the pre-M3-T2 shaders).
+
+### Xid, device and service after the window (2026-11-09 00:56 UTC)
+
+```
+dmesg -T | grep -ci xid                  -> 42 (unchanged; last Xid is the
+                                            2026-11-06 SKEDCHECK18, pre-fix)
+nvidia-smi memory.used,utilization.gpu   -> 0 MiB, 0 %  (device idle)
+systemctl is-active llama.router.service -> inactive (not restarted here:
+                                            the coordinator owns the window)
+```
+
+No `Xid`, no device lost, no `strata` process left on the GPU.
+
+### Verdict
+
+**M3 exit criterion: PASS** (rule 2, same-session control). Prefill @4096 is
+1399.9 (−1.69 % vs the stored 1423.9, +0.34 % vs the same-session control),
+decode @4096 is 117.7 (+8.4 % vs 109.8), prefill @32768 is 520.4 (−0.59 %),
+decode @32768 is 95.5 (−0.26 %); every cell is inside stored − 3 % and inside
+control − 0.5 %. Vulkan parity is unchanged from the M2 baseline (625/629 top-1/
+either). No code, shader, `.spv` or tool change was made in this task.
