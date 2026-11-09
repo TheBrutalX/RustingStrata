@@ -2303,13 +2303,19 @@ Q8_0 4.12e-7, Q4_K 7.71e-7 relative L2 — the `Backend::mmq` routing keeps the 
 Environment: `no Xid` before and after (count 42), `nvidia-smi` back to idle, `llama.router.service`
 inactive and left stopped.
 
-## 2026-11-09 — Prefill attention variants on Volta: no headroom (M3-T3, #51)
+## 2026-11-09 — Prefill attention A/B on Volta: no headroom in variants A and B (M3-T3, #51)
 
 Target from the M3-T1 profile: `attn_prefill_dp` at 4K prefill (641.6 ms, 64 164 µs
-per dispatch, 23.1 % of profiled kernel time). Branch `task/51-attn-prefill-tune`
-(commit `edcb254`), Tesla V100-SXM2-32GB (sm_70, driver 580.178.04, Vulkan
-1.4.312), `Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf`, `spirv-val` and a byte-identical
-default build checked on CPU first.
+per dispatch, 23.1 % of profiled kernel time). Branch `task/51-attn-prefill-tune`,
+Tesla V100-SXM2-32GB (sm_70, driver 580.178.04, Vulkan 1.4.312),
+`Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf` (`qwen35moe`), `spirv-val` and a
+byte-identical default build checked on CPU first.
+
+The model's shape, from its GGUF and `strata info`:
+`qwen35moe.attention.head_count = 16`, `.head_count_kv = 2`,
+`.key_length = 256` (`n_head 16`, `n_head_kv 2`, `head_dim 256`), 40 layers of
+which **10 are `Attn`** (30 are `Delta`/SSM), which is exactly the 10
+`attn_prefill_dp` dispatches of one 4096-token chunk.
 
 Two variants behind selectable defines, both opt-in builds, the default source
 path untouched (`attn_prefill_dp.comp`, variant A = `KEYBLOCK`, variant B =
@@ -2320,7 +2326,8 @@ order, so it needs its own parity run; it is the recommended follow-up (below).
 **Correction to the issue's assumption:** the reference model's head dim is
 **256**, not 128 — the profile's specialization is `attn_prefill_dp [0, 8]` and
 `PER = hd / 32 = 8`, so `HD = 256` and the f16 tile doubles: `BK = 32` needs
-2 × 32 × 256 × 2 B = **32 768 B**, `BK = 16` 16 384 B. The first A/B pass was
+2 × 32 × 256 × 2 B = **32 768 B**, `BK = 16` 16 384 B. (The profile also rules
+out the issue's `nh/nkv = 32/8`: it is 16/2.) The first A/B pass was
 built with `STAGE_MAXHD=128` and returned early (`HD > STAGE_MAXHD`): it is
 discarded, as is a pass made while a concurrent `cargo test --lib cuda::` from
 another worktree saturated the host (prefill is ~66 % host-side, so the wall
@@ -2337,7 +2344,7 @@ STRATA_NO_GRAPH=1 STRATA_VK_PROF=1 STRATA_VK_STATS=1 /tmp/strata-<variant> bench
   --gpu --backend vulkan --pp 4096 --tg 1 --reps 1 --ctx 4400
 ```
 
-| Build | `GLSL_DEFS` | BK | Shared | Regs | Binary | blocks/SM | self ms | µs/call | Δ attn | prefill tok/s |
+| Build | `GLSL_DEFS` | BK | Shared (B) | Regs | ISA bin (B) | blocks/SM | self ms | µs/call | Δ attn | prefill tok/s |
 | --- | --- | --: | ---: | ---: | ---: | --: | ---: | ---: | ---: | ---: |
 | baseline | — | — | 0 | 48 | 11 136 | 10 | 638.6 | 63 863.9 | — | 1389.1 |
 | A8 | `-DKEYBLOCK=8` | 8 | 0 | 48 | 28 928 | 10 | 696.4 | 69 640.9 | **+9.0 %** | 1356.9 |
@@ -2346,9 +2353,19 @@ STRATA_NO_GRAPH=1 STRATA_VK_PROF=1 STRATA_VK_STATS=1 /tmp/strata-<variant> bench
 | B16 | `-DSTAGE=1 -DSTAGE_BK=16 -DSTAGE_MAXHD=256` | 16 | 16 384 | 60 | 39 296 | 6 | 1280.5 | 128 053.2 | **+100.5 %** | 1081.8 |
 | B32 | `-DSTAGE=1 -DSTAGE_BK=32 -DSTAGE_MAXHD=256` | 32 | 32 768 | 97 | 67 712 | 3 | 2086.9 | 208 685.7 | **+226.8 %** | 834.1 |
 
-\* driver-allocated spill space (`Local Memory Size` is 0-stack; the source
-declares no shared array for A): the fully unrolled 32-key block does not fit
-the register file.
+Regs, shared and ISA bin are the driver's `STRATA_VK_STATS` per-pipeline
+statistics (`Register Count`, `Shared Memory Size`, `Binary Size`); `Binary Size`
+is the driver's compiled binary, **not** the `.spv` module (the baseline's `.spv`
+is 10 936 B from the local glslc, 10 920 B committed).
+
+\* The source declares no shared array for variant A, yet the driver's
+`Shared Memory Size` statistic reports 8 704 B for A32 (the `Local Memory Size`
+field reads 68 719 476 736, i.e. the device's local-memory limit, and
+`Stack Size 0`, so it is not a usage figure): most plausibly driver-allocated
+spill/scratch space of the fully unrolled 32-key block, consistent with its
+87 KB binary. It is what the driver accounts for, so it is what the blocks/SM
+formula uses; the registers are the tighter limit either way (8 704 B would
+allow 11 blocks/SM, the 80 registers only 6).
 
 `blocks/SM = min(96 KiB / shared, floor(65536 / (128 × regs)), 2048 / 128)`:
 baseline 65536/6144 = 10.67 → 10; A16 65536/8192 = 8; A32 65536/10240 = 6.4 → 6
@@ -2372,30 +2389,51 @@ What the numbers rule out:
   the BK scores plus a max scan, and it lengthens the dependency chain instead
   of shortening it. The per-key rescale was never the bottleneck.
 - **Occupancy is the currency.** A16 (64 regs, 8 blocks) and A32 (80 regs, 6
-  blocks) degrade roughly in proportion, and A32's 87 KB binary with 8 704 B of
-  spills shows the unrolled block outgrowing the register file. The kernel needs
-  many in-flight lanes to hide the K/V load latency of the per-key chain
-  (loads → 8 FMAs → 5-shuffle subgroup reduction → `expf_` → fma).
-- **Not global-bandwidth bound either.** B16/B32 cut the global K/V reads 4 ×
-  (the 4 queries of a workgroup share the rows) and make them coalesced, but pay
-  2 barriers per BK keys, one f16 shared read per dim per key per lane, 16-bit
-  shared loads (2-way bank conflicts on Volta) and a large occupancy loss:
-  +100.5 % and +226.8 %.
-- **Arithmetic.** At HD = 256 the causal prefill of one 4 096-token chunk is
-  4096 queries × 32 heads × 2 048.5 keys × 1 024 FLOP = **2.75 TFLOP per
-  dispatch**, i.e. ≈ 4.3 TFLOP/s in 63.9 ms = **14 % of the V100's 31 TFLOP/s
-  FP16 CUDA-core peak**; the global K/V traffic is ≤ 8.6 GB per dispatch
-  (≈ 134 GB/s, 15 % of HBM) without the L2 reuse of the 4-query sharing. The
-  issue's 4.3 GFLOP/67 GFLOP/s estimate appears to omit the head and causal
-  factors, so the kernel is 7 × (not 460 ×) below peak — still not FLOP- or
-  bandwidth-bound, and A/B show the two obvious latency levers do not pay.
+  blocks) degrade roughly in proportion, and A32's 87 KB binary with the
+  driver's 8 704 B of shared spill space shows the unrolled block outgrowing the
+  register file. The kernel needs many in-flight lanes to hide the K/V load
+  latency of the per-key chain (loads → 8 FMAs → 5-shuffle subgroup reduction →
+  `expf_` → fma).
+- **Not proven to be free of a load-path limit.** B16/B32 cut the global K/V
+  reads 4 × (the 4 queries of a workgroup share the rows) and make them
+  coalesced, but pay 2 barriers per BK keys, one f16 shared read per dim per key
+  per lane, 16-bit shared loads (2-way bank conflicts on Volta) and 4 and 7
+  blocks/SM of occupancy: +100.5 % and +226.8 %. That does **not** close the
+  bandwidth question, because the staged variant changed three other things at
+  once; it only says that staging K/V in shared is not the way to exploit the
+  reuse.
+- **Arithmetic.** One dispatch is one full-attention layer over a 4096-token
+  chunk, causal: `n_head × T(T+1)/2` = 16 × 8 390 656 = 1.3425e8 query-key
+  pairs, each 2·HD FLOP for QK plus 2·HD for PV with HD = 256 → 1 024 FLOP →
+  **≈ 137 GFLOP per dispatch**, i.e. **≈ 2.15 TFLOP/s** in 63.9 ms = **6.9 % of
+  the V100's 31 TFLOP/s FP16 CUDA-core peak**. The dispatch is therefore not
+  FLOP-bound. (The issue's 4.3 GFLOP / 67 GFLOP/s estimate was for HD = 128 and
+  seems to drop a factor; the corrected figure matters for the next paragraph.)
+- **The loads are the same count as the FLOPs and are close to the L2 ceiling.**
+  Each pair reads 2 × HD × 2 B = 1 024 B of K and V, so the **logical** K/V
+  traffic is **≈ 137 GB per dispatch = 2.15 TB/s**, 2.4 × the V100's 900 GB/s
+  HBM. The kernel cannot be DRAM-bound on that count — at least half of the
+  reads must be served by cache — but how much reaches DRAM depends on the reuse
+  the L2 keeps: the unique K/V of one layer (`n_head_kv 2 × 4096 keys × 256 ×
+  2 B × K and V`) is **8.4 MB**, above the V100's **6 MB L2**, so the 8 query
+  heads per KV head and the 4-query workgroup sharing are only partly cached;
+  with the workgroup's 4 × alone the DRAM traffic would be ≈ 34 GB/dispatch
+  ≈ 538 GB/s = 60 % of HBM peak. A V100 L2 delivers on the order of 2-3 TB/s,
+  so 2.15 TB/s of logical reads sits at or near that ceiling. **Conclusion: not
+  FLOP-bound (6.9 %) and not DRAM-bound on the logical count, but a
+  load-path/L2-bandwidth limit is plausible and this A/B does not exclude it**;
+  the per-SM logical rate (17.6 B/cycle at 80 SMs × 1.53 GHz) is well under the
+  L1's ~128 B/cycle, so a pure `LSU`-throughput limit is less likely than L2
+  bandwidth plus latency.
 
 **Next lever (follow-up, not in #51):** variant C, one `ldkv4` 64-bit load per
-lane for 4 contiguous dims instead of 8 scalar f16 loads, halves the load count
-per key and shrinks the binary; and/or dropping the full unroll of the block
-loop (A8's 2.6 × binary vs the baseline). Both change the per-lane dot order
-(C fully) and need a parity run. A workgroup-shape change (more queries per
-workgroup, `src/vulkan/mod.rs`) is out of scope for this issue.
+lane for 4 contiguous dims instead of 8 scalar f16 loads, halves the load
+*instructions* and shrinks the binary while keeping the same bytes; and/or
+dropping the full unroll of the block loop (A8's 2.6 × binary vs the baseline).
+If the limit is L2 bandwidth rather than instruction count, C cannot win, which
+makes it a clean experiment; both change the per-lane dot order (C fully) and
+need a parity run. A workgroup-shape change (more queries per workgroup, or
+`nh`-major work sharing, in `src/vulkan/mod.rs`) is out of scope for this issue.
 
 ### Default re-validated after the A/B (same window)
 
