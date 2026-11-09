@@ -2672,3 +2672,46 @@ decode @4096 is 117.7 (+8.4 % vs 109.8), prefill @32768 is 520.4 (−0.59 %),
 decode @32768 is 95.5 (−0.26 %); every cell is inside stored − 3 % and inside
 control − 0.5 %. Vulkan parity is unchanged from the M2 baseline (625/629 top-1/
 either). No code, shader, `.spv` or tool change was made in this task.
+
+## 2026-11-09 — base v1.2.1 vs fork v100: 128 to 131072 tokens
+
+Reference model, V100-SXM2-32GB, `strata bench --pp 128,512,2048,4096,8192,16384,32768,65536,131072 --tg 128 --reps 1 --ctx 131072`, one warm-up run before each matrix (`--pp 128,512 --tg 8`). Base = upstream release v1.2.1 (which merged the fork's v100 port at `ceeccf9` and adds upstream's tiled Vulkan attention); fork = `v100` at `845b37c`.
+
+Prefill tok/s:
+
+| tokens | base VK | fork VK | base CUDA | fork CUDA |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 306.8 | 308.2 | 1041.9 | 1046.5 |
+| 512 | 760.5 | 764.0 | 2005.5 | 2028.1 |
+| 2048 | 1404.4 | 1366.9 | 2628.8 | 2653.5 |
+| 4096 | 1462.9 | 1393.4 | 2725.8 | 2755.9 |
+| 8192 | 1242.3 | 1141.1 | 2693.4 | 2695.1 |
+| 16384 | 939.5 | 815.9 | 2538.6 | 2530.5 |
+| 32768 | 628.3 | 517.6 | 2264.2 | 2256.1 |
+| 65536 | 377.9 | 297.5 | 1847.4 | 1866.6 |
+| 131072 | 209.5 | 160.1 | 1361.7 | 1360.1 |
+
+Decode tok/s:
+
+| tokens | base VK | fork VK | base CUDA | fork CUDA |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 123.7 | 123.4 | 127.3 | 127.3 |
+| 512 | 123.8 | 123.5 | 128.3 | 128.7 |
+| 2048 | 120.3 | 119.7 | 123.2 | 124.8 |
+| 4096 | 118.3 | 117.6 | 123.0 | 124.1 |
+| 8192 | 114.4 | 114.0 | 121.1 | 121.7 |
+| 16384 | 107.6 | 107.0 | 117.2 | 117.2 |
+| 32768 | 95.5 | 95.7 | 110.0 | 109.6 |
+| 65536 | 78.7 | 78.6 | 98.2 | 96.9 |
+| 131072 | 57.9 | 57.6 | 80.1 | 77.9 |
+
+Reading:
+- CUDA and Vulkan both run on the V100; CUDA is ~1.9x the Vulkan prefill at
+  4K and ~6.5x at 128K (tensor cores vs the non-cooperative shaders), and
+  ~5% faster in decode.
+- base v1.2.1 Vulkan is faster than the fork from 2K up (+5% at 4K, +31% at
+  128K): the release merged the fork's v100 port and adds upstream's tiled
+  Vulkan prefill attention (`attn_prefill_tile`), which the fork does not have.
+  Decode is identical.
+- The fork's CUDA equals the base (the base contains the same V100 CUDA work),
+  so the fork is not ahead until it merges `upstream/main`.
