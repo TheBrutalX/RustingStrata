@@ -2181,6 +2181,7 @@ commit `5a551eb` + `gemmi.glsl` variant A (`1646a9f`/`2ca5718` rebased), model
 kernels whose committed `.spv` predate the local glslc (pre-existing drift);
 `gemmi_dp.spv` and the cooperative `gemmi`/`gemmi_s` build byte-identically
 from the final source.
+
 ## 2026-11-08 — Per-type f16 GEMM ablation on Vulkan (M3-T5, issue #44)
 
 Built from `task/44-vulkan-int8-gemm` `07673a7` (the `STRATA_VK_MMQ` /
@@ -2301,3 +2302,157 @@ Q8_0 4.12e-7, Q4_K 7.71e-7 relative L2 — the `Backend::mmq` routing keeps the 
 
 Environment: `no Xid` before and after (count 42), `nvidia-smi` back to idle, `llama.router.service`
 inactive and left stopped.
+
+## 2026-11-09 — Prefill attention A/B on Volta: no headroom in variants A and B (M3-T3, #51)
+
+Target from the M3-T1 profile: `attn_prefill_dp` at 4K prefill (641.6 ms, 64 164 µs
+per dispatch, 23.1 % of profiled kernel time). Branch `task/51-attn-prefill-tune`,
+Tesla V100-SXM2-32GB (sm_70, driver 580.178.04, Vulkan 1.4.312),
+`Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf` (`qwen35moe`), `spirv-val` and a
+byte-identical default build checked on CPU first.
+
+The model's shape, from its GGUF and `strata info`:
+`qwen35moe.attention.head_count = 16`, `.head_count_kv = 2`,
+`.key_length = 256` (`n_head 16`, `n_head_kv 2`, `head_dim 256`), 40 layers of
+which **10 are `Attn`** (30 are `Delta`/SSM), which is exactly the 10
+`attn_prefill_dp` dispatches of one 4096-token chunk.
+
+Two variants behind selectable defines, both opt-in builds, the default source
+path untouched (`attn_prefill_dp.comp`, variant A = `KEYBLOCK`, variant B =
+`STAGE`). Variant C (lane owns 4 contiguous dims, `ldkv4`) was not implemented:
+it is gated on A and B both failing, and it changes the dot-product summation
+order, so it needs its own parity run; it is the recommended follow-up (below).
+
+**Correction to the issue's assumption:** the reference model's head dim is
+**256**, not 128 — the profile's specialization is `attn_prefill_dp [0, 8]` and
+`PER = hd / 32 = 8`, so `HD = 256` and the f16 tile doubles: `BK = 32` needs
+2 × 32 × 256 × 2 B = **32 768 B**, `BK = 16` 16 384 B. (The profile also rules
+out the issue's `nh/nkv = 32/8`: it is 16/2.) The first A/B pass was
+built with `STAGE_MAXHD=128` and returned early (`HD > STAGE_MAXHD`): it is
+discarded, as is a pass made while a concurrent `cargo test --lib cuda::` from
+another worktree saturated the host (prefill is ~66 % host-side, so the wall
+clock of that pass collapsed to ~460 tok/s while the GPU-timed attention rows
+stayed plausible).
+
+### A/B (M3-T1 run A: graph off + profiler + stats, 4096 tokens, warm GPU)
+
+```
+M=/mnt/models/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf
+GLSL_DEFS=<variant> tools/gen_spirv.sh /tmp/spv && cp /tmp/spv/attn_prefill_dp.spv src/vulkan/spv/ \
+  && cargo build --release && cp target/release/strata /tmp/strata-<variant>
+STRATA_NO_GRAPH=1 STRATA_VK_PROF=1 STRATA_VK_STATS=1 /tmp/strata-<variant> bench --model "$M" \
+  --gpu --backend vulkan --pp 4096 --tg 1 --reps 1 --ctx 4400
+```
+
+| Build | `GLSL_DEFS` | BK | Shared (B) | Regs | ISA bin (B) | blocks/SM | self ms | µs/call | Δ attn | prefill tok/s |
+| --- | --- | --: | ---: | ---: | ---: | --: | ---: | ---: | ---: | ---: |
+| baseline | — | — | 0 | 48 | 11 136 | 10 | 638.6 | 63 863.9 | — | 1389.1 |
+| A8 | `-DKEYBLOCK=8` | 8 | 0 | 48 | 28 928 | 10 | 696.4 | 69 640.9 | **+9.0 %** | 1356.9 |
+| A16 | `-DKEYBLOCK=16` | 16 | 0 | 64 | 47 232 | 8 | 745.9 | 74 585.4 | **+16.8 %** | 1351.2 |
+| A32 | `-DKEYBLOCK=32` | 32 | 8 704* | 80 | 87 296 | 6 | 861.5 | 86 151.5 | **+34.9 %** | 1313.7 |
+| B16 | `-DSTAGE=1 -DSTAGE_BK=16 -DSTAGE_MAXHD=256` | 16 | 16 384 | 60 | 39 296 | 6 | 1280.5 | 128 053.2 | **+100.5 %** | 1081.8 |
+| B32 | `-DSTAGE=1 -DSTAGE_BK=32 -DSTAGE_MAXHD=256` | 32 | 32 768 | 97 | 67 712 | 3 | 2086.9 | 208 685.7 | **+226.8 %** | 834.1 |
+
+Regs, shared and ISA bin are the driver's `STRATA_VK_STATS` per-pipeline
+statistics (`Register Count`, `Shared Memory Size`, `Binary Size`); `Binary Size`
+is the driver's compiled binary, **not** the `.spv` module (the baseline's `.spv`
+is 10 936 B from the local glslc, 10 920 B committed).
+
+\* The source declares no shared array for variant A, yet the driver's
+`Shared Memory Size` statistic reports 8 704 B for A32 (the `Local Memory Size`
+field reads 68 719 476 736, i.e. the device's local-memory limit, and
+`Stack Size 0`, so it is not a usage figure): most plausibly driver-allocated
+spill/scratch space of the fully unrolled 32-key block, consistent with its
+87 KB binary. It is what the driver accounts for, so it is what the blocks/SM
+formula uses; the registers are the tighter limit either way (8 704 B would
+allow 11 blocks/SM, the 80 registers only 6).
+
+`blocks/SM = min(96 KiB / shared, floor(65536 / (128 × regs)), 2048 / 128)`:
+baseline 65536/6144 = 10.67 → 10; A16 65536/8192 = 8; A32 65536/10240 = 6.4 → 6
+(shared 8 704 B would still allow 11); B16 min(6, 8, 16) = 6; B32 min(3, 5, 16)
+= 3. Every build is ≤ 49 152 B (preflight: largest pair still `gemmi_dp`,
+40 960 B).
+
+### Decision: no variant adopted, the default kernel stays
+
+The gain bar was ≤ 60 950 µs per dispatch (−5 %). Nothing came close, so the
+committed SPIR-V is unchanged (the build from the branch's source is
+byte-identical to the build of the pre-M3-T3 source: 10 936 B, `cmp` clean; the
+committed `attn_prefill_dp.spv` is left as it was, like the other kernels whose
+`.spv` predate the local glslc).
+
+What the numbers rule out:
+
+- **Not rescale-bound.** A8 has the baseline's exact occupancy (48 regs, 10
+  blocks/SM, 0 B) and removes 7 of 8 `acc[j] * c` per key plus the per-key
+  `fma(l, c, e)`; it is 9.0 % *slower*. The block form costs a second sweep over
+  the BK scores plus a max scan, and it lengthens the dependency chain instead
+  of shortening it. The per-key rescale was never the bottleneck.
+- **Occupancy is the currency.** A16 (64 regs, 8 blocks) and A32 (80 regs, 6
+  blocks) degrade roughly in proportion, and A32's 87 KB binary with the
+  driver's 8 704 B of shared spill space shows the unrolled block outgrowing the
+  register file. The kernel needs many in-flight lanes to hide the K/V load
+  latency of the per-key chain (loads → 8 FMAs → 5-shuffle subgroup reduction →
+  `expf_` → fma).
+- **Not proven to be free of a load-path limit.** B16/B32 cut the global K/V
+  reads 4 × (the 4 queries of a workgroup share the rows) and make them
+  coalesced, but pay 2 barriers per BK keys, one f16 shared read per dim per key
+  per lane, 16-bit shared loads (2-way bank conflicts on Volta) and 4 and 7
+  blocks/SM of occupancy: +100.5 % and +226.8 %. That does **not** close the
+  bandwidth question, because the staged variant changed three other things at
+  once; it only says that staging K/V in shared is not the way to exploit the
+  reuse.
+- **Arithmetic.** One dispatch is one full-attention layer over a 4096-token
+  chunk, causal: `n_head × T(T+1)/2` = 16 × 8 390 656 = 1.3425e8 query-key
+  pairs, each 2·HD FLOP for QK plus 2·HD for PV with HD = 256 → 1 024 FLOP →
+  **≈ 137 GFLOP per dispatch**, i.e. **≈ 2.15 TFLOP/s** in 63.9 ms = **6.9 % of
+  the V100's 31 TFLOP/s FP16 CUDA-core peak**. The dispatch is therefore not
+  FLOP-bound. (The issue's 4.3 GFLOP / 67 GFLOP/s estimate was for HD = 128 and
+  seems to drop a factor; the corrected figure matters for the next paragraph.)
+- **The loads are the same count as the FLOPs and are close to the L2 ceiling.**
+  Each pair reads 2 × HD × 2 B = 1 024 B of K and V, so the **logical** K/V
+  traffic is **≈ 137 GB per dispatch = 2.15 TB/s**, 2.4 × the V100's 900 GB/s
+  HBM. The kernel cannot be DRAM-bound on that count — at least half of the
+  reads must be served by cache — but how much reaches DRAM depends on the reuse
+  the L2 keeps: the unique K/V of one layer (`n_head_kv 2 × 4096 keys × 256 ×
+  2 B × K and V`) is **8.4 MB**, above the V100's **6 MB L2**, so the 8 query
+  heads per KV head and the 4-query workgroup sharing are only partly cached;
+  with the workgroup's 4 × alone the DRAM traffic would be ≈ 34 GB/dispatch
+  ≈ 538 GB/s = 60 % of HBM peak. A V100 L2 delivers on the order of 2-3 TB/s,
+  so 2.15 TB/s of logical reads sits at or near that ceiling. **Conclusion: not
+  FLOP-bound (6.9 %) and not DRAM-bound on the logical count, but a
+  load-path/L2-bandwidth limit is plausible and this A/B does not exclude it**;
+  the per-SM logical rate (17.6 B/cycle at 80 SMs × 1.53 GHz) is well under the
+  L1's ~128 B/cycle, so a pure `LSU`-throughput limit is less likely than L2
+  bandwidth plus latency.
+
+**Next lever (follow-up, not in #51):** variant C, one `ldkv4` 64-bit load per
+lane for 4 contiguous dims instead of 8 scalar f16 loads, halves the load
+*instructions* and shrinks the binary while keeping the same bytes; and/or
+dropping the full unroll of the block loop (A8's 2.6 × binary vs the baseline).
+If the limit is L2 bandwidth rather than instruction count, C cannot win, which
+makes it a clean experiment; both change the per-lane dot order (C fully) and
+need a parity run. A workgroup-shape change (more queries per workgroup, or
+`nh`-major work sharing, in `src/vulkan/mod.rs`) is out of scope for this issue.
+
+### Default re-validated after the A/B (same window)
+
+`attn_prefill_matches_decode` ok (Vulkan vs decode rel err ≤ 4.42e-7 at
+hd 256, Vulkan vs CUDA 6.14e-5); `kv_q8` 2/2 ok (f16 and `--kv q8`);
+`tools/bench_v100.sh "$M" vulkan` twice, back to back:
+
+| Run | pp 512 | pp 4096 | pp 32768 | decode @4096 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 768.5 | 1402.9 (1399.1–1406.5) | 520.8 | 117.5 |
+| 2 | 768.6 | 1403.2 (1401.5–1405.8) | 520.3 | 117.6 |
+
+Both samples are ~1.6 % under the M3-T1/M3-T2 controls (1 431.8 / 1 425.2) and
+1.5 % under the roadmap's 1 423.9 floor, **with the unmodified kernel** (the
+committed SPIR-V is what v100 ships), so this is the machine's state today, not
+a regression of #51 — M3-T4 should re-check the floor against a same-session
+control before failing a milestone on it.
+
+Parity: `python3 -I tools/parity.py "$M" --extra "--gpu --backend vulkan"
+--tag m3t3-vk` → **either 630/640, agree 626/640** (gate ≥ 629 / ≥ 625; the
+M2-T5 baseline was 629/625), i.e. no parity change. No Xid: `dmesg | grep -ic
+Xid` = 42 before and after, no device lost.
