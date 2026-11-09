@@ -328,6 +328,7 @@ land `gemm_q` before attention.
 **Objective.** Keep Vulkan as a trustworthy fallback: profile it, tune within
 the 48 KB ceiling, guard the measured baseline, and diagnose the parity gap
 recorded by M0-T7 (629/640 either-mode vs the 99% bar).
+**Status: complete (2026-11-09).**
 
 **Exit criteria.**
 
@@ -349,7 +350,7 @@ goes through the preflight from M0-T4 and is measured.
 | M3-T1 | Vulkan profile of prefill and decode | Use `STRATA_VK_STATS`/`STRATA_VK_PROF` (and pipeline statistics) to attribute time to `gemmi_dp`, `gemm_f_dp`, `attn_prefill`, `attn_decode`; record the breakdown | `src/vulkan/mod.rs`, `docs/V100-results.md` | S | M0-T7 | Breakdown appended; the next tuning task has a named target | done (`5a551eb`) | #46 | #48 |
 | M3-T2 | Tune the non-cooperative GEMM shaders | Try local size, subgroup count, `BM`/`BK` and staged variants of `gemmi_dp`/`gemm_f_dp` within 48 KB; keep the bit-exact int32 path | `src/vulkan/shaders/gemmi.glsl`, `gemm_f.glsl`, `src/vulkan/spv/*` | M | M3-T1 | Measured change recorded; SPIR-V regenerated; preflight passes; no parity change. A: packed KS=16 rows, 49152->40960 B, bit-exact, neutral perf; C rejected | in review | #47 | #49 |
 | M3-T3 | Tune prefill attention on Volta | Examine `attn_prefill` shared usage and workgroup shape; test a variant only if M3-T1 shows it matters | `src/vulkan/shaders/attn_prefill.glsl`, `src/vulkan/spv/*` | M | M3-T1 | Gain measured or the conclusion documented; SPIR-V fresh; no regression. All variants slower (A +9..+35%, B +100..+227%): no headroom, default unchanged | done (`d50990b`) | #51 | #52 |
-| M3-T4 | Vulkan regression gate | Re-run the standard benchmark and parity after M1/M2/M3 changes; fail the milestone if below baseline | `tools/bench_v100.sh`, `tools/parity.py`, `docs/V100-results.md` | S | M3-T2, M3-T3 | Numbers ≥ baseline and parity unchanged; otherwise a follow-up task is opened before the milestone exits. Gate PASS via same-session control: pp4096 -1.69% vs stored but +0.34% vs control; decode +8.4%; parity 629/625 | in review | #53 | #54 |
+| M3-T4 | Vulkan regression gate | Re-run the standard benchmark and parity after M1/M2/M3 changes; fail the milestone if below baseline | `tools/bench_v100.sh`, `tools/parity.py`, `docs/V100-results.md` | S | M3-T2, M3-T3 | Numbers ≥ baseline and parity unchanged; otherwise a follow-up task is opened before the milestone exits. Gate PASS via same-session control: pp4096 -1.69% vs stored but +0.34% vs control; decode +8.4%; parity 629/625 | done (`ae1dcbc`) | #53 | #54 |
 | M3-T5 | Diagnose the Vulkan parity gap | Explain the 629/640 either-mode baseline from M0-T7 (concentration on prompts 10/16/17/19, real top-2 gap on #10) and either close it or state the accepted ceiling with evidence | `src/vulkan/`, `src/gpu_model.rs`, `tools/parity.py`, `docs/parity/`, `docs/V100-results.md` | M | M0-T7 | Root cause identified; fix merged with a new parity run, or a documented, coordinator-approved ceiling with the evidence. Root cause = int8 GEMM; ceiling accepted (f16 costs -20.7%/-17.7%), accuracy follow-up #50 | done (`3b5b21c`) | #44 | #45 |
 
 ---
