@@ -5,6 +5,7 @@
 
 use crate::backend::{BATCHED, ATT_SPLITS, ATT_SPLITS_1, Backend, Buf, GpuTensor, SAME_X};
 use crate::quant::GgmlType;
+use crate::rope::RopeParams;
 use anyhow::{Context, anyhow, ensure};
 use ash::vk;
 use std::collections::{BTreeMap, HashMap};
@@ -1392,17 +1393,19 @@ impl Backend for Vk {
     fn rms_norm_q(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32, xq: u64, res: u64) -> anyhow::Result<()> {
         self.run("rms_norm", &[self.0.llama], [rows, 1, 1], &[&x, &w, &out, &xq, &(x_stride as u32), &(out_stride as u32), &(n as u32), &eps, &0u64, &0f64, &0u32, &0u32, &res, &0u64, &0u64, &0u64, &0u64])
     }
-    fn rms_norm_rope(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
-        self.rms_norm_rope_kv(x, x_stride, w, out, n, rows, eps, per, n_rot, step, base, 0, 0, 0)
+    fn rms_norm_rope(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, rope: &RopeParams) -> anyhow::Result<()> {
+        self.rms_norm_rope_kv(x, x_stride, w, out, n, rows, eps, per, n_rot, step, rope, 0, 0, 0)
     }
-    fn rms_norm_rope_kv(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
-        self.rope_rows(x, x_stride, w, out, n, rows, eps, per, n_rot, step, base, v, kc, vc, 0)
+    fn rms_norm_rope_kv(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, rope: &RopeParams, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
+        anyhow::ensure!(!rope.is_scaled(), "YaRN/linear RoPE is not implemented on the Vulkan backend yet: use --backend cuda");
+        self.rope_rows(x, x_stride, w, out, n, rows, eps, per, n_rot, step, rope.base, v, kc, vc, 0)
     }
     fn kv_rows(&self) -> bool { self.0.llama == 0 }  // attn_decode_llama has no kvt
     fn rms_norm_rope_qk_rows(&self, q: u64, q_stride: usize, qw: u64, qo: u64, nh: usize, k: u64, kw: u64, ko: u64, nkv: usize, hd: usize, eps: f32, n_rot: usize,
-                             step: u64, base: f32, v: u64, kvt: u64, nt: usize) -> anyhow::Result<()> {
-        self.rope_rows(q, q_stride, qw, qo, hd, nt * nh, eps, nh, n_rot, step, base, 0, 0, 0, kvt)?;
-        self.rope_rows(k, hd, kw, ko, hd, nt * nkv, eps, nkv, n_rot, step, base, v, 0, 0, kvt)
+                             step: u64, rope: &RopeParams, v: u64, kvt: u64, nt: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(!rope.is_scaled(), "YaRN/linear RoPE is not implemented on the Vulkan backend yet: use --backend cuda");
+        self.rope_rows(q, q_stride, qw, qo, hd, nt * nh, eps, nh, n_rot, step, rope.base, 0, 0, 0, kvt)?;
+        self.rope_rows(k, hd, kw, ko, hd, nt * nkv, eps, nkv, n_rot, step, rope.base, v, 0, 0, kvt)
     }
     fn attn_rows(&self, q: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, nt: usize, sink: u64, win: usize, kvt: u64, splits: usize) -> anyhow::Result<()> {
         self.attn(q, 0, 0, qg, out, part, step, nh, nkv, hd, scale, 0, nt, 0, 0, 0, sink, win, kvt, splits)
@@ -1418,7 +1421,9 @@ impl Backend for Vk {
     fn l2_norm(&self, x: u64, n: usize, per: usize, stride: usize, rows: usize, eps: f32) -> anyhow::Result<()> {
         self.run("l2_norm", &[], [rows, 1, 1], &[&x, &(n as u32), &(per as u32), &(stride as u32), &eps])
     }
-    fn rope_pairs(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32, lo: usize, hi: usize) -> anyhow::Result<()> {
+    fn rope_pairs(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, rope: &RopeParams, lo: usize, hi: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(!rope.is_scaled(), "YaRN/linear RoPE is not implemented on the Vulkan backend yet: use --backend cuda");
+        let base = rope.base;
         let ts = (base as f64).powf(-2.0 / n_rot as f64);
         self.run("rope_neox", &[], [heads / per, 1, 1], &[&x, &step, &ts, &(stride as u32), &(per as u32), &(n_rot as u32), &(lo as u32), &(hi as u32)])
     }

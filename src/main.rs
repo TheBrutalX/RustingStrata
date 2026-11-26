@@ -39,6 +39,22 @@ struct Engine {
     /// Prefill chunk in tokens (GPU; 0 = token by token) [default: calibrated, else 4096].
     #[arg(long)]
     chunk: Option<usize>,
+    /// RoPE scaling: `none`, `linear` or `yarn` (llama.cpp's `--rope-scaling`). `yarn` needs `--rope-scale` and
+    /// `--yarn-orig-ctx`; it changes the values the model reports, not just the KV size.
+    #[arg(long, value_parser = ["none", "linear", "yarn"])]
+    rope_scaling: Option<String>,
+    /// RoPE context extension factor (llama.cpp's `--rope-scale`): 2 doubles the trained context.
+    #[arg(long)]
+    rope_scale: Option<f32>,
+    /// The context the model was trained on, for YaRN (llama.cpp's `--yarn-orig-ctx`, e.g. 262144).
+    #[arg(long)]
+    yarn_orig_ctx: Option<usize>,
+    /// YaRN `beta_fast` (llama.cpp default 32).
+    #[arg(long, default_value_t = 32.0)]
+    yarn_beta_fast: f32,
+    /// YaRN `beta_slow` (llama.cpp default 1).
+    #[arg(long, default_value_t = 1.0)]
+    yarn_beta_slow: f32,
     /// VRAM left free after placing expert layers, in MB. One value applies to every device; `512,256` gives one
     /// per device in `--device` order, and `0:512,1:256` gives one per GPU index.
     #[arg(long, default_value = "512", value_delimiter = ',')]
@@ -870,7 +886,31 @@ fn chunk_env_updates(n: usize, present: impl Fn(&str) -> bool) -> Vec<(&'static 
 
 impl Engine {
     fn load_inference_model<'a>(&self, g: &'a Gguf, aux: Option<&'a Gguf>) -> anyhow::Result<Model<'a>> {
-        Model::load_with_matvec(g, aux, &self.lora_specs(), self.fast_cpu && !self.gpu)
+        let cfg = ModelConfig::from_gguf(g)?;
+        let rope = self.rope_params(&cfg)?;
+        Model::load_with_matvec_rope(g, aux, &self.lora_specs(), self.fast_cpu && !self.gpu, rope)
+    }
+
+    /// The RoPE plan the CLI asked for, or `None` to keep the GGUF's own (`{arch}.rope.scaling.*`).
+    fn rope_params(&self, cfg: &ModelConfig) -> anyhow::Result<Option<rusting_strata::rope::RopeParams>> {
+        let Some(kind) = self.rope_scaling.as_deref() else {
+            if self.rope_scale.is_some() || self.yarn_orig_ctx.is_some() {
+                anyhow::bail!("--rope-scale/--yarn-orig-ctx need --rope-scaling yarn or linear");
+            }
+            return Ok(None);
+        };
+        let factor = self.rope_scale.unwrap_or(1.0);
+        let rope = match kind {
+            "none" => rusting_strata::rope::RopeParams::plain(cfg.rope.base, cfg.n_rot),
+            "linear" => rusting_strata::rope::RopeParams::linear(cfg.rope.base, cfg.n_rot, factor)?,
+            "yarn" => {
+                let orig = self.yarn_orig_ctx.context("--rope-scaling yarn needs --yarn-orig-ctx (the trained context, e.g. 262144)")?;
+                rusting_strata::rope::RopeParams::yarn(cfg.rope.base, cfg.n_rot, orig, factor, self.yarn_beta_fast, self.yarn_beta_slow)?
+            }
+            other => anyhow::bail!("unknown --rope-scaling {other}"),
+        };
+        say!("rope: {kind}, factor {factor}, corr [{:.0}, {:.0}], {} dims", rope.corr[0], rope.corr[1], cfg.n_rot);
+        Ok(Some(rope))
     }
 
     pub fn lora_specs(&self) -> Vec<(String, f32)> {
@@ -1390,7 +1430,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             if arch == rusting_strata::kolibri::ARCH { score_tokenwise!(rusting_strata::kolibri::chat, rusting_strata::kolibri::forward::KolibriModel) }
             if rusting_strata::inkling2::is_arch(arch) { score_tokenwise!(rusting_strata::inkling2::chat, rusting_strata::inkling2::forward::Inkling2Model) }
             let aux_g = open_mtp_gguf(engine.aux_model_path())?;
-            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
+            let m = engine.load_inference_model(&g, aux_g.as_ref())?;
             if let Some(&t) = prompt.iter().chain(&cont).find(|&&t| t as usize >= m.cfg.n_vocab) {
                 anyhow::bail!("token id {t} out of range (vocabulary has {} tokens)", m.cfg.n_vocab);
             }
@@ -1525,7 +1565,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 None
             };
             let aux_g = if ink.is_none() { open_mtp_gguf(engine.aux_model_path())? } else { None };
-            let m = if ink.is_none() { Some(Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?) } else { None };
+            let m = if ink.is_none() { Some(engine.load_inference_model(&g, aux_g.as_ref())?) } else { None };
             let mut r = match &m { Some(m) => Some(engine.runner(m, &model)?), None => None };
             let nv = match (&ink, &m) { (Some(im), _) => im.cfg.n_vocab, (_, Some(m)) => m.cfg.n_vocab, _ => unreachable!() };
             let mut out = kld_base.map(|p| std::fs::File::create(p).map(std::io::BufWriter::new)).transpose()?;

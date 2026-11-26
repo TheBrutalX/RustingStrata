@@ -2269,7 +2269,7 @@ impl<'a> GpuModel<'a> {
                 g.gemm_dense(&dl.v, nt, df.th.addr(), ne, df.v_ctx.addr() + o, kv, crate::backend::SAME_X)?;
                 g.rms_norm_rope_kv(
                     df.k_ctx.addr() + o, hd, dl.kn.ptr, df.k.addr() + o,
-                    hd, nt * nkv, eps, nkv, dc.n_rot, df.ctx_step.addr(), dc.rope_base,
+                    hd, nt * nkv, eps, nkv, dc.n_rot, df.ctx_step.addr(), &dc.rope,
                     df.v_ctx.addr() + o, dl.kc[self.cur].addr(), dl.vc[self.cur].addr(),
                 )?;
             }
@@ -2286,7 +2286,7 @@ impl<'a> GpuModel<'a> {
                     let o = off(li);
                     g.rms_norm_rope_kv(
                         df.k_ctx.addr() + o, hd, dl.kn.ptr, df.k.addr() + o,
-                        hd, nt * nkv, eps, nkv, dc.n_rot, df.ctx_step.addr(), dc.rope_base,
+                        hd, nt * nkv, eps, nkv, dc.n_rot, df.ctx_step.addr(), &dc.rope,
                         df.v_ctx.addr() + o, dl.kc[self.cur].addr(), dl.vc[self.cur].addr(),
                     )?;
                 }
@@ -2351,7 +2351,7 @@ impl<'a> GpuModel<'a> {
             g.rms_norm_rope_qk(
                 df.q.addr(), hd, dl.qn.ptr, df.q.addr(), b_len * nh, nh,
                 df.k_ctx.addr(), dl.kn.ptr, df.k.addr(), b_len * nkv, nkv,
-                hd, eps, dc.n_rot, swa_step, dc.rope_base,
+                hd, eps, dc.n_rot, swa_step, &dc.rope,
                 df.v_ctx.addr(), dl.kc[self.cur].addr(), dl.vc[self.cur].addr(),
             )?;
 
@@ -3148,8 +3148,8 @@ impl<'a> GpuModel<'a> {
                 self.mv(v, eh, 2 * ne, eg.v.addr(), kv, nt)
             })?;
             g.batch(&mut || {
-                g.rope_neox(eg.q.addr(), hd, nt * nh, nh, ec.n_rot, h.step_buf.addr(), ec.rope_base)?;
-                g.rope_neox(eg.k.addr(), hd, nt * nkv, nkv, ec.n_rot, h.step_buf.addr(), ec.rope_base)
+                g.rope_neox(eg.q.addr(), hd, nt * nh, nh, ec.n_rot, h.step_buf.addr(), &ec.rope)?;
+                g.rope_neox(eg.k.addr(), hd, nt * nkv, nkv, ec.n_rot, h.step_buf.addr(), &ec.rope)
             })?;
             g.kv_store(eg.k.addr(), eg.v.addr(), kc[self.cur].addr(), vc[self.cur].addr(), kv, nt, h.step_buf.addr(), hd)?;
             if !(crate::host_attn::on_host(self.m.cfg.n_layer)
@@ -3344,7 +3344,7 @@ impl<'a> GpuModel<'a> {
                             for (r, &(sl, _)) in self.rows.iter().enumerate() {
                                 if use_rope && self.rope_offset == 0 {
                                     g.rms_norm_rope_qk(at("qg", r, nh * qs), qs, qn.ptr, at("q", r, nh * hd), nh, nh, at("kraw", r, kv), kn.ptr, at("k", r, kv), nkv, nkv,
-                                                       hd, eps, c.n_rot, step + 8 * r as u64, c.rope_base, at("v", r, kv), kc[sl].addr(), vc[sl].addr())?;
+                                                       hd, eps, c.n_rot, step + 8 * r as u64, &c.rope, at("v", r, kv), kc[sl].addr(), vc[sl].addr())?;
                                 } else {
                                     g.rms_norm(at("qg", r, nh * qs), qs, qn.ptr, at("q", r, nh * hd), hd, hd, nh, eps)?;
                                     g.rms_norm(at("kraw", r, kv), hd, kn.ptr, at("k", r, kv), hd, hd, nkv, eps)?;
@@ -3355,8 +3355,8 @@ impl<'a> GpuModel<'a> {
                         if use_rope && self.rope_offset != 0 {
                             g.batch(&mut || {
                                 for r in 0..self.rows.len() {
-                                    g.rope_neox(at("q", r, nh * hd), hd, nh, nh, c.n_rot, rope + 8 * r as u64, c.rope_base)?;
-                                    g.rope_neox(at("k", r, kv), hd, nkv, nkv, c.n_rot, rope + 8 * r as u64, c.rope_base)?;
+                                    g.rope_neox(at("q", r, nh * hd), hd, nh, nh, c.n_rot, rope + 8 * r as u64, &c.rope)?;
+                                    g.rope_neox(at("k", r, kv), hd, nkv, nkv, c.n_rot, rope + 8 * r as u64, &c.rope)?;
                                 }
                                 Ok(())
                             })?;
@@ -3378,7 +3378,7 @@ impl<'a> GpuModel<'a> {
                     } else {
                     if use_rope && self.rope_offset == 0 && !self.mrope {
                         g.batch(&mut || g.rms_norm_rope_qk(p("qg"), qs, qn.ptr, p("q"), nt * nh, nh, p("kraw"), kn.ptr, p("k"), nt * nkv, nkv,
-                                                           hd, eps, c.n_rot, step, c.rope_base, p("v"), kc[self.cur].addr(), vc[self.cur].addr()))?;
+                                                           hd, eps, c.n_rot, step, &c.rope, p("v"), kc[self.cur].addr(), vc[self.cur].addr()))?;
                     } else {
                         g.batch(&mut || {
                             g.rms_norm(p("qg"), qs, qn.ptr, p("q"), hd, hd, nt * nh, eps)?;
@@ -3389,12 +3389,12 @@ impl<'a> GpuModel<'a> {
                             g.batch(&mut || {
                                 // An image token turns each section of pairs by its own position.
                                 if let (true, Some(sec)) = (self.mrope, c.mrope_sections) {
-                                    g.rope_mrope(p("q"), hd, nt * nh, nh, c.n_rot, self.mrope_buf.addr(), c.rope_base, sec)?;
-                                    return g.rope_mrope(p("k"), hd, nt * nkv, nkv, c.n_rot, self.mrope_buf.addr(), c.rope_base, sec);
+                                    g.rope_mrope(p("q"), hd, nt * nh, nh, c.n_rot, self.mrope_buf.addr(), &c.rope, sec)?;
+                                    return g.rope_mrope(p("k"), hd, nt * nkv, nkv, c.n_rot, self.mrope_buf.addr(), &c.rope, sec);
                                 }
                                 let rope = if self.mrope { self.mrope_buf.addr() } else { rope };
-                                g.rope_neox(p("q"), hd, nt * nh, nh, c.n_rot, rope, c.rope_base)?;
-                                g.rope_neox(p("k"), hd, nt * nkv, nkv, c.n_rot, rope, c.rope_base)?;
+                                g.rope_neox(p("q"), hd, nt * nh, nh, c.n_rot, rope, &c.rope)?;
+                                g.rope_neox(p("k"), hd, nt * nkv, nkv, c.n_rot, rope, &c.rope)?;
                                 Ok(())
                             })?;
                         }
@@ -3403,9 +3403,9 @@ impl<'a> GpuModel<'a> {
                     let (sel, sst) = match (qsa, &self.qsa) {
                         (Some(a), Some(b)) => {
                             mv2(&a.qp, &a.kp, "iq", "ik")?;
-                            g.qsa_pool(p("ik"), a.ring, a.pool.addr(), a.kn.ptr, step, nt, c.n_rot, c.rope_base, eps)?;
+                            g.qsa_pool(p("ik"), a.ring, a.pool.addr(), a.kn.ptr, step, nt, c.n_rot, c.rope.base, eps)?;
                             g.rms_norm(p("iq"), QSA_D, a.qn.ptr, p("iqn"), QSA_D, QSA_D, nt * QSA_H, eps)?;
-                            g.rope_neox(p("iqn"), QSA_D, nt * QSA_H, QSA_H, c.n_rot, rope, c.rope_base)?;
+                            g.rope_neox(p("iqn"), QSA_D, nt * QSA_H, QSA_H, c.n_rot, rope, &c.rope)?;
                             g.qsa_select(p("iqn"), a.pool.addr(), b.score.addr(), b.sel.addr(), 0, step, 0, nt, b.nbs, b.top, b.sst, 0)?;
                             (b.sel.addr(), b.sst)
                         }

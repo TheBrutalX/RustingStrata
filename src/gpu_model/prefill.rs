@@ -529,7 +529,7 @@ impl GpuModel<'_> {
                     g.gemm_dense(k, t, h, ne, kraw, kv, SAME_X | BATCHED)?;
                     g.gemm_dense(v, t, h, ne, vv, kv, SAME_X | BATCHED)?;
                     let win = c.swa.get(il).copied().unwrap_or(false).then_some(c.n_swa).unwrap_or(0);
-                    g.rms_norm_rope_qk_rows(at(l.a), qs, qn.ptr, at(l.b), nh, kraw, kn.ptr, kk, nkv, hd, eps, c.n_rot, step, c.rope_base, vv, kvt, t)?;
+                    g.rms_norm_rope_qk_rows(at(l.a), qs, qn.ptr, at(l.b), nh, kraw, kn.ptr, kk, nkv, hd, eps, c.n_rot, step, &c.rope, vv, kvt, t)?;
                     g.attn_rows(at(l.b), if c.q_gate { at(l.a) } else { 0 }, at(l.d), bt.attp.addr(), step, nh, nkv, hd, 1.0 / (hd as f32).sqrt(), t,
                                 sink.as_ref().map_or(0, |s| s.ptr), win, kvt, splits)?;
                     g.gemm_dense(o, t, at(l.d), nh * hd, mx, ne, mact | BATCHED)?;
@@ -540,11 +540,11 @@ impl GpuModel<'_> {
                     let use_rope = c.rope_layer.get(il).copied().unwrap_or(true);
                     g.gemm_dense(q, t, h, ne, at(l.a), nh * qs, 0)?;
                     g.rms_norm(at(l.a), qs, qn.ptr, at(l.b), hd, hd, t * nh, eps)?;
-                    if use_rope { g.rope_neox(at(l.b), hd, t * nh, nh, c.n_rot, rope, c.rope_base)?; }
+                    if use_rope { g.rope_neox(at(l.b), hd, t * nh, nh, c.n_rot, rope, &c.rope)?; }
                     g.gemm_dense(k, t, h, ne, kraw, kv, SAME_X)?;
                     g.gemm_dense(v, t, h, ne, vv, kv, SAME_X)?;
                     g.rms_norm(kraw, hd, kn.ptr, kk, hd, hd, t * nkv, eps)?;
-                    if use_rope { g.rope_neox(kk, hd, t * nkv, nkv, c.n_rot, rope, c.rope_base)?; }
+                    if use_rope { g.rope_neox(kk, hd, t * nkv, nkv, c.n_rot, rope, &c.rope)?; }
                     g.kv_store(kk, vv, kc[self.cur].addr(), vc[self.cur].addr(), kv, t, step, hd)?;
                     // QSA: region c (free after kv_store) holds the raw indexer keys, raw queries and normed queries.
                     let (qm, mw) = match (qsa, &self.qsa) {
@@ -553,11 +553,11 @@ impl GpuModel<'_> {
                             let (dq, nq) = (super::QSA_D, super::QSA_H * super::QSA_D);
                             g.gemm_dense(&a.kp, t, h, ne, ik, dq, 0)?;
                             g.gemm_dense(&a.qp, t, h, ne, iq, nq, SAME_X)?;
-                            g.qsa_pool(ik, a.ring, a.pool.addr(), a.kn.ptr, step, t, c.n_rot, c.rope_base, eps)?;
+                            g.qsa_pool(ik, a.ring, a.pool.addr(), a.kn.ptr, step, t, c.n_rot, c.rope.base, eps)?;
                             // Rows with at most `top` complete blocks attend densely: no mask while all of them do.
                             if self.pos + t >= super::QSA_POOL * (b.top + 1) {
                                 g.rms_norm(iq, dq, a.qn.ptr, iqn, dq, dq, t * super::QSA_H, eps)?;
-                                g.rope_neox(iqn, dq, t * super::QSA_H, super::QSA_H, c.n_rot, rope, c.rope_base)?;
+                                g.rope_neox(iqn, dq, t * super::QSA_H, super::QSA_H, c.n_rot, rope, &c.rope)?;
                                 for r0 in (0..t).step_by(super::QSA_ROWS) {
                                     g.qsa_select(iqn + (4 * r0 * nq) as u64, a.pool.addr(), b.score.addr(), 0, b.mask.addr() + (4 * r0 * b.mw) as u64,
                                                  step, r0, super::QSA_ROWS.min(t - r0), b.nbs, b.top, 0, b.mw)?;
@@ -893,7 +893,7 @@ impl GpuModel<'_> {
                 g.gemm_dense(&dl.v, t, h, df_ne, vv, df_kv, SAME_X)?;
                 g.rms_norm_rope_kv(
                     kraw, df_hd, dl.kn.ptr, kk,
-                    df_hd, t * df_nkv, df_eps, df_nkv, dc.n_rot, df.ctx_step.addr(), dc.rope_base,
+                    df_hd, t * df_nkv, df_eps, df_nkv, dc.n_rot, df.ctx_step.addr(), &dc.rope,
                     vv, dl.kc[self.cur].addr(), dl.vc[self.cur].addr(),
                 )?;
             }
@@ -974,7 +974,7 @@ impl GpuModel<'_> {
                 g.gemm_dense(k, t, h, ne, kraw, kv, SAME_X | BATCHED)?;
                 g.gemm_dense(v, t, h, ne, vv, kv, SAME_X | BATCHED)?;
                 let win = c.swa.get(self.first + i).copied().unwrap_or(false).then_some(c.n_swa).unwrap_or(0);
-                g.rms_norm_rope_qk_rows(at(l.a), qs, qn.ptr, at(l.b), nh, kraw, kn.ptr, kk, nkv, hd, eps, c.n_rot, step, c.rope_base, vv, kvt, t)?;
+                g.rms_norm_rope_qk_rows(at(l.a), qs, qn.ptr, at(l.b), nh, kraw, kn.ptr, kk, nkv, hd, eps, c.n_rot, step, &c.rope, vv, kvt, t)?;
                 g.attn_rows(at(l.b), if c.q_gate { at(l.a) } else { 0 }, at(l.d), bt.attp.addr(), step, nh, nkv, hd, 1.0 / (hd as f32).sqrt(), t,
                             sink.as_ref().map_or(0, |s| s.ptr), win, kvt, splits)?;
                 g.gemm_dense(o, t, at(l.d), nh * hd, x, ne, 2 | BATCHED)?;

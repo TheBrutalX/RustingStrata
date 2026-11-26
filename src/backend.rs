@@ -2,6 +2,7 @@
 //! model runs. Every op takes device addresses, so model code never sees backend types. `cuda` and `vulkan` implement it.
 
 use crate::quant::GgmlType;
+use crate::rope::RopeParams;
 use crate::weights::Tensor;
 use std::any::Any;
 
@@ -281,34 +282,34 @@ pub trait Backend: Send {
     /// Row r: vector r % per (n floats) of token r / per, tokens `stride` floats apart.
     fn l2_norm(&self, x: u64, n: usize, per: usize, stride: usize, rows: usize, eps: f32) -> anyhow::Result<()>;
     /// `heads` rows of `stride` floats, `per` per token; token t is at position step[0] + t.
-    fn rope_neox(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
-        self.rope_pairs(x, stride, heads, per, n_rot, step, base, 0, n_rot / 2)
+    fn rope_neox(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, rope: &RopeParams) -> anyhow::Result<()> {
+        self.rope_pairs(x, stride, heads, per, n_rot, step, rope, 0, n_rot / 2)
     }
     /// `rope_neox` of pairs `lo..hi` only (M-RoPE: one call per section, each with its own position buffer).
-    fn rope_pairs(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32, lo: usize, hi: usize) -> anyhow::Result<()>;
+    fn rope_pairs(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, rope: &RopeParams, lo: usize, hi: usize) -> anyhow::Result<()>;
     /// M-RoPE (`ops::rope_mrope`): section s of the pairs turns by position `pos[2 * s]` (`pos`: four [position, _]
     /// i32 pairs); pairs past the sections use the last position.
-    fn rope_mrope(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, pos: u64, base: f32, sections: [usize; 4]) -> anyhow::Result<()> {
+    fn rope_mrope(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, pos: u64, rope: &RopeParams, sections: [usize; 4]) -> anyhow::Result<()> {
         let (half, mut lo) = (n_rot / 2, 0);
         for (s, n) in sections.into_iter().enumerate() {
             let hi = if s == 3 { half } else { (lo + n).min(half) };
-            if hi > lo { self.rope_pairs(x, stride, heads, per, n_rot, pos + 8 * s as u64, base, lo, hi)?; }
+            if hi > lo { self.rope_pairs(x, stride, heads, per, n_rot, pos + 8 * s as u64, rope, lo, hi)?; }
             lo = hi;
         }
         Ok(())
     }
     /// `rms_norm` of `rows` heads of n (output rows of n), then `rope_neox` on them.
-    fn rms_norm_rope(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
+    fn rms_norm_rope(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, rope: &RopeParams) -> anyhow::Result<()> {
         self.rms_norm(x, x_stride, w, out, n, n, rows, eps)?;
-        self.rope_neox(out, n, rows, per, n_rot, step, base)
+        self.rope_neox(out, n, rows, per, n_rot, step, rope)
     }
     /// `rms_norm_rope` of the k heads (`per` per token), then `kv_store` of them and v (rows of n, like out).
-    fn rms_norm_rope_kv(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64) -> anyhow::Result<()>;
+    fn rms_norm_rope_kv(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, rope: &RopeParams, v: u64, kc: u64, vc: u64) -> anyhow::Result<()>;
     /// `rms_norm_rope` of the q heads (`qrows` rows, `qper` per token), then `rms_norm_rope_kv` of the k heads (rows of n).
     fn rms_norm_rope_qk(&self, q: u64, q_stride: usize, qw: u64, qo: u64, qrows: usize, qper: usize, k: u64, kw: u64, ko: u64, krows: usize, kper: usize,
-                        n: usize, eps: f32, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
-        self.rms_norm_rope(q, q_stride, qw, qo, n, qrows, eps, qper, n_rot, step, base)?;
-        self.rms_norm_rope_kv(k, n, kw, ko, n, krows, eps, kper, n_rot, step, base, v, kc, vc)
+                        n: usize, eps: f32, n_rot: usize, step: u64, rope: &RopeParams, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
+        self.rms_norm_rope(q, q_stride, qw, qo, n, qrows, eps, qper, n_rot, step, rope)?;
+        self.rms_norm_rope_kv(k, n, kw, ko, n, krows, eps, kper, n_rot, step, rope, v, kc, vc)
     }
     /// x += y.
     fn add(&self, x: u64, y: u64, n: usize) -> anyhow::Result<()>;
@@ -542,7 +543,7 @@ pub trait Backend: Send {
     /// `rms_norm_rope_qk` for `nt` tokens of different sequences: token t is at position `step[2t]` and stores its K
     /// and V in the caches whose addresses are `kvt[2t]` and `kvt[2t + 1]` (u64 each).
     fn rms_norm_rope_qk_rows(&self, _q: u64, _q_stride: usize, _qw: u64, _qo: u64, _nh: usize, _k: u64, _kw: u64, _ko: u64, _nkv: usize, _hd: usize, _eps: f32, _n_rot: usize,
-                             _step: u64, _base: f32, _v: u64, _kvt: u64, _nt: usize) -> anyhow::Result<()> {
+                             _step: u64, _rope: &RopeParams, _v: u64, _kvt: u64, _nt: usize) -> anyhow::Result<()> {
         anyhow::bail!("{}: no per-row KV kernels", self.name())
     }
     /// `attn_decode_gq` with `gq_min` 0 for `nt` tokens of different sequences, with the caches of

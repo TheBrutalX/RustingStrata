@@ -1,6 +1,7 @@
 //! Model hyperparameters read from GGUF metadata, plus the per-architecture table.
 
 use crate::gguf::Gguf;
+use crate::rope::RopeParams;
 use anyhow::{Context, bail, ensure};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,6 +17,7 @@ pub struct Eagle3Config {
     pub head_dim: usize,
     pub n_rot: usize,
     pub rope_base: f32,
+    pub rope: RopeParams,
     pub eps: f32,
     pub draft_vocab: usize,
     pub norm_before_residual: bool,
@@ -37,6 +39,7 @@ pub struct DFlashConfig {
     pub head_dim: usize,
     pub n_rot: usize,
     pub rope_base: f32,
+    pub rope: RopeParams,
     pub eps: f32,
     pub sliding_window: usize,
     pub layer_swa: Vec<bool>,
@@ -205,7 +208,8 @@ pub struct ModelConfig {
     pub n_rot: usize,
     /// Qwen3-VL/3.5 M-RoPE section sizes (sum = `n_rot/2`); `None` uses 1-D RoPE.
     pub mrope_sections: Option<[usize; 4]>,
-    pub rope_base: f32,
+    /// RoPE plan: plain, linear or YaRN (`{arch}.rope.scaling.*`).
+    pub rope: RopeParams,
     pub eps: f32,
     pub n_vocab: usize,
     /// Dense FFN size (0 for MoE).
@@ -356,6 +360,8 @@ impl ModelConfig {
         let n_swa = opt("attention.sliding_window");
         anyhow::ensure!(!swa.contains(&true) || n_swa > 0, "sliding-window layers without attention.sliding_window");
         let emb = g.tensors.get("token_embd.weight").context("missing tensor token_embd.weight")?;
+        let n_rot = match opt("rope.dimension_count") { 0 => head_dim, v => v };
+        let rope = crate::rope::from_gguf(g, &arch, f("rope.freq_base").unwrap_or(10000.0), n_rot)?;
         let c = ModelConfig {
             n_layer,
             n_nextn,
@@ -363,14 +369,14 @@ impl ModelConfig {
             n_head,
             n_head_kv: req("attention.head_count_kv")?,
             head_dim,
-            n_rot: match opt("rope.dimension_count") { 0 => head_dim, v => v },
+            n_rot,
             mrope_sections: g.meta.get(&format!("{arch}.rope.dimension_sections")).and_then(|v| v.as_arr()).and_then(|a| {
                 if a.len() < 4 { return None; }
                 let mut s = [0usize; 4];
                 for (o, v) in s.iter_mut().zip(a) { *o = v.as_u64()? as usize; }
                 Some(s)
             }),
-            rope_base: f("rope.freq_base").unwrap_or(10000.0),
+            rope,
             eps: f("attention.layer_norm_rms_epsilon").context("missing rms epsilon")?,
             n_vocab: emb.dims[1] as usize,
             n_ff: opt("feed_forward_length"),

@@ -2,7 +2,7 @@
 mod common;
 use common::{down, up};
 use rusting_strata::backend::{Backend, ATT_GQA_MIN, ATT_SPLITS, BATCHED, GEMM_BM, GpuTensor, SAME_X};
-use rusting_strata::{cuda::Gpu, gguf::Gguf, quant::GgmlType, weights::{Tensor, Weights}};
+use rusting_strata::{cuda::Gpu, gguf::Gguf, quant::GgmlType, rope::RopeParams, weights::{Tensor, Weights}};
 
 fn xs(n: usize) -> Vec<f32> {
     (0..n).map(|i| ((i as f32 * 0.7548777).fract() - 0.5) * 2.0).collect()
@@ -1178,7 +1178,7 @@ fn norm_rope_and_gate_ops_match_cpu() {
         let (hd, n_rot, pos) = (128, 64, 30_000);
         let dx = up(gpu, &x[..6 * hd]);
         let step = up(gpu, &[pos as i32, 0]);
-        gpu.rope_neox(dx.addr(), hd, 6, 2, n_rot, step.addr(), 1e7).unwrap();
+        gpu.rope_neox(dx.addr(), hd, 6, 2, n_rot, step.addr(), &RopeParams::plain(1e7, n_rot)).unwrap();
         let mut want = x[..6 * hd].to_vec();
         for (h, v) in want.chunks_mut(hd).enumerate() { ops::rope_neox(v, n_rot, pos + h / 2, 1e7) }
         let got = down::<f32>(gpu, &dx);
@@ -1188,7 +1188,7 @@ fn norm_rope_and_gate_ops_match_cpu() {
         let (mpos, sec) = ([40, 7, 13, 5], [11, 11, 10, 0]);
         let dx = up(gpu, &x[..2 * hd]);
         let step = up(gpu, &mpos.map(|p| [p, 0]).concat());
-        gpu.rope_mrope(dx.addr(), hd, 2, 2, n_rot, step.addr(), 1e7, sec).unwrap();
+        gpu.rope_mrope(dx.addr(), hd, 2, 2, n_rot, step.addr(), &RopeParams::plain(1e7, n_rot), sec).unwrap();
         let mut want = x[..2 * hd].to_vec();
         for v in want.chunks_mut(hd) { ops::rope_mrope(v, n_rot, mpos, sec, 1e7) }
         let got = down::<f32>(gpu, &dx);
@@ -1197,24 +1197,24 @@ fn norm_rope_and_gate_ops_match_cpu() {
         let dx = up(gpu, &x[..6 * 160]);
         let (d1, d2) = (gpu.zeros::<f32>(6 * hd).unwrap(), gpu.zeros::<f32>(6 * hd).unwrap());
         gpu.rms_norm(dx.addr(), 160, dw.addr(), d1.addr(), hd, hd, 6, 1e-6).unwrap();
-        gpu.rope_neox(d1.addr(), hd, 6, 2, n_rot, step.addr(), 1e7).unwrap();
-        gpu.rms_norm_rope(dx.addr(), 160, dw.addr(), d2.addr(), hd, 6, 1e-6, 2, n_rot, step.addr(), 1e7).unwrap();
+        gpu.rope_neox(d1.addr(), hd, 6, 2, n_rot, step.addr(), &RopeParams::plain(1e7, n_rot)).unwrap();
+        gpu.rms_norm_rope(dx.addr(), 160, dw.addr(), d2.addr(), hd, 6, 1e-6, 2, n_rot, step.addr(), &RopeParams::plain(1e7, n_rot)).unwrap();
         assert_eq!(down::<f32>(gpu, &d2), down::<f32>(gpu, &d1), "rms_norm_rope");
         // rms_norm_rope_kv == rms_norm_rope then kv_store of 3 tokens of 2 heads.
         let dv = up(gpu, &x[6 * hd..12 * hd]);
         let c: Vec<_> = (0..4).map(|_| gpu.zeros::<u16>(gpu.kv_words((pos + 3) * 2 * hd)).unwrap()).collect();
         let d3 = gpu.zeros::<f32>(6 * hd).unwrap();
         gpu.kv_store(d2.addr(), dv.addr(), c[0].addr(), c[1].addr(), 2 * hd, 3, step.addr(), hd).unwrap();
-        gpu.rms_norm_rope_kv(dx.addr(), 160, dw.addr(), d3.addr(), hd, 6, 1e-6, 2, n_rot, step.addr(), 1e7, dv.addr(), c[2].addr(), c[3].addr()).unwrap();
+        gpu.rms_norm_rope_kv(dx.addr(), 160, dw.addr(), d3.addr(), hd, 6, 1e-6, 2, n_rot, step.addr(), &RopeParams::plain(1e7, n_rot), dv.addr(), c[2].addr(), c[3].addr()).unwrap();
         assert_eq!(down::<f32>(gpu, &d3), down::<f32>(gpu, &d1), "rms_norm_rope_kv");
         for i in 0..2 { assert_eq!(down::<u16>(gpu, &c[i + 2]), down::<u16>(gpu, &c[i]), "rms_norm_rope_kv cache {i}"); }
         // rms_norm_rope_qk == rms_norm_rope of 3 tokens of 2 q heads (rows 160 apart), then rms_norm_rope_kv of 1 k head each.
         let dk = up(gpu, &x[12 * hd..15 * hd]);
         let (d4, d5, d6, d7) = (gpu.zeros::<f32>(6 * hd).unwrap(), gpu.zeros::<f32>(3 * hd).unwrap(), gpu.zeros::<f32>(6 * hd).unwrap(), gpu.zeros::<f32>(3 * hd).unwrap());
         let c2: Vec<_> = (0..4).map(|_| gpu.zeros::<u16>(gpu.kv_words((pos + 3) * hd)).unwrap()).collect();
-        gpu.rms_norm_rope(dx.addr(), 160, dw.addr(), d4.addr(), hd, 6, 1e-6, 2, n_rot, step.addr(), 1e7).unwrap();
-        gpu.rms_norm_rope_kv(dk.addr(), hd, dw.addr(), d5.addr(), hd, 3, 1e-6, 1, n_rot, step.addr(), 1e7, dv.addr(), c2[0].addr(), c2[1].addr()).unwrap();
-        gpu.rms_norm_rope_qk(dx.addr(), 160, dw.addr(), d6.addr(), 6, 2, dk.addr(), dw.addr(), d7.addr(), 3, 1, hd, 1e-6, n_rot, step.addr(), 1e7,
+        gpu.rms_norm_rope(dx.addr(), 160, dw.addr(), d4.addr(), hd, 6, 1e-6, 2, n_rot, step.addr(), &RopeParams::plain(1e7, n_rot)).unwrap();
+        gpu.rms_norm_rope_kv(dk.addr(), hd, dw.addr(), d5.addr(), hd, 3, 1e-6, 1, n_rot, step.addr(), &RopeParams::plain(1e7, n_rot), dv.addr(), c2[0].addr(), c2[1].addr()).unwrap();
+        gpu.rms_norm_rope_qk(dx.addr(), 160, dw.addr(), d6.addr(), 6, 2, dk.addr(), dw.addr(), d7.addr(), 3, 1, hd, 1e-6, n_rot, step.addr(), &RopeParams::plain(1e7, n_rot),
                              dv.addr(), c2[2].addr(), c2[3].addr()).unwrap();
         assert_eq!(down::<f32>(gpu, &d6), down::<f32>(gpu, &d4), "rms_norm_rope_qk q");
         assert_eq!(down::<f32>(gpu, &d7), down::<f32>(gpu, &d5), "rms_norm_rope_qk k");

@@ -2081,13 +2081,25 @@ extern "C" __global__ void l2_norm(float* x, int n, int per, int stride, float e
 
 // Per-token values live in device memory so a captured graph can replay: step[0] = position, step[1] = CPU worker seq.
 
+__device__ __forceinline__ double rope_f_yarn(float base, int i, int n_rot, float freq_scale, float ext, float corr0, float corr1) {
+    double f = pow((double)base, -2.0 * i / n_rot);
+    if (ext == 0.0f) return f * (double)freq_scale;
+    double lo = (double)corr0, hi = (double)corr1;
+    double y = ((double)i - lo) / fmax(0.001, hi - lo);
+    double mix = (1.0 - fmin(1.0, fmax(0.0, y))) * (double)ext;
+    return f * ((double)freq_scale * (1.0 - mix) + mix);
+}
 // grid = tokens (each rotates its per heads), block = n_rot / 2. NEOX pairs (i, i + n_rot/2), only lo <= i < hi (M-RoPE
 // rotates each section of pairs by its own position). Token t sits at position step[0] + t.
-extern "C" __global__ void rope_neox(float* x, int stride, int per, int n_rot, const int* step, float base, int lo, int hi) {
+extern "C" __global__ void rope_neox(float* x, int stride, int per, int n_rot, const int* step, float base,
+                                    float freq_scale, float ext, float corr0, float corr1, const double* fr, int lo, int hi) {
     int pos = step[0] + blockIdx.x;
     int i = threadIdx.x, half = n_rot / 2;
     if (i < lo || i >= hi) return;
-    double theta = (double)pos * pow((double)base, -2.0 * i / n_rot);  // f64 is slow: once per token, not per head
+    // f64 is slow: once per token, not per head. fr is the YaRN-aware table; without one (a graph capture) the
+    // same effective frequency is computed here so the captured graph stays correct.
+    double f = fr ? fr[i] : rope_f_yarn(base, i, n_rot, freq_scale, ext, corr0, corr1);
+    double theta = (double)pos * f;
     float s = (float)sin(theta), c = (float)cos(theta);
     for (int hd = 0; hd < per; hd++) {
         float* h = x + (size_t)(blockIdx.x * per + hd) * stride;
@@ -3086,10 +3098,9 @@ extern "C" __global__ void __launch_bounds__(128) kv_store_turbo(const float* k,
 // grid = rows (heads of n), block 256 (or 128 when n <= 128): rms_norm (out rows of n) then rope_neox of the head, in one launch with the same
 // bits. Head r belongs to token r / per. With kc, then kv_store of the head and its v (v rows of n, like out).
 // Blocks below qrows do the q heads (from qx etc., no cache store); the rest do x etc.
-__device__ __forceinline__ double rope_f(float base, int i, int n_rot) { return pow((double)base, -2.0 * i / n_rot); }
-// fr[i] = rope_f(base, i, n_rot) for i < n_rot / 2, made once so rms_norm_rope skips the f64 pow.
-extern "C" __global__ void rope_freq(double* fr, float base, int n_rot) {
-    for (int i = threadIdx.x; i < n_rot / 2; i += blockDim.x) fr[i] = rope_f(base, i, n_rot);
+// fr[i] = effective frequency of pair i, made once so rms_norm_rope skips the f64 pow.
+extern "C" __global__ void rope_freq(double* fr, float base, int n_rot, float freq_scale, float ext, float corr0, float corr1) {
+    for (int i = threadIdx.x; i < n_rot / 2; i += blockDim.x) fr[i] = rope_f_yarn(base, i, n_rot, freq_scale, ext, corr0, corr1);
 }
 // cs[t * (n_rot / 2) + i] = (sin, cos) of angle i of token t, as rms_norm_rope computes them (tok and pos as there):
 // once a token instead of once a head (the f64 sincos is slow on consumer cards).
@@ -3103,7 +3114,8 @@ extern "C" __global__ void rope_cs(float2* cs, const int* step, const u64* kvt, 
 }
 // fr: the rope_freq table of base and n_rot, or null to compute it here. cs: the rope_cs table of these tokens, or null.
 extern "C" __global__ void rms_norm_rope(const float* x, int x_stride, const float* w, float* out, int n, float eps, int per,
-                                         int n_rot, const int* step, float base, const float* v, u16* kc, u16* vc,
+                                         int n_rot, const int* step, float base, float freq_scale, float ext, float corr0, float corr1,
+                                         const float* v, u16* kc, u16* vc,
                                          int qrows, const float* qx, int q_stride, const float* qw, float* qo, int qper,
                                          const double* fr, const u64* kvt, const float2* cs) {
     int b = (int)blockIdx.x - qrows;
@@ -3123,7 +3135,7 @@ extern "C" __global__ void rms_norm_rope(const float* x, int x_stride, const flo
         float sn, c;
         if (cs) { float2 v = cs[tok * half + i]; sn = v.x; c = v.y; }
         else {
-            double theta = (double)pos * (fr ? fr[i] : rope_f(base, i, n_rot));
+            double theta = (double)pos * (fr ? fr[i] : rope_f_yarn(base, i, n_rot, freq_scale, ext, corr0, corr1));
             double ds, dc;
             sincos(theta, &ds, &dc);
             sn = (float)ds; c = (float)dc;
