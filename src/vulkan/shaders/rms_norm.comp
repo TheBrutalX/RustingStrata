@@ -8,7 +8,7 @@ layout(local_size_x = 256) in;
 // at kvt[2 (r / per)] and kvt[2 (r / per) + 1].
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer U64 { uint64_t v[]; };
 layout(push_constant) uniform P { F32 x; F32 w; F32 o; U32 q; uint xs; uint os; uint n; float eps; I32 step; double ts; uint per; uint n_rot; F32 res;
-                                   F32 v; U16 kc; U16 vc; U64 kvt; } p;
+                                   F32 v; U16 kc; U16 vc; U64 kvt; uint yarn0; uint yarn1; } p;
 shared float tqk[512], tqv[512];
 void rotate(inout float s[512], uint base, uint lane, bool inv) {
     vec4 a = vec4(s[base + 4u * lane], s[base + 4u * lane + 1u], s[base + 4u * lane + 2u], s[base + 4u * lane + 3u]);
@@ -43,7 +43,7 @@ void main() {
         double pos = double(uint64_t(p.kvt) != 0 ? p.step.v[2 * (r / p.per)] : p.step.v[0] + int(r / p.per));
         for (uint i = gl_LocalInvocationID.x; i < h; i += 256) {
             float sn, cs, a = p.x.v[xo + i] * sc * p.w.v[i], b = p.x.v[xo + i + h] * sc * p.w.v[i + h];
-            rope_cs(pos, p.ts, i, sn, cs);
+            rope_cs_yarn(pos, p.ts, i, p.yarn0, p.yarn1, sn, cs);
             p.o.v[oo + i] = a * cs - b * sn;
             p.o.v[oo + i + h] = a * sn + b * cs;
         }

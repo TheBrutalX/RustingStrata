@@ -230,12 +230,24 @@ uvec2 ldkv4(U16 c, uint off, uint hd, uint mode) {
     return uvec2(packFloat2x16(a), packFloat2x16(z));
 }
 
-// sin and cos of theta = pos * ts^i (ts = base^(-2 / n_rot) from the host) in f64, as the CPU and CUDA take them
-// (GLSL has no f64 pow, sin or cos).
-void rope_cs(double pos, double ts, uint i, out float sn, out float cs) {
+// theta = pos * ts^i (ts = base^(-2 / n_rot) from the host) in f64, with the YaRN/linear correction. yarn0 packs the
+// f32 freq_scale with ext_factor in its sign bit; yarn1 packs corr[0], corr[1] as two f16 (exact for these small ints).
+double rope_theta(double pos, double ts, uint i, uint yarn0, uint yarn1) {
     double f = 1.0LF, b = ts;
     for (uint e = i; e > 0; e >>= 1, b *= b) if ((e & 1) != 0) f *= b;
-    double theta = pos * f, k = roundEven(theta * 0.63661977236758134LF);  // 2 / pi
+    double extrap = pos * f;
+    float fs = uintBitsToFloat(yarn0 & 0x7fffffffu);
+    double interp = double(fs) * extrap;
+    if ((yarn0 & 0x80000000u) == 0u) return interp;
+    vec2 cd = unpackHalf2x16(yarn1);
+    double lo = double(cd.x), hi = double(cd.y);
+    double y = (double(i) - lo) / max(0.001LF, hi - lo);
+    double mix = 1.0LF - clamp(y, 0.0LF, 1.0LF);
+    return interp * (1.0LF - mix) + extrap * mix;
+}
+// sin and cos of a f64 angle, as the CPU and CUDA take them (GLSL has no f64 sin or cos).
+void sincos_d(double theta, out float sn, out float cs) {
+    double k = roundEven(theta * 0.63661977236758134LF);  // 2 / pi
     double y = fma(-k, 1.5707963267948966LF, theta);
     y = fma(-k, 6.123233995736766e-17LF, y);
     double y2 = y * y;
@@ -244,6 +256,12 @@ void rope_cs(double pos, double ts, uint i, out float sn, out float cs) {
     s *= y;
     int q = int(k) & 3;
     sn = float(q == 0 ? s : q == 1 ? c : q == 2 ? -s : -c); cs = float(q == 0 ? c : q == 1 ? -s : q == 2 ? -c : s);
+}
+void rope_cs(double pos, double ts, uint i, out float sn, out float cs) {
+    sincos_d(rope_theta(pos, ts, i, 0x3f800000u, 0u), sn, cs);
+}
+void rope_cs_yarn(double pos, double ts, uint i, uint yarn0, uint yarn1, out float sn, out float cs) {
+    sincos_d(rope_theta(pos, ts, i, yarn0, yarn1), sn, cs);
 }
 
 // Quantize x[0, n) (times sc * w[i] when w is not null, or silu(x) * u when u is not null) to int8 at q (as words, from word qo) with per-32 scales at
