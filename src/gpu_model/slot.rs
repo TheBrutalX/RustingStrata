@@ -25,6 +25,34 @@ const CHUNK: usize = 64 << 20;
 /// Depth of the async save ring (4 × 64 MB of staged bytes, see `docs/SLOT-ARCHIVE-PHASE2.md` §5.3).
 const RING: usize = 4;
 
+/// One bounded GPU↔host copy: part index, buffer, byte offset, byte length. `len` is at most [`CHUNK`].
+type CopyPlan = (usize, Buf, usize, usize);
+
+/// Split `len` bytes of `buf` into at most-[`CHUNK`] copy steps, attributed to `part` and starting at `offset`.
+///
+/// This is the unit the resumable `_with` variants yield on: after every entry of the resulting plan the callback
+/// runs, so the longest stretch without a scheduler turn is one 64 MiB copy (plus the caller's own framing).
+fn push_copy_chunks(plan: &mut Vec<CopyPlan>, part: usize, buf: &Buf, offset: usize, len: usize) {
+    let mut done = 0;
+    while done < len {
+        let n = (len - done).min(CHUNK);
+        plan.push((part, Buf::clone(buf), offset + done, n));
+        done += n;
+    }
+}
+
+/// The no-op interleaving point used by the existing public API: `save_slot_to`, `restore_slot_from` and the
+/// segmented variants keep their old behaviour by passing this for `between`.
+fn no_yield(_: &mut GpuModel<'_>) -> Result<()> { Ok(()) }
+
+/// The framing and bounded copies of one model part in a `STRATASLOT` stream.
+struct SlotPartPlan {
+    saved_frame: Vec<u8>,
+    saved: Vec<CopyPlan>,
+    kv_frame: Vec<u8>,
+    kv: Vec<CopyPlan>,
+}
+
 /// Magic of a segmented K/V payload (`STRKVSEG`), see [`GpuModel::save_kv_segment`].
 const KV_SEGMENT_MAGIC: [u8; 8] = *b"STRKVSEG";
 /// Magic of a segmented recurrent/DeltaNet/MTP/PLE/QSA payload (`STRRSEG`), see
@@ -572,14 +600,41 @@ impl GpuModel<'_> {
     /// commit may set them (the file path after the rename, the async path once every byte is captured).
     /// `save_state` itself clears `saved_ids`, as in the synchronous save.
     pub fn save_slot_to<W: Write>(&mut self, slot: usize, out: &mut W) -> Result<u64> {
+        self.save_slot_to_with(slot, out, &mut no_yield)
+    }
+
+    /// Resumable [`Self::save_slot_to`]: `between(self)` runs after every 64 MiB GPU→host chunk, so a scheduler can
+    /// service other slots between copies. The callback must not change `slot`'s state (buffers, history or saved
+    /// marker); the caller marks the target active/saving for the duration so no request can use it. The target slot
+    /// is selected again before each copy because the callback may have switched the current slot.
+    pub fn save_slot_to_with<W: Write, F: FnMut(&mut GpuModel<'_>) -> Result<()>>(
+        &mut self,
+        slot: usize,
+        out: &mut W,
+        between: &mut F,
+    ) -> Result<u64> {
         let (tokens, header) = self.slot_snapshot(slot)?;
-        self.write_slot_stream(&tokens, &header, out)
+        self.write_slot_stream_with(slot, &tokens, &header, out, between)
     }
 
     /// Restore a `STRATASLOT` v1 stream from `inp` into `slot`. Same validation, unified-KV growth, install and
     /// error handling (a partially installed slot is cleared) as [`Self::restore_slot_file`], without opening a
     /// path. `allow_evict` is as in `restore_slot_file`.
     pub fn restore_slot_from<R: Read>(&mut self, slot: usize, inp: &mut R, allow_evict: bool) -> Result<u64> {
+        self.restore_slot_from_with(slot, inp, allow_evict, &mut no_yield)
+    }
+
+    /// Resumable [`Self::restore_slot_from`]: `between(self)` runs after every 64 MiB host→GPU chunk. The callback
+    /// must not change `slot`'s state (buffers, history or saved marker); the caller marks the target active/saving
+    /// for the duration so no request can use it. The target slot is selected again before each copy because the
+    /// callback may have switched the current slot.
+    pub fn restore_slot_from_with<R: Read, F: FnMut(&mut GpuModel<'_>) -> Result<()>>(
+        &mut self,
+        slot: usize,
+        inp: &mut R,
+        allow_evict: bool,
+        between: &mut F,
+    ) -> Result<u64> {
         ensure!(slot < self.slots(), "slot {slot} of {}", self.slots());
         let mut inp = Count::new(BufReader::with_capacity(8 << 20, inp));
         let (header, tokens) = slot_file::read_header(&mut inp)?;
@@ -587,40 +642,52 @@ impl GpuModel<'_> {
         ensure!(header.n_tokens as usize == tokens.len(), "slot file token count mismatch");
         ensure!(!tokens.is_empty(), "slot file has no tokens");
         ensure!(tokens.len() <= self.ctx, "slot file has {} tokens, --ctx is {}", tokens.len(), self.ctx);
-        ensure!(header.n_parts as usize == self.parts().count(), "slot file has {} parts, this model has {}", header.n_parts, self.parts().count());
+        let n_parts = self.parts().count();
+        ensure!(header.n_parts as usize == n_parts, "slot file has {} parts, this model has {n_parts}", header.n_parts);
         let n = tokens.len();
         self.prepare_segmented_restore(slot, n, allow_evict)?;
         self.save_state()?;
         let r = (|| -> Result<u64> {
-            let mut q = Some(&mut *self);
-            while let Some(p) = q {
-                let ple0 = slot_file::read_u64(&mut inp)? as i64;
-                let ple1 = slot_file::read_u64(&mut inp)? as i64;
-                let n_slot = slot_file::read_u32(&mut inp)? as usize;
-                let bufs = p.slot();
-                ensure!(n_slot == bufs.len(), "slot file has {n_slot} recurrent buffers, this model has {}", bufs.len());
-                for b in bufs {
-                    let len = slot_file::read_u64(&mut inp)? as usize;
-                    ensure!(len == b.len(), "slot file recurrent buffer {len} bytes, this model has {}", b.len());
-                    read_buf(&*p.gpu, b, len, &mut inp)?;
-                }
-                let n_kv = slot_file::read_u32(&mut inp)? as usize;
-                let kv = p.kv_bufs();
-                ensure!(n_kv == kv.len(), "slot file has {n_kv} KV buffers, this model has {}", kv.len());
-                for (b, rows) in kv {
-                    let row = slot_file::read_u64(&mut inp)? as usize;
-                    ensure!(row == b.len() / rows.max(1), "slot file KV row is {row} bytes, this model has {}", b.len() / rows.max(1));
-                    let bytes = row.checked_mul(n).context("slot file KV size overflow")?;
-                    ensure!(bytes <= b.len(), "slot file KV rows do not fit the slot buffer");
-                    read_buf(&*p.gpu, b, bytes, &mut inp)?;
-                }
+            for part in 0..n_parts {
+                // Frame of this part: PLE pair, the recurrent buffer count/lengths, then the KV count/row sizes.
+                // Everything is validated before a byte is copied into the slot.
+                let (ple0, ple1, saved, kv) = {
+                    self.use_slot(slot);
+                    let p = self.part_mut(part)?;
+                    let ple0 = slot_file::read_u64(&mut inp)? as i64;
+                    let ple1 = slot_file::read_u64(&mut inp)? as i64;
+                    let n_slot = slot_file::read_u32(&mut inp)? as usize;
+                    let bufs = p.slot();
+                    ensure!(n_slot == bufs.len(), "slot file has {n_slot} recurrent buffers, this model has {}", bufs.len());
+                    let mut saved = Vec::new();
+                    for b in bufs {
+                        let len = slot_file::read_u64(&mut inp)? as usize;
+                        ensure!(len == b.len(), "slot file recurrent buffer {len} bytes, this model has {}", b.len());
+                        push_copy_chunks(&mut saved, part, b, 0, len);
+                    }
+                    let n_kv = slot_file::read_u32(&mut inp)? as usize;
+                    let kv_bufs = p.kv_bufs();
+                    ensure!(n_kv == kv_bufs.len(), "slot file has {n_kv} KV buffers, this model has {}", kv_bufs.len());
+                    let mut kv = Vec::new();
+                    for (b, rows) in kv_bufs {
+                        let row = slot_file::read_u64(&mut inp)? as usize;
+                        ensure!(row == b.len() / rows.max(1), "slot file KV row is {row} bytes, this model has {}", b.len() / rows.max(1));
+                        let bytes = row.checked_mul(n).context("slot file KV size overflow")?;
+                        ensure!(bytes <= b.len(), "slot file KV rows do not fit the slot buffer");
+                        push_copy_chunks(&mut kv, part, b, 0, bytes);
+                    }
+                    (ple0, ple1, saved, kv)
+                };
+                self.read_copies(slot, &saved, &mut inp, between)?;
+                self.read_copies(slot, &kv, &mut inp, between)?;
+                self.use_slot(slot);
+                let p = self.part_mut(part)?;
                 p.saved_ple_prev = [ple0, ple1];
                 p.saved_pos = n;
                 p.saved_ids = tokens.clone();
                 p.history = tokens.clone();
                 p.saved_owner = header.owner;
                 p.rope_offset = header.rope_offset;
-                q = p.next.as_deref_mut();
             }
             let payload = inp.count();
             slot_file::read_footer(&mut inp, payload)?;
@@ -774,32 +841,133 @@ impl GpuModel<'_> {
 
     /// The framing and buffer copies of a save: `save_state`, header, every part, footer.
     fn write_slot_stream<W: Write>(&mut self, tokens: &[u32], header: &SlotHeader, out: &mut W) -> Result<u64> {
+        let slot = self.current_slot();
+        self.write_slot_stream_with(slot, tokens, header, out, &mut no_yield)
+    }
+
+    /// [`Self::write_slot_stream`] with resumable copies: `between(self)` runs after every 64 MiB GPU→host chunk.
+    fn write_slot_stream_with<W: Write, F: FnMut(&mut GpuModel<'_>) -> Result<()>>(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        header: &SlotHeader,
+        out: &mut W,
+        between: &mut F,
+    ) -> Result<u64> {
         // Allocate the recurrent copies and make the current recurrent state the saved one.
         self.save_state()?;
-        let mut out = Count::new(out);
-        slot_file::write_header(&mut out, header, tokens)?;
+
+        // Capture the framing and the buffer handles once. The clones keep the target slot's device memory alive
+        // if the callback selects another slot; `use_slot(slot)` at each copy makes the model state target it too.
+        let mut parts = Vec::new();
+        let mut part = 0usize;
         let mut q = Some(&mut *self);
         while let Some(p) = q {
-            for v in p.saved_ple_prev { slot_file::write_u64(&mut out, v as u64)?; }
+            let mut saved_frame = Vec::new();
+            for v in p.saved_ple_prev { slot_file::write_u64(&mut saved_frame, v as u64)?; }
             let slot_bufs = p.slot();
-            slot_file::write_u32(&mut out, slot_bufs.len() as u32)?;
+            slot_file::write_u32(&mut saved_frame, slot_bufs.len() as u32)?;
+            let mut saved = Vec::new();
             for b in slot_bufs {
-                slot_file::write_u64(&mut out, b.len() as u64)?;
-                write_buf(&*p.gpu, b, b.len(), &mut out)?;
+                slot_file::write_u64(&mut saved_frame, b.len() as u64)?;
+                push_copy_chunks(&mut saved, part, b, 0, b.len());
             }
             let kv = p.kv_bufs();
-            slot_file::write_u32(&mut out, kv.len() as u32)?;
+            let mut kv_frame = Vec::new();
+            slot_file::write_u32(&mut kv_frame, kv.len() as u32)?;
+            let mut kv_plan = Vec::new();
             for (b, rows) in kv {
                 let row = b.len() / rows.max(1);
-                slot_file::write_u64(&mut out, row as u64)?;
-                write_buf(&*p.gpu, b, row * tokens.len(), &mut out)?;
+                slot_file::write_u64(&mut kv_frame, row as u64)?;
+                let bytes = row.checked_mul(tokens.len()).context("slot file KV size overflow")?;
+                push_copy_chunks(&mut kv_plan, part, b, 0, bytes);
             }
+            parts.push(SlotPartPlan { saved_frame, saved, kv_frame, kv: kv_plan });
+            part += 1;
             q = p.next.as_deref_mut();
+        }
+
+        let mut out = Count::new(out);
+        slot_file::write_header(&mut out, header, tokens)?;
+        for pp in &parts {
+            out.write_all(&pp.saved_frame)?;
+            self.write_copies(slot, &pp.saved, &mut out, between)?;
+            out.write_all(&pp.kv_frame)?;
+            self.write_copies(slot, &pp.kv, &mut out, between)?;
         }
         let payload = out.count();
         slot_file::write_footer(&mut out, payload)?;
         out.flush()?;
         Ok(out.count())
+    }
+
+    /// Copy the bytes of a save plan to `out`, calling `between(self)` after each bounded chunk. The target slot is
+    /// selected again before every copy because the callback may have left a different slot current.
+    fn write_copies<W: Write, F: FnMut(&mut GpuModel<'_>) -> Result<()>>(
+        &mut self,
+        slot: usize,
+        plan: &[CopyPlan],
+        out: &mut W,
+        between: &mut F,
+    ) -> Result<()> {
+        for (part, b, offset, len) in plan {
+            self.use_slot(slot);
+            let v = {
+                let g = self.part_ref(*part)?;
+                g.get::<u8>(b, *offset, *len)?
+            };
+            out.write_all(&v)?;
+            if let Err(e) = between(self) {
+                self.use_slot(slot);
+                return Err(e);
+            }
+        }
+        self.use_slot(slot);
+        Ok(())
+    }
+
+    /// Read a restore plan from `inp` into the target slot, calling `between(self)` after each bounded chunk. The
+    /// target slot is selected again before every copy because the callback may have left a different slot current.
+    fn read_copies<R: Read, F: FnMut(&mut GpuModel<'_>) -> Result<()>>(
+        &mut self,
+        slot: usize,
+        plan: &[CopyPlan],
+        inp: &mut R,
+        between: &mut F,
+    ) -> Result<()> {
+        for (part, b, offset, len) in plan {
+            self.use_slot(slot);
+            let mut v = vec![0u8; *len];
+            inp.read_exact(&mut v)?;
+            {
+                let g = self.part_ref(*part)?;
+                g.put(&v, b, *offset)?;
+            }
+            if let Err(e) = between(self) {
+                self.use_slot(slot);
+                return Err(e);
+            }
+        }
+        self.use_slot(slot);
+        Ok(())
+    }
+
+    /// The backend of model part `index` (0 is `self`, then the `next` chain).
+    fn part_ref(&self, index: usize) -> Result<&dyn crate::backend::Backend> {
+        let mut p = self;
+        for _ in 0..index {
+            p = p.next.as_deref().with_context(|| format!("model part {index} is missing"))?;
+        }
+        Ok(p.gpu.as_ref())
+    }
+
+    /// Model part `index` (0 is `self`, then the `next` chain).
+    fn part_mut(&mut self, index: usize) -> Result<&mut Self> {
+        let mut p = self;
+        for _ in 0..index {
+            p = p.next.as_deref_mut().with_context(|| format!("model part {index} is missing"))?;
+        }
+        Ok(p)
     }
 
     /// Save the K/V rows of the token range `[start, end)` of `slot` as an opaque `STRKVSEG` v1 payload and return
@@ -815,6 +983,20 @@ impl GpuModel<'_> {
         end: usize,
         out: &mut W,
     ) -> Result<u64> {
+        self.save_kv_segment_with(slot, start, end, out, &mut no_yield)
+    }
+
+    /// Resumable [`Self::save_kv_segment`]: `between(self)` runs after each at-most-64-MiB GPU→host chunk of the
+    /// segment (at least once for a non-empty segment). The callback must not change `slot`'s KV rows; the caller
+    /// marks the target active/saving for the duration. The target slot is selected again before each copy.
+    pub fn save_kv_segment_with<W: Write, F: FnMut(&mut GpuModel<'_>) -> Result<()>>(
+        &mut self,
+        slot: usize,
+        start: usize,
+        end: usize,
+        out: &mut W,
+        between: &mut F,
+    ) -> Result<u64> {
         ensure!(slot < self.slots(), "slot {slot} of {}", self.slots());
         ensure!(
             start < end,
@@ -823,7 +1005,7 @@ impl GpuModel<'_> {
         let prev = self.current_slot();
         self.use_slot(slot);
         let guard = SlotGuard { model: self, prev };
-        guard.model.write_kv_segment(slot, start, end, out)
+        guard.model.write_kv_segment_with(slot, start, end, out, between)
     }
 
     /// Restore a `STRKVSEG` v1 payload into the K/V rows of `[start, end)` of `slot` and return the bytes consumed.
@@ -838,6 +1020,20 @@ impl GpuModel<'_> {
         end: usize,
         inp: &mut R,
     ) -> Result<u64> {
+        self.restore_kv_segment_with(slot, start, end, inp, &mut no_yield)
+    }
+
+    /// Resumable [`Self::restore_kv_segment`]: `between(self)` runs after each at-most-64-MiB host→GPU chunk of the
+    /// segment (at least once for a non-empty segment). The callback must not change `slot`'s KV rows; the caller
+    /// marks the target active/saving for the duration. The target slot is selected again before each copy.
+    pub fn restore_kv_segment_with<R: Read, F: FnMut(&mut GpuModel<'_>) -> Result<()>>(
+        &mut self,
+        slot: usize,
+        start: usize,
+        end: usize,
+        inp: &mut R,
+        between: &mut F,
+    ) -> Result<u64> {
         ensure!(slot < self.slots(), "slot {slot} of {}", self.slots());
         ensure!(
             start < end,
@@ -846,19 +1042,22 @@ impl GpuModel<'_> {
         let prev = self.current_slot();
         self.use_slot(slot);
         let guard = SlotGuard { model: self, prev };
-        guard.model.read_kv_segment(slot, start, end, inp)
+        guard.model.read_kv_segment_with(slot, start, end, inp, between)
     }
 
-    fn write_kv_segment<W: Write>(
+    fn write_kv_segment_with<W: Write, F: FnMut(&mut GpuModel<'_>) -> Result<()>>(
         &mut self,
         slot: usize,
         start: usize,
         end: usize,
         out: &mut W,
+        between: &mut F,
     ) -> Result<u64> {
         // Capture and validate one row size per buffer first, so a state that cannot be addressed fails before the
-        // header is written.
+        // header is written. The same pass records the bounded copies the callback can yield between.
         let mut parts: Vec<Vec<u64>> = Vec::new();
+        let mut plan: Vec<CopyPlan> = Vec::new();
+        let mut part = 0usize;
         let mut q = Some(&mut *self);
         while let Some(p) = q {
             let kv = p.kv_bufs();
@@ -875,29 +1074,22 @@ impl GpuModel<'_> {
                     end <= n_rows,
                     "KV segment ends at {end}, but slot {slot} has {n_rows} rows"
                 );
-                row.checked_mul(end)
-                    .context("KV segment offset overflow")?;
+                let offset = row.checked_mul(start).context("KV segment offset overflow")?;
+                let bytes = row
+                    .checked_mul(end - start)
+                    .context("KV segment size overflow")?;
+                push_copy_chunks(&mut plan, part, b, offset, bytes);
                 rows.push(row as u64);
             }
             parts.push(rows);
+            part += 1;
             q = p.next.as_deref_mut();
         }
 
         let mut out = Count::new(out);
         let payload_len = write_kv_segment_header(&mut out, start as u64, end as u64, &parts)?;
-        let rows = end - start;
-        let mut written = 0u64;
-        let mut q = Some(&mut *self);
-        while let Some(p) = q {
-            for &(b, n_rows) in &p.kv_bufs() {
-                let row = b.len() / n_rows;
-                let offset = row.checked_mul(start).context("KV segment offset overflow")?;
-                let bytes = row.checked_mul(rows).context("KV segment size overflow")?;
-                write_buf_range(&*p.gpu, b, offset, bytes, &mut out)?;
-                written += bytes as u64;
-            }
-            q = p.next.as_deref_mut();
-        }
+        self.write_copies(slot, &plan, &mut out, between)?;
+        let written: u64 = plan.iter().map(|&(_, _, _, len)| len as u64).sum();
         ensure!(
             written == payload_len,
             "KV segment wrote {written} payload bytes, the header describes {payload_len}"
@@ -906,12 +1098,13 @@ impl GpuModel<'_> {
         Ok(out.count())
     }
 
-    fn read_kv_segment<R: Read>(
+    fn read_kv_segment_with<R: Read, F: FnMut(&mut GpuModel<'_>) -> Result<()>>(
         &mut self,
         slot: usize,
         start: usize,
         end: usize,
         inp: &mut R,
+        between: &mut F,
     ) -> Result<u64> {
         let mut inp = Count::new(inp);
         let header = read_kv_segment_header(&mut inp)?;
@@ -928,8 +1121,10 @@ impl GpuModel<'_> {
             header.parts.len()
         );
 
-        // Validation pass: compare every descriptor with the model before touching the slot.
+        // Validation pass: compare every descriptor with the model before touching the slot. The same pass records
+        // the bounded host→GPU copies the callback can yield between.
         let rows = end - start;
+        let mut plan: Vec<CopyPlan> = Vec::new();
         let mut part_index = 0;
         let mut q = Some(&mut *self);
         while let Some(p) = q {
@@ -970,6 +1165,7 @@ impl GpuModel<'_> {
                     offset.checked_add(bytes).is_some_and(|n| n <= b.len()),
                     "KV segment part {part_index} buffer {buffer_index} does not fit its slot buffer"
                 );
+                push_copy_chunks(&mut plan, part_index, b, offset, bytes);
             }
             part_index += 1;
             q = p.next.as_deref_mut();
@@ -977,18 +1173,7 @@ impl GpuModel<'_> {
 
         // Install pass: the header and the layout are known good.
         let header_bytes = inp.count();
-        let mut q = Some(&mut *self);
-        while let Some(p) = q {
-            for &(b, n_rows) in &p.kv_bufs() {
-                let row = b.len() / n_rows;
-                let offset = row
-                    .checked_mul(start)
-                    .context("KV segment offset overflow")?;
-                let bytes = row.checked_mul(rows).context("KV segment size overflow")?;
-                read_buf_range(&*p.gpu, b, offset, bytes, &mut inp)?;
-            }
-            q = p.next.as_deref_mut();
-        }
+        self.read_copies(slot, &plan, &mut inp, between)?;
         let payload_read = inp.count() - header_bytes;
         ensure!(
             payload_read == header.payload_len,
@@ -1005,11 +1190,24 @@ impl GpuModel<'_> {
     /// leaves `pos`/`history` and the caller's current slot alone. `saved_owner` is not part of the payload: the
     /// archive entry stores it and passes it to [`Self::finish_segmented_restore`].
     pub fn save_recurrent_to<W: Write>(&mut self, slot: usize, out: &mut W) -> Result<u64> {
+        self.save_recurrent_to_with(slot, out, &mut no_yield)
+    }
+
+    /// Resumable [`Self::save_recurrent_to`]: `between(self)` runs after each at-most-64-MiB GPU→host chunk of the
+    /// snapshot (at least once when the snapshot has buffers). The callback must not change `slot`'s saved buffers;
+    /// the caller marks the target active/saving for the duration. The target slot is selected again before each
+    /// copy.
+    pub fn save_recurrent_to_with<W: Write, F: FnMut(&mut GpuModel<'_>) -> Result<()>>(
+        &mut self,
+        slot: usize,
+        out: &mut W,
+        between: &mut F,
+    ) -> Result<u64> {
         ensure!(slot < self.slots(), "slot {slot} of {}", self.slots());
         let prev = self.current_slot();
         self.use_slot(slot);
         let guard = SlotGuard { model: self, prev };
-        guard.model.write_recurrent_segment(slot, out)
+        guard.model.write_recurrent_segment_with(slot, out, between)
     }
 
     /// Restore a `STRRSEG` v1 payload into `slot`'s saved buffers and return the bytes consumed.
@@ -1018,20 +1216,45 @@ impl GpuModel<'_> {
     /// `saved_owner` are left for [`Self::finish_segmented_restore`], after every KV segment has also been installed.
     /// A corrupt header/count/length is rejected before any buffer is changed.
     pub fn restore_recurrent_from<R: Read>(&mut self, slot: usize, inp: &mut R) -> Result<u64> {
+        self.restore_recurrent_from_with(slot, inp, &mut no_yield)
+    }
+
+    /// Resumable [`Self::restore_recurrent_from`]: `between(self)` runs after each at-most-64-MiB host→GPU chunk of
+    /// the snapshot (at least once when the snapshot has buffers). The callback must not change `slot`'s saved
+    /// buffers; the caller marks the target active/saving for the duration. The target slot is selected again before
+    /// each copy.
+    pub fn restore_recurrent_from_with<R: Read, F: FnMut(&mut GpuModel<'_>) -> Result<()>>(
+        &mut self,
+        slot: usize,
+        inp: &mut R,
+        between: &mut F,
+    ) -> Result<u64> {
         ensure!(slot < self.slots(), "slot {slot} of {}", self.slots());
         let prev = self.current_slot();
         self.use_slot(slot);
         let guard = SlotGuard { model: self, prev };
-        guard.model.read_recurrent_segment(slot, inp)
+        guard.model.read_recurrent_segment_with(slot, inp, between)
     }
 
-    fn write_recurrent_segment<W: Write>(&mut self, _slot: usize, out: &mut W) -> Result<u64> {
+    fn write_recurrent_segment_with<W: Write, F: FnMut(&mut GpuModel<'_>) -> Result<()>>(
+        &mut self,
+        slot: usize,
+        out: &mut W,
+        between: &mut F,
+    ) -> Result<u64> {
         // The payload is the `saved` snapshot, not the live state.
         self.save_state()?;
         let mut parts: Vec<Vec<u64>> = Vec::new();
+        let mut plan: Vec<CopyPlan> = Vec::new();
+        let mut part = 0usize;
         let mut q = Some(&mut *self);
         while let Some(p) = q {
-            parts.push(p.slot().iter().map(|b| b.len() as u64).collect());
+            let bufs = p.slot();
+            parts.push(bufs.iter().map(|b| b.len() as u64).collect());
+            for b in bufs {
+                push_copy_chunks(&mut plan, part, b, 0, b.len());
+            }
+            part += 1;
             q = p.next.as_deref_mut();
         }
         let header = RecurrentSegmentHeader {
@@ -1044,18 +1267,17 @@ impl GpuModel<'_> {
         };
         let mut out = Count::new(out);
         write_recurrent_segment_header(&mut out, &header)?;
-        let mut q = Some(&mut *self);
-        while let Some(p) = q {
-            for b in p.slot() {
-                write_buf(&*p.gpu, b, b.len(), &mut out)?;
-            }
-            q = p.next.as_deref_mut();
-        }
+        self.write_copies(slot, &plan, &mut out, between)?;
         out.flush()?;
         Ok(out.count())
     }
 
-    fn read_recurrent_segment<R: Read>(&mut self, _slot: usize, inp: &mut R) -> Result<u64> {
+    fn read_recurrent_segment_with<R: Read, F: FnMut(&mut GpuModel<'_>) -> Result<()>>(
+        &mut self,
+        slot: usize,
+        inp: &mut R,
+        between: &mut F,
+    ) -> Result<u64> {
         let mut inp = Count::new(inp);
         let header = read_recurrent_segment_header(&mut inp)?;
         let n_parts = self.parts().count();
@@ -1068,7 +1290,8 @@ impl GpuModel<'_> {
         // would, without overwriting the target's saved position/history/owner.
         self.ensure_saved_buffers()?;
 
-        // Validate every count and length before the first copy.
+        // Validate every count and length before the first copy, and record the bounded copies.
+        let mut plan: Vec<CopyPlan> = Vec::new();
         let mut part_index = 0;
         let mut q = Some(&mut *self);
         while let Some(p) = q {
@@ -1087,18 +1310,16 @@ impl GpuModel<'_> {
                     described[buffer_index],
                     b.len()
                 );
+                push_copy_chunks(&mut plan, part_index, b, 0, b.len());
             }
             part_index += 1;
             q = p.next.as_deref_mut();
         }
 
-        let mut q = Some(&mut *self);
-        while let Some(p) = q {
-            for b in p.slot() {
-                read_buf(&*p.gpu, b, b.len(), &mut inp)?;
-            }
-            p.saved_ple_prev = header.ple_prev;
-            q = p.next.as_deref_mut();
+        self.read_copies(slot, &plan, &mut inp, between)?;
+        for part_index in 0..n_parts {
+            self.use_slot(slot);
+            self.part_mut(part_index)?.saved_ple_prev = header.ple_prev;
         }
         Ok(inp.count())
     }
@@ -1325,51 +1546,6 @@ fn create_tmp(path: &Path) -> Result<(PathBuf, File)> {
         Err(e) => return Err(e).with_context(|| format!("creating {}", tmp.display())),
     };
     Ok((tmp, f))
-}
-
-fn write_buf(g: &dyn crate::backend::Backend, b: &Buf, bytes: usize, out: &mut impl Write) -> Result<()> {
-    write_buf_range(g, b, 0, bytes, out)
-}
-
-/// Write `bytes` starting at `offset` of `b`, in bounded chunks.
-fn write_buf_range(
-    g: &dyn crate::backend::Backend,
-    b: &Buf,
-    offset: usize,
-    bytes: usize,
-    out: &mut impl Write,
-) -> Result<()> {
-    let mut done = 0;
-    while done < bytes {
-        let n = (bytes - done).min(CHUNK);
-        let v = g.get::<u8>(b, offset + done, n)?;
-        out.write_all(&v)?;
-        done += n;
-    }
-    Ok(())
-}
-
-fn read_buf(g: &dyn crate::backend::Backend, b: &Buf, bytes: usize, inp: &mut impl Read) -> Result<()> {
-    read_buf_range(g, b, 0, bytes, inp)
-}
-
-/// Read `bytes` into `b` starting at `offset`, in bounded chunks.
-fn read_buf_range(
-    g: &dyn crate::backend::Backend,
-    b: &Buf,
-    offset: usize,
-    bytes: usize,
-    inp: &mut impl Read,
-) -> Result<()> {
-    let mut done = 0;
-    let mut v = vec![0u8; CHUNK.min(bytes)];
-    while done < bytes {
-        let n = (bytes - done).min(v.len());
-        inp.read_exact(&mut v[..n])?;
-        g.put(&v[..n], b, offset + done)?;
-        done += n;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1682,5 +1858,25 @@ mod tests {
         let mut bad = good.clone();
         bad.truncate(bad.len() - 1);
         assert!(read_recurrent_segment_header(&mut &bad[..]).is_err());
+    }
+
+    /// A buffer larger than one `CHUNK` becomes one copy per chunk, which is one `between` call per entry: the
+    /// resumable variants cannot spend more than 64 MiB in a single uninterruptible copy.
+    #[test]
+    fn copy_plan_splits_a_multi_chunk_stream() {
+        let len = 2 * CHUNK + 17;
+        let buf = Buf::new(0, len, ());
+        let mut plan = Vec::new();
+        push_copy_chunks(&mut plan, 2, &buf, 3, len);
+
+        assert_eq!(plan.len(), 3, "a {len}-byte copy is not split into one entry per chunk");
+        assert!(plan.iter().all(|&(part, _, _, n)| part == 2 && n > 0 && n <= CHUNK));
+        assert_eq!(plan.iter().map(|entry| entry.3).sum::<usize>(), len);
+        assert_eq!(plan.iter().map(|entry| entry.2).collect::<Vec<_>>(), vec![3, 3 + CHUNK, 3 + 2 * CHUNK]);
+
+        // An empty copy (a part with no buffers) yields no callback and no bytes.
+        let mut empty = Vec::new();
+        push_copy_chunks(&mut empty, 0, &buf, 0, 0);
+        assert!(empty.is_empty());
     }
 }
