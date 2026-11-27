@@ -57,6 +57,11 @@ What changes with `--parallel N`:
   slot. The reclaim drops that slot's VRAM prefix cache and saved state. It is one GPU only, and the budget is
   reserved at load: a 1M q8 budget is 10.9 GB of KV with every expert resident on a 32 GB card. Unified mode
   prefills prompts one at a time and does not reuse a saved prompt prefix (each request starts at position 0).
+
+On the V100 32 GB, `--parallel 4 --ctx 1048576 --kv-unified --kv q8` reserved 10,880 MB of KV with all 10,240
+experts resident. Four 31k-token prompts completed 4/4 on those 256k slots. An 801,742-token prompt allocated an
+801,792-token slot, prefilled at 368.6 tok/s and generated 4 tokens at 25.3 tok/s in 36m22s; the cap can reach
+1,048,573 (one token per idle slot is reserved).
   | `--ctx` | `--kv` | KV for 4 slots | Resident experts | Total |
   |---|---|---|---|---|
   | 16384 | f16 | 1280 MB | 6876 of 10240 | 160 tok/s |
