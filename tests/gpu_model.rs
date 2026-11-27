@@ -1160,3 +1160,67 @@ fn slot_save_as_records_explicit_owner() {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+/// The streaming/async I/O is byte- and logit-identical to the synchronous file path: `save_slot_to` reproduces the
+/// file bytes, `restore_slot_from` a `Cursor` behaves like the file restore, the background writer produces the same
+/// file, and the background reader restores the same next-token logits. (GPU integration test; not run by the
+/// CPU-only pass.)
+#[test]
+fn slot_async_io_matches_sync() {
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let ids = tok.encode("The quick brown fox jumps over the lazy dog. The capital of France is").unwrap();
+    for (bk, gpu) in common::backends() {
+        eprintln!("backend {bk}");
+        let mut gm = GpuModel::load(&m, gpu, 1024, 64, 512 << 20, 0).unwrap();
+        gm.adapt_every = 0;
+        gm.prefill(&ids).unwrap();
+        gm.step(42).unwrap();
+        let mut want = ids.clone();
+        want.push(42);
+        let base = std::env::temp_dir().join(format!("strata-slot-async-{}-{bk}", std::process::id()));
+        let file = base.with_extension("bin");
+        let afile = base.with_extension("async.bin");
+
+        let n_file = gm.save_slot_file(0, &file).unwrap();
+        let sync_bytes = std::fs::read(&file).unwrap();
+        assert_eq!(sync_bytes.len() as u64, n_file, "{bk}: sync file size");
+
+        let mut stream = Vec::new();
+        let n_stream = gm.save_slot_to(0, &mut stream).unwrap();
+        assert_eq!(n_stream, n_file, "{bk}: streamed size");
+        assert_eq!(stream, sync_bytes, "{bk}: streamed bytes differ from the file");
+
+        let pending = gm.save_slot_file_async(0, &afile).unwrap();
+        // Decode/compute on the model thread while the writer still owns the disk work.
+        let first = gm.step(43).unwrap();
+        let n_async = pending.join().unwrap();
+        assert_eq!(n_async, n_file, "{bk}: async size");
+        assert_eq!(std::fs::read(&afile).unwrap(), sync_bytes, "{bk}: async file bytes differ");
+
+        gm.reset().unwrap();
+        let mut cur = std::io::Cursor::new(stream);
+        let n_cur = gm.restore_slot_from(0, &mut cur, false).unwrap();
+        assert_eq!(gm.slot_tokens(0), &want[..], "{bk}: cursor restore history");
+        let from_cur = gm.step(43).unwrap();
+
+        gm.reset().unwrap();
+        let n_async_restore = gm.restore_slot_file_async(0, &afile, false).unwrap();
+        assert_eq!(gm.slot_tokens(0), &want[..], "{bk}: async restore history");
+        let from_async = gm.step(43).unwrap();
+        assert_eq!(n_cur, n_async_restore, "{bk}: restore byte counts");
+
+        for (what, other) in [("cursor", &from_cur), ("async", &from_async)] {
+            let diff = first.iter().zip(other).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+            eprintln!("{bk}: {what} restore max |dlogit| {diff:.3e}");
+            assert_eq!(ops::argmax(&first), ops::argmax(other), "{bk}: {what} restore argmax");
+            assert!(diff <= 1e-4, "{bk}: {what} restore logits differ by {diff}");
+        }
+
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(&afile);
+    }
+}
