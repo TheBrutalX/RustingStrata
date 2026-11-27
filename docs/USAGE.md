@@ -80,6 +80,13 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 
 - `--backend NAME` GPU backend: `cuda`, `vulkan` or `hip` (AMD cards through ROCm, one device per run, see [HIP.md](HIP.md)). Without it CUDA is used when it loads, else Vulkan.
 - `--ctx` KV cache size in tokens (default 4096). For Inkling 2, Hy4, GLM, DeepSeek, Kolibri and Gemma 4 it is the prompt plus reply limit instead, and the default is the context the model was trained on; their caches grow with the text.
+- `--rope-scaling none|linear|yarn` changes the RoPE plan, not only the KV size. `yarn` and `linear` need
+  `--rope-scale FACTOR` (2 doubles the context); `yarn` also needs `--yarn-orig-ctx N` (the context the model was
+  trained on) and takes `--yarn-beta-fast`/`--yarn-beta-slow` (32/1, llama.cpp's defaults). A file that carries
+  `{arch}.rope.scaling.*` metadata uses it when no flag is given. On a 262,144-token model,
+  `--ctx 524288 --rope-scaling yarn --rope-scale 2 --yarn-orig-ctx 262144` gives 512k: the KV is 5.4 GB at
+  `--kv q8` (10.2 GB f16), so a 32 GB card holds one f16 slot or two q8 slots with every expert resident. CUDA and
+  Vulkan are supported; HIP has the same kernels but was not run on AMD hardware.
 - `--mtp [N]` speculative decoding with the model's draft head. Greedy tokens stay the same; sampling keeps its
   distribution. Needs a GGUF with an MTP head (for example the Qwen3.6-35B-A3B MTP files).
   Qwen3.8-Flash-Next (`qwen4exp`) takes its head from a companion file: `--mtp-model mtp-...-shared-Q8_0.gguf`.

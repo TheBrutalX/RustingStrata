@@ -5,6 +5,17 @@
 
 use crate::backend::{BATCHED, ATT_SPLITS, ATT_SPLITS_1, Backend, Buf, GpuTensor, SAME_X};
 use crate::quant::GgmlType;
+use crate::rope::RopeParams;
+
+/// Pack the plan into the two u32 push constants that `rope_theta` reads: `freq_scale` as f32 with `ext_factor` in
+/// the sign bit, and `corr[0]`/`corr[1]` as two f16 (exact for these small integers).
+fn rope_push(rope: &RopeParams) -> (u32, u32) {
+    let mut y0 = rope.freq_scale.to_bits();
+    if rope.ext_factor != 0.0 { y0 |= 0x8000_0000; }
+    let y1 = half::f16::from_f32(rope.corr[0]).to_bits() as u32
+        | ((half::f16::from_f32(rope.corr[1]).to_bits() as u32) << 16);
+    (y0, y1)
+}
 use anyhow::{Context, anyhow, ensure};
 use ash::vk;
 use std::collections::{BTreeMap, HashMap};
@@ -906,13 +917,14 @@ impl Vk {
         self.run("attn_merge", &[], [nh, 1, nt], &[&part, &qg, &out, &step, &(hd as u32), &(splits as u32), &(ATT_SPLITS_1 as u32), &gq_min, &xq, &sink])
     }
     /// rms_norm with rope and (kc, or kvt with v) the K/V store; see rms_norm.comp.
-    fn rope_rows(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64, kvt: u64) -> anyhow::Result<()> {
+    fn rope_rows(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, rope: &RopeParams, v: u64, kc: u64, vc: u64, kvt: u64) -> anyhow::Result<()> {
         if kc != 0 || (kvt != 0 && v != 0) {
             let turbo = self.0.kv_k_mode >= 4 || self.0.kv_v_mode >= 4;
             ensure!(!turbo || n % 128 == 0, "turbo KV cache: head_dim {n} is not a multiple of 128");
         }
-        let ts = (base as f64).powf(-2.0 / n_rot as f64);
-        self.run("rms_norm", &[self.0.llama], [rows, 1, 1], &[&x, &w, &out, &0u64, &(x_stride as u32), &(n as u32), &(n as u32), &eps, &step, &ts, &(per as u32), &(n_rot as u32), &0u64, &v, &kc, &vc, &kvt])
+        let ts = (rope.base as f64).powf(-2.0 / n_rot as f64);
+        let (y0, y1) = rope_push(rope);
+        self.run("rms_norm", &[self.0.llama], [rows, 1, 1], &[&x, &w, &out, &0u64, &(x_stride as u32), &(n as u32), &(n as u32), &eps, &step, &ts, &(per as u32), &(n_rot as u32), &0u64, &v, &kc, &vc, &kvt, &y0, &y1])
     }
     /// Record kernel `name` over `groups` workgroups with push constants `args`.
     fn run(&self, name: &'static str, spec: &[u32], groups: [usize; 3], args: &[&dyn Arg]) -> anyhow::Result<()> {
@@ -1390,19 +1402,19 @@ impl Backend for Vk {
         self.rms_norm_q(x, x_stride, w, out, out_stride, n, rows, eps, 0, 0)
     }
     fn rms_norm_q(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32, xq: u64, res: u64) -> anyhow::Result<()> {
-        self.run("rms_norm", &[self.0.llama], [rows, 1, 1], &[&x, &w, &out, &xq, &(x_stride as u32), &(out_stride as u32), &(n as u32), &eps, &0u64, &0f64, &0u32, &0u32, &res, &0u64, &0u64, &0u64, &0u64])
+        self.run("rms_norm", &[self.0.llama], [rows, 1, 1], &[&x, &w, &out, &xq, &(x_stride as u32), &(out_stride as u32), &(n as u32), &eps, &0u64, &0f64, &0u32, &0u32, &res, &0u64, &0u64, &0u64, &0u64, &0u32, &0u32])
     }
-    fn rms_norm_rope(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
-        self.rms_norm_rope_kv(x, x_stride, w, out, n, rows, eps, per, n_rot, step, base, 0, 0, 0)
+    fn rms_norm_rope(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, rope: &RopeParams) -> anyhow::Result<()> {
+        self.rms_norm_rope_kv(x, x_stride, w, out, n, rows, eps, per, n_rot, step, rope, 0, 0, 0)
     }
-    fn rms_norm_rope_kv(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
-        self.rope_rows(x, x_stride, w, out, n, rows, eps, per, n_rot, step, base, v, kc, vc, 0)
+    fn rms_norm_rope_kv(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, rope: &RopeParams, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
+        self.rope_rows(x, x_stride, w, out, n, rows, eps, per, n_rot, step, rope, v, kc, vc, 0)
     }
     fn kv_rows(&self) -> bool { self.0.llama == 0 }  // attn_decode_llama has no kvt
     fn rms_norm_rope_qk_rows(&self, q: u64, q_stride: usize, qw: u64, qo: u64, nh: usize, k: u64, kw: u64, ko: u64, nkv: usize, hd: usize, eps: f32, n_rot: usize,
-                             step: u64, base: f32, v: u64, kvt: u64, nt: usize) -> anyhow::Result<()> {
-        self.rope_rows(q, q_stride, qw, qo, hd, nt * nh, eps, nh, n_rot, step, base, 0, 0, 0, kvt)?;
-        self.rope_rows(k, hd, kw, ko, hd, nt * nkv, eps, nkv, n_rot, step, base, v, 0, 0, kvt)
+                             step: u64, rope: &RopeParams, v: u64, kvt: u64, nt: usize) -> anyhow::Result<()> {
+        self.rope_rows(q, q_stride, qw, qo, hd, nt * nh, eps, nh, n_rot, step, rope, 0, 0, 0, kvt)?;
+        self.rope_rows(k, hd, kw, ko, hd, nt * nkv, eps, nkv, n_rot, step, rope, v, 0, 0, kvt)
     }
     fn attn_rows(&self, q: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, nt: usize, sink: u64, win: usize, kvt: u64, splits: usize) -> anyhow::Result<()> {
         self.attn(q, 0, 0, qg, out, part, step, nh, nkv, hd, scale, 0, nt, 0, 0, 0, sink, win, kvt, splits)
@@ -1418,9 +1430,10 @@ impl Backend for Vk {
     fn l2_norm(&self, x: u64, n: usize, per: usize, stride: usize, rows: usize, eps: f32) -> anyhow::Result<()> {
         self.run("l2_norm", &[], [rows, 1, 1], &[&x, &(n as u32), &(per as u32), &(stride as u32), &eps])
     }
-    fn rope_pairs(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32, lo: usize, hi: usize) -> anyhow::Result<()> {
-        let ts = (base as f64).powf(-2.0 / n_rot as f64);
-        self.run("rope_neox", &[], [heads / per, 1, 1], &[&x, &step, &ts, &(stride as u32), &(per as u32), &(n_rot as u32), &(lo as u32), &(hi as u32)])
+    fn rope_pairs(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, rope: &RopeParams, lo: usize, hi: usize) -> anyhow::Result<()> {
+        let ts = (rope.base as f64).powf(-2.0 / n_rot as f64);
+        let (y0, y1) = rope_push(rope);
+        self.run("rope_neox", &[], [heads / per, 1, 1], &[&x, &step, &ts, &(stride as u32), &(per as u32), &(n_rot as u32), &(lo as u32), &(hi as u32), &y0, &y1])
     }
     fn add(&self, x: u64, y: u64, n: usize) -> anyhow::Result<()> { self.run("add", &[], [n.div_ceil(256), 1, 1], &[&x, &y, &(n as u32)]) }
     fn swiglu(&self, g: u64, u: u64, n: usize) -> anyhow::Result<()> { self.run("swiglu", &[], [n.div_ceil(256), 1, 1], &[&g, &u, &(n as u32)]) }

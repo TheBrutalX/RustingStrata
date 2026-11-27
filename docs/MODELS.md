@@ -43,6 +43,38 @@ and 32 GB RAM:
 | Qwen3-Next-80B-A3B-Instruct UD-IQ1_S (most experts on the CPU) | IQ1_S to IQ4_NL, Q4_K to Q8_0, BF16 | 92 / 90 tok/s |
 | Qwen3.8-Flash-Next GSQ-RCO IQ2_XS (64 GB in two files, pass the `-00001-of-00002` one; 18% of experts fit in VRAM, and with 32 GB RAM the rest are partly read from disk) | Q2_0, IQ1_M to IQ4_XS, Q6_K, Q8_0, F16, BF16 | 22 / 20 tok/s |
 
+### Long context (YaRN)
+
+The main engine reads `{arch}.rope.scaling.*` from the GGUF and accepts llama.cpp's
+`--rope-scaling yarn --rope-scale N --yarn-orig-ctx N` (plus `--yarn-beta-fast`/`--yarn-beta-slow`). The effective
+frequency of each pair is computed once and the angle stays linear in the position; the net attention scale is 1,
+as in llama.cpp. `--rope-scaling linear` applies the same frequencies without the ramp.
+
+On a V100 32 GB with a 35B-A3B `qwen35moe` file trained at 262,144 tokens, 512k needs:
+
+```sh
+rustingstrata bench --model M.gguf --gpu --ctx 524288 --kv q8 \
+    --rope-scaling yarn --rope-scale 2 --yarn-orig-ctx 262144
+```
+
+The plan is 5,440 MB of KV, 15,150 MB of experts and about 3 GB of weights/scratch, with all 10,240 experts
+resident. One `bench` run on the V100 (`--kv q8`, `--chunk 8192`, no drafts):
+
+| prompt | prefill | decode |
+|---:|---:|---:|
+| 131,072 | 1,432.2 tok/s | 77.6 tok/s |
+| 262,144 | 921.2 tok/s | 56.9 tok/s |
+| 524,224 | 534.3 tok/s | 36.8 tok/s |
+
+A free 503,040-token prompt prefilled at 552.2 tok/s and generated 16 coherent tokens at 37.4 tok/s; the same
+prompt teacher-forced took 15m16s. Top-1 against llama.cpp b12502 with the same flags: 32/32 at 15,720 tokens,
+32/32 at 125,760, 8/8 at 256,000 and 8/8 at 503,040 (q8 KV for the last two, f16 for the first two). Without
+YaRN the plain path keeps parity too: 32/32 at 125,760 tokens against llama.cpp with no scaling. The YaRN rotation
+matches the CPU reference on CUDA and Vulkan (relative error 2.3e-8, no differing bits in the kernel test).
+
+Vulkan runs the same plan through `rope_cs_yarn`; earlier binaries refuse scaled RoPE there rather than using the
+native frequencies.
+
 ## GGUF types
 
 Supported GGUF types: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_0, TQ1_0, TQ2_0, Q2_K-Q6_K, IQ1_S, IQ1_M,

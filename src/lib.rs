@@ -12,6 +12,7 @@ pub fn ctx_limit(trained: usize) -> usize {
     match CTX.load(std::sync::atomic::Ordering::Relaxed) { 0 => trained, n => n }
 }
 pub mod config;
+pub mod rope;
 pub mod gguf;
 pub mod quant;
 pub mod weights;

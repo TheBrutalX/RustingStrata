@@ -13,6 +13,7 @@
 use crate::backend::{ATT_SPLITS, ATT_SPLITS_1, Backend, Buf, GpuTensor, GEMM_BM, SAME_X};
 use crate::cuda::{AMAX_PARTS, FA_BK, attn_prefill_smem_bk, dyn_shmem_need, kname, rpw_from, gemv_block_from, tuned};
 use crate::quant::GgmlType;
+use crate::rope::RopeParams;
 use anyhow::{Context, bail};
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
@@ -47,7 +48,7 @@ pub struct Gpu {
     /// Recorded graphs by `Backend::graph` key.
     graphs: Mutex<HashMap<u64, Graph>>,
     /// Rope frequency tables, `base` and `n_rot` to the device buffer that holds them.
-    fr: Mutex<(HashMap<(u32, usize), Buf>, Vec<(f32, usize)>)>,
+    fr: Mutex<(HashMap<(u32, usize, u32, u32, u32, u32), Buf>, Vec<RopeParams>)>,
     /// Pinned staging for large `htod`, used as a ring: the copy returns before its DMA, so the host fills the next
     /// region while the card reads the previous one (expert streaming in prefill).
     staging: Mutex<Staging>,
@@ -285,19 +286,22 @@ impl Gpu {
     /// The rope frequencies base^(-2i / n_rot) as `rms_norm_rope` computes them in f64, made once by `rope_freq`.
     /// While a graph is captured a missing table gives 0 (the kernel computes the frequencies itself) and is made
     /// after the capture, which `graph` then repeats.
-    fn rope_fr(&self, base: f32, n_rot: usize) -> anyhow::Result<u64> {
+    fn rope_fr(&self, rope: &RopeParams) -> anyhow::Result<u64> {
+        let n_rot = rope.n_rot;
+        let key = (rope.base.to_bits(), n_rot, rope.freq_scale.to_bits(), rope.ext_factor.to_bits(),
+                   rope.corr[0].to_bits(), rope.corr[1].to_bits());
         let mut fr = self.fr.lock().unwrap();
-        if let Some(b) = fr.0.get(&(base.to_bits(), n_rot)) { return Ok(b.addr()) }
+        if let Some(b) = fr.0.get(&key) { return Ok(b.addr()) }
         if self.capturing() {
-            fr.1.push((base, n_rot));
+            fr.1.push(rope.clone());
             return Ok(0);
         }
         let buf = alloc_raw(&self.hip, 8 * (n_rot / 2).max(1))?;
         let p = buf.addr();
-        let (bs, nr) = (base, n_rot as i32);
-        launch!(self, "rope_freq", cfg((1, 1), 256, 0), p, bs, nr);
+        let (bs, nr, fs, ext, c0, c1) = (rope.base, n_rot as i32, rope.freq_scale, rope.ext_factor, rope.corr[0], rope.corr[1]);
+        launch!(self, "rope_freq", cfg((1, 1), 256, 0), p, bs, nr, fs, ext, c0, c1);
         self.wait()?;
-        fr.0.insert((base.to_bits(), n_rot), buf);
+        fr.0.insert(key, buf);
         Ok(p)
     }
 
@@ -549,7 +553,7 @@ impl Backend for Gpu {
         // A rope table the capture lacked: make it, and capture again next time (this graph computes it per call).
         let want = std::mem::take(&mut self.fr.lock().unwrap().1);
         if !want.is_empty() {
-            for (base, n_rot) in want { self.rope_fr(base, n_rot)?; }
+            for r in want { self.rope_fr(&r)?; }
             return Ok(());
         }
         self.graphs.lock().unwrap().insert(key, Graph { exec, graph, hip: self.hip.clone() });
@@ -665,45 +669,47 @@ impl Backend for Gpu {
         Ok(())
     }
 
-    fn rope_neox(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
-        self.rope_pairs(x, stride, heads, per, n_rot, step, base, 0, n_rot / 2)
+    fn rope_neox(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, rope: &RopeParams) -> anyhow::Result<()> {
+        self.rope_pairs(x, stride, heads, per, n_rot, step, rope, 0, n_rot / 2)
     }
 
-    fn rope_pairs(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32, lo: usize, hi: usize) -> anyhow::Result<()> {
-        launch!(self, "rope_neox", cfg(((heads / per) as u32, 1), (n_rot / 2) as u32, 0), x, stride as i32, per as i32, n_rot as i32, step, base, lo as i32, hi as i32);
+    fn rope_pairs(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, rope: &RopeParams, lo: usize, hi: usize) -> anyhow::Result<()> {
+        let fr = self.rope_fr(rope)?;
+        launch!(self, "rope_neox", cfg(((heads / per) as u32, 1), (n_rot / 2) as u32, 0), x, stride as i32, per as i32, n_rot as i32, step,
+                rope.base, rope.freq_scale, rope.ext_factor, rope.corr[0], rope.corr[1], fr, lo as i32, hi as i32);
         Ok(())
     }
 
-    fn rms_norm_rope(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
-        self.rms_norm_rope_kv(x, x_stride, w, out, n, rows, eps, per, n_rot, step, base, 0, 0, 0)
+    fn rms_norm_rope(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, rope: &RopeParams) -> anyhow::Result<()> {
+        self.rms_norm_rope_kv(x, x_stride, w, out, n, rows, eps, per, n_rot, step, rope, 0, 0, 0)
     }
 
     fn rms_norm_rope_kv(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize,
-                        step: u64, base: f32, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
+                        step: u64, rope: &RopeParams, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
         anyhow::ensure!(n_rot <= n.min(512) && n % 32 == 0, "rms_norm_rope: head of {n}, n_rot {n_rot}");
-        let fr = self.rope_fr(base, n_rot)?;
+        let fr = self.rope_fr(rope)?;
         launch!(self, "rms_norm_rope", cfg((rows as u32, 1), 256, 0), x, x_stride as i32, w, out, n as i32, eps, per as i32, n_rot as i32,
-                step, base, v, kc, vc, 0i32, 0u64, 0i32, 0u64, 0u64, 0i32, fr, 0u64, 0u64);
+                step, rope.base, rope.freq_scale, rope.ext_factor, rope.corr[0], rope.corr[1], v, kc, vc, 0i32, 0u64, 0i32, 0u64, 0u64, 0i32, fr, 0u64, 0u64);
         Ok(())
     }
 
     fn rms_norm_rope_qk(&self, q: u64, q_stride: usize, qw: u64, qo: u64, qrows: usize, qper: usize, k: u64, kw: u64, ko: u64,
-                        krows: usize, kper: usize, n: usize, eps: f32, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
+                        krows: usize, kper: usize, n: usize, eps: f32, n_rot: usize, step: u64, rope: &RopeParams, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
         anyhow::ensure!(n_rot <= n.min(512) && n % 32 == 0, "rms_norm_rope: head of {n}, n_rot {n_rot}");
-        let fr = self.rope_fr(base, n_rot)?;
+        let fr = self.rope_fr(rope)?;
         launch!(self, "rms_norm_rope", cfg(((qrows + krows) as u32, 1), 256, 0), k, n as i32, kw, ko, n as i32, eps, kper as i32, n_rot as i32,
-                step, base, v, kc, vc, qrows as i32, q, q_stride as i32, qw, qo, qper as i32, fr, 0u64, 0u64);
+                step, rope.base, rope.freq_scale, rope.ext_factor, rope.corr[0], rope.corr[1], v, kc, vc, qrows as i32, q, q_stride as i32, qw, qo, qper as i32, fr, 0u64, 0u64);
         Ok(())
     }
 
     fn kv_rows(&self) -> bool { true }
 
     fn rms_norm_rope_qk_rows(&self, q: u64, q_stride: usize, qw: u64, qo: u64, nh: usize, k: u64, kw: u64, ko: u64, nkv: usize,
-                             hd: usize, eps: f32, n_rot: usize, step: u64, base: f32, v: u64, kvt: u64, nt: usize) -> anyhow::Result<()> {
+                             hd: usize, eps: f32, n_rot: usize, step: u64, rope: &RopeParams, v: u64, kvt: u64, nt: usize) -> anyhow::Result<()> {
         anyhow::ensure!(n_rot <= hd.min(512) && hd % 32 == 0, "rms_norm_rope: head of {hd}, n_rot {n_rot}");
-        let fr = self.rope_fr(base, n_rot)?;
+        let fr = self.rope_fr(rope)?;
         launch!(self, "rms_norm_rope", cfg(((nt * (nh + nkv)) as u32, 1), 256, 0), k, hd as i32, kw, ko, hd as i32, eps, nkv as i32, n_rot as i32,
-                step, base, v, 0u64, 0u64, (nt * nh) as i32, q, q_stride as i32, qw, qo, nh as i32, fr, kvt, 0u64);
+                step, rope.base, rope.freq_scale, rope.ext_factor, rope.corr[0], rope.corr[1], v, 0u64, 0u64, (nt * nh) as i32, q, q_stride as i32, qw, qo, nh as i32, fr, kvt, 0u64);
         Ok(())
     }
 

@@ -129,7 +129,14 @@ impl<'a> Model<'a> {
     }
 
     pub fn load_with_matvec(g: &'a Gguf, aux: Option<&'a Gguf>, loras: &[(String, f32)], fast_matvec: bool) -> anyhow::Result<Model<'a>> {
+        Self::load_with_matvec_rope(g, aux, loras, fast_matvec, None)
+    }
+
+    /// `load_with_matvec`, with the RoPE plan replaced after the GGUF metadata (CLI `--rope-scaling`).
+    pub fn load_with_matvec_rope(g: &'a Gguf, aux: Option<&'a Gguf>, loras: &[(String, f32)], fast_matvec: bool,
+                                 rope: Option<crate::rope::RopeParams>) -> anyhow::Result<Model<'a>> {
         let mut cfg = ModelConfig::from_gguf(g)?;
+        if let Some(r) = rope { cfg.rope = r; }
         // A DFlash draft given on the command line replaces the target's own MTP head; without this the draft was
         // ignored without a word for a target GGUF that carries one.
         if cfg.n_nextn > 0 && aux.is_some_and(|ag| ag.tensors.contains_key("dflash.fc.weight")) {
@@ -172,7 +179,7 @@ impl<'a> Model<'a> {
                 let n_ff = gate.rows;
                 let draft_vocab = out.rows;
                 let n_rot = ag.meta.get("eagle3.rope.dimension_count").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(head_dim);
-                let rope_base = ag.meta.get("eagle3.rope.freq_base").and_then(|v| v.as_f32()).unwrap_or(cfg.rope_base);
+                let rope_base = ag.meta.get("eagle3.rope.freq_base").and_then(|v| v.as_f32()).unwrap_or(cfg.rope.base);
                 let eps = ag.meta.get("eagle3.attention.layer_norm_rms_epsilon").and_then(|v| v.as_f32()).unwrap_or(cfg.eps);
                 let norm_before_residual = matches!(ag.meta.get("eagle3.norm_before_residual"), Some(crate::gguf::Value::Bool(true)));
                 let rope_neox = !matches!(ag.meta.get("eagle3.rope.neox"), Some(crate::gguf::Value::Bool(false)));
@@ -203,7 +210,8 @@ impl<'a> Model<'a> {
                 };
                 cfg.n_nextn = 1;
                 cfg.eagle3 = Some(Eagle3Config {
-                    extract_layers, n_ff, n_head, n_head_kv, head_dim, n_rot, rope_base, eps,
+                    extract_layers, n_ff, n_head, n_head_kv, head_dim, n_rot, rope_base,
+                    rope: crate::rope::RopeParams::plain(rope_base, n_rot), eps,
                     draft_vocab, norm_before_residual, rope_neox, d2t,
                 });
                 crate::say!(
@@ -222,7 +230,7 @@ impl<'a> Model<'a> {
                 let n_head_kv = u("dflash.attention.head_count_kv").unwrap_or(cfg.n_head_kv);
                 let head_dim = u("dflash.attention.key_length").unwrap_or(n_embd / n_head.max(1));
                 let n_rot = u("dflash.rope.dimension_count").unwrap_or(head_dim);
-                let rope_base = f("dflash.rope.freq_base").unwrap_or(cfg.rope_base);
+                let rope_base = f("dflash.rope.freq_base").unwrap_or(cfg.rope.base);
                 let eps = f("dflash.attention.layer_norm_rms_epsilon").unwrap_or(cfg.eps);
                 let sliding_window = u("dflash.attention.sliding_window").unwrap_or(0);
                 let input_embedding_scale = f("dflash.input_embedding_scale").unwrap_or(1.0);
@@ -251,6 +259,7 @@ impl<'a> Model<'a> {
                     head_dim,
                     n_rot,
                     rope_base,
+                    rope: crate::rope::RopeParams::plain(rope_base, n_rot),
                     eps,
                     sliding_window,
                     layer_swa,
@@ -746,8 +755,8 @@ impl<'a> Model<'a> {
     /// RoPE for one head: 1-D when the model has no M-RoPE sections, otherwise `[t, y, x, z]`.
     fn rope(&self, x: &mut [f32], kv_pos: usize, rope_pos: [i32; 4]) {
         match self.cfg.mrope_sections {
-            Some(sections) => ops::rope_mrope(x, self.cfg.n_rot, rope_pos, sections, self.cfg.rope_base),
-            None => ops::rope_neox(x, self.cfg.n_rot, kv_pos, self.cfg.rope_base),
+            Some(sections) => ops::rope_mrope(x, self.cfg.n_rot, rope_pos, sections, self.cfg.rope.base),
+            None => self.cfg.rope.apply_neox(x, kv_pos),
         }
     }
 
