@@ -14,6 +14,9 @@ control plane and `--slot-save-path` in `src/main.rs`, the unit/GPU tests and th
 `tools/test_slot_save.sh`. The sections below describe the code as implemented on the branch, not a plan;
 where an earlier design assumed a different shape, the text follows the code.
 
+The automatic, budgeted layer above these explicit files is designed in
+[SLOT-ARCHIVE.md](SLOT-ARCHIVE.md).
+
 ## 1. Goals and non-goals
 
 ### Goals
