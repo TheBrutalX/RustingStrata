@@ -406,6 +406,20 @@ impl GpuModel<'_> {
     /// Backpressure: `write` blocks when the writer is more than `RING` chunks behind, so a disk slower than the
     /// GPU→host copies still stalls the model thread (after ~256 MB of staging), and `join` waits for the disk.
     pub fn save_slot_file_async(&mut self, slot: usize, path: &Path) -> Result<AsyncSave> {
+        self.save_slot_file_async_as(slot, path, self.owner)
+    }
+
+    /// `save_slot_file_async` with an explicit conversation owner. The archive uses `slot_owner` here, not the
+    /// owner of the request that triggered the checkpoint: an eviction caused by another key must not re-label the
+    /// state. The owner is put in the header and in `saved_owner`; the caller's request owner is restored on
+    /// success, error and unwind, as in [`Self::save_slot_file_as`].
+    pub fn save_slot_file_async_as(&mut self, slot: usize, path: &Path, owner: u64) -> Result<AsyncSave> {
+        let prev = std::mem::replace(&mut self.owner, owner);
+        let guard = OwnerGuard { model: self, prev };
+        guard.model.save_slot_file_async_owned(slot, path)
+    }
+
+    fn save_slot_file_async_owned(&mut self, slot: usize, path: &Path) -> Result<AsyncSave> {
         let (tokens, header) = self.slot_snapshot(slot)?;
         let (tmp, f) = create_tmp(path)?;
         let (mut out, save) = spawn_writer(f, tmp, path.to_path_buf());
