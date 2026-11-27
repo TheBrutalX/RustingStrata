@@ -25,6 +25,22 @@ const CHUNK: usize = 64 << 20;
 /// Depth of the async save ring (4 × 64 MB of staged bytes, see `docs/SLOT-ARCHIVE-PHASE2.md` §5.3).
 const RING: usize = 4;
 
+/// Magic of a segmented K/V payload (`STRKVSEG`), see [`GpuModel::save_kv_segment`].
+const KV_SEGMENT_MAGIC: [u8; 8] = *b"STRKVSEG";
+/// Magic of a segmented recurrent/DeltaNet/MTP/PLE/QSA payload (`STRRSEG`), see
+/// [`GpuModel::save_recurrent_to`].
+const RECURRENT_SEGMENT_MAGIC: [u8; 7] = *b"STRRSEG";
+/// Version of both segmented payloads understood by this module.
+const SEGMENT_VERSION: u32 = 1;
+/// Sanity bound on the number of model parts in a segmented payload. A split model has a handful; the bound is
+/// only there so a corrupt header cannot make the reader allocate an arbitrary vector.
+const MAX_SEGMENT_PARTS: usize = 256;
+/// Sanity bound on the number of buffers in one part (KV pairs, DeltaNet pairs, MTP/PLE/QSA copies).
+const MAX_SEGMENT_BUFFERS: usize = 4096;
+/// Sanity bound on one buffer or KV row. 16 GiB is far above any per-layer buffer but keeps length arithmetic from
+/// accepting an impossible value before it is compared with the model layout.
+const MAX_SEGMENT_BUFFER_LEN: u64 = 1 << 34;
+
 /// Restores the request owner when `save_slot_file_as` finishes or unwinds. The owner field is the caller's
 /// request identity; only the saved state and header carry the explicit conversation owner.
 struct OwnerGuard<'m, 'a> {
@@ -33,6 +49,16 @@ struct OwnerGuard<'m, 'a> {
 }
 impl Drop for OwnerGuard<'_, '_> {
     fn drop(&mut self) { self.model.owner = self.prev; }
+}
+
+/// Restores the caller's current slot when a segmented save/restore finishes or unwinds. Selecting another slot is
+/// safe: `use_slot` swaps the whole per-slot state, so the caller finds its cursor where it left it.
+struct SlotGuard<'m, 'a> {
+    model: &'m mut GpuModel<'a>,
+    prev: usize,
+}
+impl Drop for SlotGuard<'_, '_> {
+    fn drop(&mut self) { self.model.use_slot(self.prev); }
 }
 
 /// A writer that counts the bytes it passes through (the footer stores the payload length).
@@ -56,6 +82,241 @@ impl<R: Read> Read for Count<R> {
         Ok(n)
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// Segmented payloads
+// ---------------------------------------------------------------------------------------------------------
+//
+// The archive v2 dedup stores one opaque payload per KV segment and one per entry's fixed recurrent state. They
+// are deliberately small, self-delimiting streams (no file path, temp file, footer or fingerprint: the entry
+// header and the segment id carry those). All integers are little-endian, like the `STRATASLOT` format.
+//
+// `STRKVSEG` v1 for the K/V rows of `[start, end)`:
+//
+// ```text
+// magic[8] = "STRKVSEG"
+// version: u32 = 1
+// start: u64
+// end: u64                       (start < end)
+// n_parts: u32
+// per part:
+//     n_buffers: u32
+//     per buffer: row_bytes: u64
+// then the bytes of every part/buffer in the same order, each buffer `row_bytes * (end - start)` long.
+// ```
+//
+// `STRRSEG` v1 for the recurrent state of one slot:
+//
+// ```text
+// magic[7] = "STRRSEG"
+// version: u32 = 1
+// ple_prev[0]: u64 (i64 bits), ple_prev[1]: u64
+// n_parts: u32
+// per part:
+//     n_slot: u32
+//     per saved buffer: len: u64, then `len` bytes
+// ```
+//
+// `n_parts` and `n_buffers` are validated against the model before any GPU copy; a corrupt count, an empty range
+// or a payload length overflow is rejected up front. The model/layout fingerprint is not in these payloads: the
+// caller (the archive entry) owns that check, because a segment may be shared by several entries of one model.
+
+/// Parsed `STRKVSEG` header: the range, one row-size vector per part, and the computed payload length.
+#[derive(Debug, PartialEq, Eq)]
+struct KvSegmentHeader {
+    start: u64,
+    end: u64,
+    parts: Vec<Vec<u64>>,
+    payload_len: u64,
+}
+
+/// The bytes of all KV rows of a segment, checked for overflow.
+fn kv_segment_payload_len(start: u64, end: u64, parts: &[Vec<u64>]) -> Result<u64> {
+    let rows = end.checked_sub(start).context("KV segment range underflow")?;
+    ensure!(rows > 0, "KV segment range [{start}, {end}) is empty or reversed");
+    let mut total = 0u64;
+    for &row in parts.iter().flatten() {
+        let bytes = row
+            .checked_mul(rows)
+            .context("KV segment payload length overflow")?;
+        total = total
+            .checked_add(bytes)
+            .context("KV segment payload length overflow")?;
+    }
+    Ok(total)
+}
+
+/// Write a `STRKVSEG` v1 header and return the payload length it describes.
+fn write_kv_segment_header<W: Write>(out: &mut W, start: u64, end: u64, parts: &[Vec<u64>]) -> Result<u64> {
+    ensure!(
+        (1..=MAX_SEGMENT_PARTS).contains(&parts.len()),
+        "KV segment has {} parts, the range is 1..={MAX_SEGMENT_PARTS}",
+        parts.len()
+    );
+    let payload_len = kv_segment_payload_len(start, end, parts)?;
+    out.write_all(&KV_SEGMENT_MAGIC).context("writing the KV segment magic")?;
+    slot_file::write_u32(out, SEGMENT_VERSION)?;
+    slot_file::write_u64(out, start)?;
+    slot_file::write_u64(out, end)?;
+    slot_file::write_u32(out, parts.len() as u32)?;
+    for part in parts {
+        ensure!(
+            part.len() <= MAX_SEGMENT_BUFFERS,
+            "KV segment part has {} buffers, the limit is {MAX_SEGMENT_BUFFERS}",
+            part.len()
+        );
+        slot_file::write_u32(out, part.len() as u32)?;
+        for &row in part {
+            ensure!(row > 0, "KV segment row is empty");
+            ensure!(
+                row <= MAX_SEGMENT_BUFFER_LEN,
+                "KV segment row of {row} bytes exceeds the {MAX_SEGMENT_BUFFER_LEN}-byte limit"
+            );
+            slot_file::write_u64(out, row)?;
+        }
+    }
+    Ok(payload_len)
+}
+
+/// Read and validate a `STRKVSEG` v1 header, including its counts and its computed payload length.
+fn read_kv_segment_header<R: Read>(inp: &mut R) -> Result<KvSegmentHeader> {
+    let mut magic = [0u8; 8];
+    inp.read_exact(&mut magic).context("reading the KV segment magic")?;
+    ensure!(
+        magic == KV_SEGMENT_MAGIC,
+        "bad KV segment magic {magic:02x?}, expected {KV_SEGMENT_MAGIC:02x?}"
+    );
+    let version = slot_file::read_u32(inp).context("reading the KV segment version")?;
+    ensure!(
+        version == SEGMENT_VERSION,
+        "unsupported KV segment version {version}, expected {SEGMENT_VERSION}"
+    );
+    let start = slot_file::read_u64(inp).context("reading the KV segment start")?;
+    let end = slot_file::read_u64(inp).context("reading the KV segment end")?;
+    ensure!(
+        start < end,
+        "KV segment range [{start}, {end}) is empty or reversed"
+    );
+    let n_parts = slot_file::read_u32(inp).context("reading the KV segment part count")? as usize;
+    ensure!(
+        (1..=MAX_SEGMENT_PARTS).contains(&n_parts),
+        "KV segment has {n_parts} parts, the range is 1..={MAX_SEGMENT_PARTS}"
+    );
+    let mut parts = Vec::with_capacity(n_parts);
+    for part_index in 0..n_parts {
+        let n_buffers = slot_file::read_u32(inp)
+            .with_context(|| format!("reading the KV buffer count of part {part_index}"))?
+            as usize;
+        ensure!(
+            n_buffers <= MAX_SEGMENT_BUFFERS,
+            "KV segment part {part_index} has {n_buffers} buffers, the limit is {MAX_SEGMENT_BUFFERS}"
+        );
+        let mut rows = Vec::with_capacity(n_buffers);
+        for buffer_index in 0..n_buffers {
+            let row = slot_file::read_u64(inp).with_context(|| {
+                format!("reading the row size of part {part_index} buffer {buffer_index}")
+            })?;
+            ensure!(
+                row > 0,
+                "KV segment part {part_index} buffer {buffer_index} has a zero row size"
+            );
+            ensure!(
+                row <= MAX_SEGMENT_BUFFER_LEN,
+                "KV segment row of {row} bytes exceeds the {MAX_SEGMENT_BUFFER_LEN}-byte limit"
+            );
+            rows.push(row);
+        }
+        parts.push(rows);
+    }
+    let payload_len = kv_segment_payload_len(start, end, &parts)?;
+    Ok(KvSegmentHeader { start, end, parts, payload_len })
+}
+
+/// Parsed `STRRSEG` header: the PLE token pair and one saved-buffer length vector per part.
+#[derive(Debug, PartialEq, Eq)]
+struct RecurrentSegmentHeader {
+    ple_prev: [i64; 2],
+    parts: Vec<Vec<u64>>,
+}
+
+/// Write a `STRRSEG` v1 header.
+fn write_recurrent_segment_header<W: Write>(out: &mut W, header: &RecurrentSegmentHeader) -> Result<()> {
+    ensure!(
+        (1..=MAX_SEGMENT_PARTS).contains(&header.parts.len()),
+        "recurrent segment has {} parts, the range is 1..={MAX_SEGMENT_PARTS}",
+        header.parts.len()
+    );
+    out.write_all(&RECURRENT_SEGMENT_MAGIC)
+        .context("writing the recurrent segment magic")?;
+    slot_file::write_u32(out, SEGMENT_VERSION)?;
+    for value in header.ple_prev {
+        slot_file::write_u64(out, value as u64)?;
+    }
+    slot_file::write_u32(out, header.parts.len() as u32)?;
+    for (part_index, part) in header.parts.iter().enumerate() {
+        ensure!(
+            part.len() <= MAX_SEGMENT_BUFFERS,
+            "recurrent segment part {part_index} has {} buffers, the limit is {MAX_SEGMENT_BUFFERS}",
+            part.len()
+        );
+        slot_file::write_u32(out, part.len() as u32)?;
+        for &len in part {
+            ensure!(
+                len <= MAX_SEGMENT_BUFFER_LEN,
+                "recurrent segment buffer of {len} bytes exceeds the {MAX_SEGMENT_BUFFER_LEN}-byte limit"
+            );
+            slot_file::write_u64(out, len)?;
+        }
+    }
+    Ok(())
+}
+
+/// Read and validate a `STRRSEG` v1 header, including its counts and buffer lengths.
+fn read_recurrent_segment_header<R: Read>(inp: &mut R) -> Result<RecurrentSegmentHeader> {
+    let mut magic = [0u8; 7];
+    inp.read_exact(&mut magic)
+        .context("reading the recurrent segment magic")?;
+    ensure!(
+        magic == RECURRENT_SEGMENT_MAGIC,
+        "bad recurrent segment magic {magic:02x?}, expected {RECURRENT_SEGMENT_MAGIC:02x?}"
+    );
+    let version = slot_file::read_u32(inp).context("reading the recurrent segment version")?;
+    ensure!(
+        version == SEGMENT_VERSION,
+        "unsupported recurrent segment version {version}, expected {SEGMENT_VERSION}"
+    );
+    let ple0 = slot_file::read_u64(inp).context("reading the recurrent PLE position")? as i64;
+    let ple1 = slot_file::read_u64(inp).context("reading the recurrent PLE position")? as i64;
+    let n_parts = slot_file::read_u32(inp).context("reading the recurrent part count")? as usize;
+    ensure!(
+        (1..=MAX_SEGMENT_PARTS).contains(&n_parts),
+        "recurrent segment has {n_parts} parts, the range is 1..={MAX_SEGMENT_PARTS}"
+    );
+    let mut parts = Vec::with_capacity(n_parts);
+    for part_index in 0..n_parts {
+        let n_slot = slot_file::read_u32(inp)
+            .with_context(|| format!("reading the recurrent buffer count of part {part_index}"))?
+            as usize;
+        ensure!(
+            n_slot <= MAX_SEGMENT_BUFFERS,
+            "recurrent segment part {part_index} has {n_slot} buffers, the limit is {MAX_SEGMENT_BUFFERS}"
+        );
+        let mut lens = Vec::with_capacity(n_slot);
+        for buffer_index in 0..n_slot {
+            let len = slot_file::read_u64(inp).with_context(|| {
+                format!("reading the length of part {part_index} buffer {buffer_index}")
+            })?;
+            ensure!(
+                len <= MAX_SEGMENT_BUFFER_LEN,
+                "recurrent segment buffer of {len} bytes exceeds the {MAX_SEGMENT_BUFFER_LEN}-byte limit"
+            );
+            lens.push(len);
+        }
+        parts.push(lens);
+    }
+    Ok(RecurrentSegmentHeader { ple_prev: [ple0, ple1], parts })
+}
+
 
 /// The first worker error, kept so that both `write()` and `join()` report it instead of a bare "channel closed".
 #[derive(Clone, Default)]
@@ -557,6 +818,379 @@ impl GpuModel<'_> {
         Ok(out.count())
     }
 
+    /// Save the K/V rows of the token range `[start, end)` of `slot` as an opaque `STRKVSEG` v1 payload and return
+    /// the number of bytes written.
+    ///
+    /// The K/V representation is exactly the running model's (q8/f16/q4/q2), so this is a raw row copy: the caller
+    /// checks the model fingerprint through the archive entry. `use_slot` selects the slot; `pos`, `history`,
+    /// `saved_*` and the caller's current slot are left as they were.
+    pub fn save_kv_segment<W: Write>(
+        &mut self,
+        slot: usize,
+        start: usize,
+        end: usize,
+        out: &mut W,
+    ) -> Result<u64> {
+        ensure!(slot < self.slots(), "slot {slot} of {}", self.slots());
+        ensure!(
+            start < end,
+            "KV segment range [{start}, {end}) is empty or reversed"
+        );
+        let prev = self.current_slot();
+        self.use_slot(slot);
+        let guard = SlotGuard { model: self, prev };
+        guard.model.write_kv_segment(slot, start, end, out)
+    }
+
+    /// Restore a `STRKVSEG` v1 payload into the K/V rows of `[start, end)` of `slot` and return the bytes consumed.
+    ///
+    /// Every header count, the range, the row sizes and the model layout are validated before the first host→GPU
+    /// copy, so a malformed header does not partially change the slot. The recurrent state, `pos`, `history`, the
+    /// saved history and the caller's current slot are untouched.
+    pub fn restore_kv_segment<R: Read>(
+        &mut self,
+        slot: usize,
+        start: usize,
+        end: usize,
+        inp: &mut R,
+    ) -> Result<u64> {
+        ensure!(slot < self.slots(), "slot {slot} of {}", self.slots());
+        ensure!(
+            start < end,
+            "KV segment range [{start}, {end}) is empty or reversed"
+        );
+        let prev = self.current_slot();
+        self.use_slot(slot);
+        let guard = SlotGuard { model: self, prev };
+        guard.model.read_kv_segment(slot, start, end, inp)
+    }
+
+    fn write_kv_segment<W: Write>(
+        &mut self,
+        slot: usize,
+        start: usize,
+        end: usize,
+        out: &mut W,
+    ) -> Result<u64> {
+        // Capture and validate one row size per buffer first, so a state that cannot be addressed fails before the
+        // header is written.
+        let mut parts: Vec<Vec<u64>> = Vec::new();
+        let mut q = Some(&mut *self);
+        while let Some(p) = q {
+            let kv = p.kv_bufs();
+            let mut rows = Vec::with_capacity(kv.len());
+            for &(b, n_rows) in &kv {
+                ensure!(n_rows > 0, "slot {slot}: a KV buffer has no rows");
+                let row = b.len() / n_rows;
+                ensure!(
+                    row > 0,
+                    "slot {slot}: a KV buffer is {}-1 rows, shorter than {n_rows} rows",
+                    b.len()
+                );
+                ensure!(
+                    end <= n_rows,
+                    "KV segment ends at {end}, but slot {slot} has {n_rows} rows"
+                );
+                row.checked_mul(end)
+                    .context("KV segment offset overflow")?;
+                rows.push(row as u64);
+            }
+            parts.push(rows);
+            q = p.next.as_deref_mut();
+        }
+
+        let mut out = Count::new(out);
+        let payload_len = write_kv_segment_header(&mut out, start as u64, end as u64, &parts)?;
+        let rows = end - start;
+        let mut written = 0u64;
+        let mut q = Some(&mut *self);
+        while let Some(p) = q {
+            for &(b, n_rows) in &p.kv_bufs() {
+                let row = b.len() / n_rows;
+                let offset = row.checked_mul(start).context("KV segment offset overflow")?;
+                let bytes = row.checked_mul(rows).context("KV segment size overflow")?;
+                write_buf_range(&*p.gpu, b, offset, bytes, &mut out)?;
+                written += bytes as u64;
+            }
+            q = p.next.as_deref_mut();
+        }
+        ensure!(
+            written == payload_len,
+            "KV segment wrote {written} payload bytes, the header describes {payload_len}"
+        );
+        out.flush()?;
+        Ok(out.count())
+    }
+
+    fn read_kv_segment<R: Read>(
+        &mut self,
+        slot: usize,
+        start: usize,
+        end: usize,
+        inp: &mut R,
+    ) -> Result<u64> {
+        let mut inp = Count::new(inp);
+        let header = read_kv_segment_header(&mut inp)?;
+        ensure!(
+            header.start == start as u64 && header.end == end as u64,
+            "KV segment range [{}, {}) does not match the requested [{start}, {end})",
+            header.start,
+            header.end
+        );
+        let n_parts = self.parts().count();
+        ensure!(
+            header.parts.len() == n_parts,
+            "KV segment has {} parts, this model has {n_parts}",
+            header.parts.len()
+        );
+
+        // Validation pass: compare every descriptor with the model before touching the slot.
+        let rows = end - start;
+        let mut part_index = 0;
+        let mut q = Some(&mut *self);
+        while let Some(p) = q {
+            let kv = p.kv_bufs();
+            let described = &header.parts[part_index];
+            ensure!(
+                described.len() == kv.len(),
+                "KV segment part {part_index} has {} buffers, this model has {}",
+                described.len(),
+                kv.len()
+            );
+            for (buffer_index, &(b, n_rows)) in kv.iter().enumerate() {
+                ensure!(
+                    n_rows > 0,
+                    "slot {slot}: part {part_index} buffer {buffer_index} has no rows"
+                );
+                let row = b.len() / n_rows;
+                ensure!(
+                    row > 0,
+                    "slot {slot}: part {part_index} buffer {buffer_index} has an empty row"
+                );
+                ensure!(
+                    end <= n_rows,
+                    "KV segment ends at {end}, but slot {slot} part {part_index} has {n_rows} rows"
+                );
+                ensure!(
+                    described[buffer_index] == row as u64,
+                    "KV segment part {part_index} buffer {buffer_index} has {} bytes a row, this model has {row}",
+                    described[buffer_index]
+                );
+                let offset = row
+                    .checked_mul(start)
+                    .context("KV segment offset overflow")?;
+                let bytes = row
+                    .checked_mul(rows)
+                    .context("KV segment size overflow")?;
+                ensure!(
+                    offset.checked_add(bytes).is_some_and(|n| n <= b.len()),
+                    "KV segment part {part_index} buffer {buffer_index} does not fit its slot buffer"
+                );
+            }
+            part_index += 1;
+            q = p.next.as_deref_mut();
+        }
+
+        // Install pass: the header and the layout are known good.
+        let header_bytes = inp.count();
+        let mut q = Some(&mut *self);
+        while let Some(p) = q {
+            for &(b, n_rows) in &p.kv_bufs() {
+                let row = b.len() / n_rows;
+                let offset = row
+                    .checked_mul(start)
+                    .context("KV segment offset overflow")?;
+                let bytes = row.checked_mul(rows).context("KV segment size overflow")?;
+                read_buf_range(&*p.gpu, b, offset, bytes, &mut inp)?;
+            }
+            q = p.next.as_deref_mut();
+        }
+        let payload_read = inp.count() - header_bytes;
+        ensure!(
+            payload_read == header.payload_len,
+            "KV segment payload is {payload_read} bytes, the header describes {}",
+            header.payload_len
+        );
+        Ok(inp.count())
+    }
+
+    /// Save `slot`'s recurrent/DeltaNet/MTP/PLE/QSA state as an opaque `STRRSEG` v1 payload and return the number
+    /// of bytes written.
+    ///
+    /// This calls `save_state` (which clears `saved_ids`, as the full-slot save does), writes that snapshot and
+    /// leaves `pos`/`history` and the caller's current slot alone. `saved_owner` is not part of the payload: the
+    /// archive entry stores it and passes it to [`Self::finish_segmented_restore`].
+    pub fn save_recurrent_to<W: Write>(&mut self, slot: usize, out: &mut W) -> Result<u64> {
+        ensure!(slot < self.slots(), "slot {slot} of {}", self.slots());
+        let prev = self.current_slot();
+        self.use_slot(slot);
+        let guard = SlotGuard { model: self, prev };
+        guard.model.write_recurrent_segment(slot, out)
+    }
+
+    /// Restore a `STRRSEG` v1 payload into `slot`'s saved buffers and return the bytes consumed.
+    ///
+    /// The saved buffers are filled and `saved_ple_prev` is set, but `saved_pos`, `saved_ids`, `history` and
+    /// `saved_owner` are left for [`Self::finish_segmented_restore`], after every KV segment has also been installed.
+    /// A corrupt header/count/length is rejected before any buffer is changed.
+    pub fn restore_recurrent_from<R: Read>(&mut self, slot: usize, inp: &mut R) -> Result<u64> {
+        ensure!(slot < self.slots(), "slot {slot} of {}", self.slots());
+        let prev = self.current_slot();
+        self.use_slot(slot);
+        let guard = SlotGuard { model: self, prev };
+        guard.model.read_recurrent_segment(slot, inp)
+    }
+
+    fn write_recurrent_segment<W: Write>(&mut self, _slot: usize, out: &mut W) -> Result<u64> {
+        // The payload is the `saved` snapshot, not the live state.
+        self.save_state()?;
+        let mut parts: Vec<Vec<u64>> = Vec::new();
+        let mut q = Some(&mut *self);
+        while let Some(p) = q {
+            parts.push(p.slot().iter().map(|b| b.len() as u64).collect());
+            q = p.next.as_deref_mut();
+        }
+        let header = RecurrentSegmentHeader {
+            // PLE lives on one part of a split model; the single header field takes that part's pair.
+            ple_prev: self
+                .parts()
+                .find(|p| p.ple_ring.is_some())
+                .map_or(self.saved_ple_prev, |p| p.saved_ple_prev),
+            parts,
+        };
+        let mut out = Count::new(out);
+        write_recurrent_segment_header(&mut out, &header)?;
+        let mut q = Some(&mut *self);
+        while let Some(p) = q {
+            for b in p.slot() {
+                write_buf(&*p.gpu, b, b.len(), &mut out)?;
+            }
+            q = p.next.as_deref_mut();
+        }
+        out.flush()?;
+        Ok(out.count())
+    }
+
+    fn read_recurrent_segment<R: Read>(&mut self, _slot: usize, inp: &mut R) -> Result<u64> {
+        let mut inp = Count::new(inp);
+        let header = read_recurrent_segment_header(&mut inp)?;
+        let n_parts = self.parts().count();
+        ensure!(
+            header.parts.len() == n_parts,
+            "recurrent segment has {} parts, this model has {n_parts}",
+            header.parts.len()
+        );
+        // A fresh model that never saved a state has no DeltaNet copies yet. Allocate the same set `save_state`
+        // would, without overwriting the target's saved position/history/owner.
+        self.ensure_saved_buffers()?;
+
+        // Validate every count and length before the first copy.
+        let mut part_index = 0;
+        let mut q = Some(&mut *self);
+        while let Some(p) = q {
+            let bufs = p.slot();
+            let described = &header.parts[part_index];
+            ensure!(
+                described.len() == bufs.len(),
+                "recurrent segment part {part_index} has {} buffers, this model has {}",
+                described.len(),
+                bufs.len()
+            );
+            for (buffer_index, b) in bufs.iter().enumerate() {
+                ensure!(
+                    described[buffer_index] == b.len() as u64,
+                    "recurrent segment part {part_index} buffer {buffer_index} has {} bytes, this model has {}",
+                    described[buffer_index],
+                    b.len()
+                );
+            }
+            part_index += 1;
+            q = p.next.as_deref_mut();
+        }
+
+        let mut q = Some(&mut *self);
+        while let Some(p) = q {
+            for b in p.slot() {
+                read_buf(&*p.gpu, b, b.len(), &mut inp)?;
+            }
+            p.saved_ple_prev = header.ple_prev;
+            q = p.next.as_deref_mut();
+        }
+        Ok(inp.count())
+    }
+
+    /// Complete a segmented restore: adopt `tokens` as the slot's history at position `tokens.len()`, set its owner
+    /// and rope offset on every part, and install the recurrent snapshot loaded by [`Self::restore_recurrent_from`].
+    ///
+    /// A segmented restore has no full-slot header, so this is where the history marker (`saved_ids`), `saved_pos`,
+    /// `history` and `saved_owner` are committed. The K/V rows must already be installed. After it returns, `pos`
+    /// and `history` are consistent for the next prefill/decode.
+    pub fn finish_segmented_restore(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        owner: u64,
+        rope_offset: i32,
+    ) -> Result<()> {
+        ensure!(slot < self.slots(), "slot {slot} of {}", self.slots());
+        ensure!(!tokens.is_empty(), "segmented restore has no tokens");
+        ensure!(
+            tokens.len() <= self.ctx,
+            "segmented restore has {} tokens, --ctx is {}",
+            tokens.len(),
+            self.ctx
+        );
+        let prev = self.current_slot();
+        self.use_slot(slot);
+        let guard = SlotGuard { model: self, prev };
+        guard.model.finish_segmented(slot, tokens, owner, rope_offset)
+    }
+
+    fn finish_segmented(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        owner: u64,
+        rope_offset: i32,
+    ) -> Result<()> {
+        // Reject a state that was never installed rather than letting `restore_state` find an empty snapshot.
+        let mut q = Some(&mut *self);
+        while let Some(p) = q {
+            let has_delta = p
+                .layers
+                .iter()
+                .any(|l| matches!(l.mixer, super::Mixer::Delta { .. }));
+            ensure!(
+                !has_delta || !p.saved.is_empty(),
+                "slot {slot}: no recurrent state restored (call restore_recurrent_from first)"
+            );
+            q = p.next.as_deref_mut();
+        }
+
+        let mut q = Some(&mut *self);
+        while let Some(p) = q {
+            p.saved_pos = tokens.len();
+            p.saved_ids = tokens.to_vec();
+            p.history = tokens.to_vec();
+            p.saved_owner = owner;
+            p.rope_offset = rope_offset;
+            q = p.next.as_deref_mut();
+        }
+        self.restore_state()
+    }
+
+    /// Allocate the per-part saved buffers if they were not allocated yet, without touching the saved marker.
+    fn ensure_saved_buffers(&mut self) -> Result<()> {
+        let mut q = Some(&mut *self);
+        while let Some(p) = q {
+            if p.saved.is_empty() {
+                p.saved = super::alloc_saved(&*p.gpu, &p.layers, p.seqs.len() > 1)?;
+            }
+            q = p.next.as_deref_mut();
+        }
+        Ok(())
+    }
+
     /// Clear `slot` and return how many tokens it held.
     pub fn erase_slot(&mut self, slot: usize) -> Result<usize> {
         ensure!(slot < self.slots(), "slot {slot} of {}", self.slots());
@@ -658,24 +1292,46 @@ fn create_tmp(path: &Path) -> Result<(PathBuf, File)> {
 }
 
 fn write_buf(g: &dyn crate::backend::Backend, b: &Buf, bytes: usize, out: &mut impl Write) -> Result<()> {
-    let mut off = 0;
-    while off < bytes {
-        let n = (bytes - off).min(CHUNK);
-        let v = g.get::<u8>(b, off, n)?;
+    write_buf_range(g, b, 0, bytes, out)
+}
+
+/// Write `bytes` starting at `offset` of `b`, in bounded chunks.
+fn write_buf_range(
+    g: &dyn crate::backend::Backend,
+    b: &Buf,
+    offset: usize,
+    bytes: usize,
+    out: &mut impl Write,
+) -> Result<()> {
+    let mut done = 0;
+    while done < bytes {
+        let n = (bytes - done).min(CHUNK);
+        let v = g.get::<u8>(b, offset + done, n)?;
         out.write_all(&v)?;
-        off += n;
+        done += n;
     }
     Ok(())
 }
 
 fn read_buf(g: &dyn crate::backend::Backend, b: &Buf, bytes: usize, inp: &mut impl Read) -> Result<()> {
-    let mut off = 0;
+    read_buf_range(g, b, 0, bytes, inp)
+}
+
+/// Read `bytes` into `b` starting at `offset`, in bounded chunks.
+fn read_buf_range(
+    g: &dyn crate::backend::Backend,
+    b: &Buf,
+    offset: usize,
+    bytes: usize,
+    inp: &mut impl Read,
+) -> Result<()> {
+    let mut done = 0;
     let mut v = vec![0u8; CHUNK.min(bytes)];
-    while off < bytes {
-        let n = (bytes - off).min(v.len());
+    while done < bytes {
+        let n = (bytes - done).min(v.len());
         inp.read_exact(&mut v[..n])?;
-        g.put(&v[..n], b, off)?;
-        off += n;
+        g.put(&v[..n], b, offset + done)?;
+        done += n;
     }
     Ok(())
 }
@@ -816,5 +1472,179 @@ mod tests {
         assert_eq!(std::fs::read(&dst).unwrap(), b"old");
         assert!(!tmp.exists(), "temp left after an aborted save");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // Segmented payload headers are pure CPU framing; these tests do not need a GPU.
+
+    fn put_u32(buf: &mut [u8], off: usize, v: u32) {
+        buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn put_u64(buf: &mut [u8], off: usize, v: u64) {
+        buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// A `STRKVSEG` stream assembled without validation, for corrupt-header tests.
+    fn kv_header_bytes(start: u64, end: u64, parts: &[Vec<u64>]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&KV_SEGMENT_MAGIC);
+        v.extend_from_slice(&SEGMENT_VERSION.to_le_bytes());
+        v.extend_from_slice(&start.to_le_bytes());
+        v.extend_from_slice(&end.to_le_bytes());
+        v.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+        for part in parts {
+            v.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            for &row in part {
+                v.extend_from_slice(&row.to_le_bytes());
+            }
+        }
+        v
+    }
+
+    /// A `STRRSEG` stream assembled without validation, for corrupt-header tests.
+    fn recurrent_header_bytes(ple_prev: [i64; 2], parts: &[Vec<u64>]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&RECURRENT_SEGMENT_MAGIC);
+        v.extend_from_slice(&SEGMENT_VERSION.to_le_bytes());
+        for value in ple_prev {
+            v.extend_from_slice(&(value as u64).to_le_bytes());
+        }
+        v.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+        for part in parts {
+            v.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            for &len in part {
+                v.extend_from_slice(&len.to_le_bytes());
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn kv_segment_header_round_trip() {
+        let parts = vec![vec![128, 64], vec![256]];
+        let mut buf = Vec::new();
+        let payload_len = write_kv_segment_header(&mut buf, 10, 20, &parts).unwrap();
+        assert_eq!(payload_len, (128 + 64 + 256) * 10);
+        let header = read_kv_segment_header(&mut &buf[..]).unwrap();
+        assert_eq!(
+            header,
+            KvSegmentHeader { start: 10, end: 20, parts: parts.clone(), payload_len }
+        );
+
+        // A model part with no attention layer describes zero buffers; the payload is then just the header.
+        let mut buf = Vec::new();
+        assert_eq!(write_kv_segment_header(&mut buf, 0, 8, &[vec![]]).unwrap(), 0);
+        let header = read_kv_segment_header(&mut &buf[..]).unwrap();
+        assert!(header.parts[0].is_empty());
+        assert_eq!(header.payload_len, 0);
+    }
+
+    #[test]
+    fn kv_segment_header_rejects_bad_magic_version_and_range() {
+        let good = kv_header_bytes(0, 4, &[vec![128]]);
+
+        let mut bad = good.clone();
+        bad[0] ^= 0xff;
+        let err = read_kv_segment_header(&mut &bad[..]).unwrap_err();
+        assert!(err.to_string().contains("bad KV segment magic"), "{err}");
+
+        let mut bad = good.clone();
+        put_u32(&mut bad, 8, SEGMENT_VERSION + 1);
+        let err = read_kv_segment_header(&mut &bad[..]).unwrap_err();
+        assert!(err.to_string().contains("unsupported KV segment version"), "{err}");
+
+        let mut bad = good.clone();
+        put_u64(&mut bad, 20, 0);
+        let err = read_kv_segment_header(&mut &bad[..]).unwrap_err();
+        assert!(err.to_string().contains("empty or reversed"), "{err}");
+
+        let mut bad = good.clone();
+        bad.truncate(bad.len() - 2);
+        assert!(read_kv_segment_header(&mut &bad[..]).is_err());
+    }
+
+    #[test]
+    fn kv_segment_header_rejects_bad_counts_and_lengths() {
+        let good = kv_header_bytes(0, 4, &[vec![128, 256]]);
+
+        let mut bad = good.clone();
+        put_u32(&mut bad, 28, 0);
+        let err = read_kv_segment_header(&mut &bad[..]).unwrap_err();
+        assert!(err.to_string().contains("parts"), "{err}");
+
+        let mut bad = good.clone();
+        put_u32(&mut bad, 28, (MAX_SEGMENT_PARTS + 1) as u32);
+        let err = read_kv_segment_header(&mut &bad[..]).unwrap_err();
+        assert!(err.to_string().contains("parts"), "{err}");
+
+        let mut bad = good.clone();
+        put_u32(&mut bad, 32, (MAX_SEGMENT_BUFFERS + 1) as u32);
+        let err = read_kv_segment_header(&mut &bad[..]).unwrap_err();
+        assert!(err.to_string().contains("buffers"), "{err}");
+
+        let mut bad = good.clone();
+        put_u64(&mut bad, 36, 0);
+        let err = read_kv_segment_header(&mut &bad[..]).unwrap_err();
+        assert!(err.to_string().contains("zero row size"), "{err}");
+
+        let mut bad = good.clone();
+        put_u64(&mut bad, 36, MAX_SEGMENT_BUFFER_LEN + 1);
+        let err = read_kv_segment_header(&mut &bad[..]).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+
+        // A payload length that does not fit u64 is rejected while reading the header.
+        let bad = kv_header_bytes(0, 1 << 40, &[vec![MAX_SEGMENT_BUFFER_LEN]]);
+        let err = read_kv_segment_header(&mut &bad[..]).unwrap_err();
+        assert!(err.to_string().contains("overflow"), "{err}");
+    }
+
+    #[test]
+    fn recurrent_segment_header_round_trip() {
+        let header = RecurrentSegmentHeader {
+            ple_prev: [-1, 0x1_0000_0002],
+            parts: vec![vec![8, 16], vec![32]],
+        };
+        let mut buf = Vec::new();
+        write_recurrent_segment_header(&mut buf, &header).unwrap();
+        let got = read_recurrent_segment_header(&mut &buf[..]).unwrap();
+        assert_eq!(got, header);
+    }
+
+    #[test]
+    fn recurrent_segment_header_rejects_bad_magic_version_and_counts() {
+        let good = recurrent_header_bytes([3, 4], &[vec![8]]);
+
+        let mut bad = good.clone();
+        bad[1] ^= 0xff;
+        let err = read_recurrent_segment_header(&mut &bad[..]).unwrap_err();
+        assert!(err.to_string().contains("bad recurrent segment magic"), "{err}");
+
+        let mut bad = good.clone();
+        put_u32(&mut bad, 7, SEGMENT_VERSION + 1);
+        let err = read_recurrent_segment_header(&mut &bad[..]).unwrap_err();
+        assert!(err.to_string().contains("unsupported recurrent segment version"), "{err}");
+
+        let mut bad = good.clone();
+        put_u32(&mut bad, 27, 0);
+        let err = read_recurrent_segment_header(&mut &bad[..]).unwrap_err();
+        assert!(err.to_string().contains("parts"), "{err}");
+
+        let mut bad = good.clone();
+        put_u32(&mut bad, 27, (MAX_SEGMENT_PARTS + 1) as u32);
+        assert!(read_recurrent_segment_header(&mut &bad[..]).is_err());
+
+        let mut bad = good.clone();
+        put_u32(&mut bad, 31, (MAX_SEGMENT_BUFFERS + 1) as u32);
+        let err = read_recurrent_segment_header(&mut &bad[..]).unwrap_err();
+        assert!(err.to_string().contains("buffers"), "{err}");
+
+        let mut bad = good.clone();
+        put_u64(&mut bad, 35, MAX_SEGMENT_BUFFER_LEN + 1);
+        let err = read_recurrent_segment_header(&mut &bad[..]).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+
+        let mut bad = good.clone();
+        bad.truncate(bad.len() - 1);
+        assert!(read_recurrent_segment_header(&mut &bad[..]).is_err());
     }
 }
