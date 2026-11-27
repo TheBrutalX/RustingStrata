@@ -78,7 +78,9 @@ model-thread stall.
 - **Locking:** the archive mutex is not held during GPU copies; the writer/reader takes it per phase. `finish`
   still waits for the final state/manifest commit, so the model thread can wait for that commit at the end.
 - **Benchmark:** the explicit-checkpoint path remains synchronous by design; the async automatic path is exercised
-  by the archive/dedup E2E. The separate async phase measurement is recorded in `tests/archive_phase_bench.rs`.
+  by the archive/dedup E2E. `tests/archive_phase_bench.rs` measured the async sink path on the same 22.5k-token
+  f16 state at **546 ms total** versus **930 ms** for the synchronous `save_segmented` (GPU copies + overlapped
+  segment disk writes + final commit), about a 41% reduction.
 
 ## 1. What phase 1 actually does
 
