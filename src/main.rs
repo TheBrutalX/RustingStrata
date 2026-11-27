@@ -10,7 +10,7 @@ use rusting_strata::model::{Model, State};
 use rusting_strata::{backend, gpu_model::GpuModel};
 use rusting_strata::{config::ModelConfig, gguf::Gguf, hf, ops, ops::Sampler, quant::GgmlType, serve, tokenizer::Tokenizer};
 use rusting_strata::chat::{Hold, Msg, Template, Think};
-use rusting_strata::slot_archive::{self, Archive, ArchiveConfig, ArchiveEntry, SaveSlot};
+use rusting_strata::slot_archive::{self, Archive, ArchiveConfig, ArchiveEntry, Lease, SaveSlot};
 use rusting_strata::vision::{self, VisionProjector};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -304,6 +304,20 @@ struct Hosting {
     /// Archive entries kept per conversation lineage [default: 1].
     #[arg(long, value_name = "N", default_value_t = 1)]
     slot_archive_versions: usize,
+    /// Delete archived conversations unused for this long. Units are `d`, `h`, `m` or `s` (a plain number is
+    /// seconds), for example `30d` or `12h`; `0` disables the TTL [default: 0, off]. Pinned entries never expire,
+    /// and the TTL is applied by GC and by a new checkpoint, not on a timer.
+    #[arg(long, value_name = "DURATION", default_value = "0")]
+    slot_archive_ttl: String,
+    /// Archive quota per conversation owner, in GiB (0 = off) [default: 0]. At a checkpoint the owner's least
+    /// recently used entries are evicted first; another owner's entries are never touched. 25% of the global
+    /// budget (or 20 GiB) is a sensible value on a shared server.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    slot_archive_per_key_gb: u64,
+    /// Cap on the bytes an admin may pin, in GiB [default: 10% of `--slot-archive-gb`; `0` = no cap]. The pin cap
+    /// is a safety valve, not a target: a pin route that would exceed it answers 409.
+    #[arg(long, value_name = "N")]
+    slot_archive_pin_gb: Option<u64>,
     /// Free the model (its VRAM and its memory in this process) after this many seconds without a chat request. The
     /// next chat request loads it again, with the same options, and is answered after the load.
     #[arg(long, value_name = "SECONDS")]
@@ -1984,6 +1998,20 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     }
                     anyhow::ensure!(host.slot_archive_gb > 0, "--slot-archive-gb must be at least 1");
                     anyhow::ensure!(host.slot_archive_versions > 0, "--slot-archive-versions must be at least 1");
+                    anyhow::ensure!(
+                        host.slot_archive_per_key_gb == 0 || host.slot_archive_per_key_gb <= host.slot_archive_gb,
+                        "--slot-archive-per-key-gb {} cannot exceed --slot-archive-gb {}",
+                        host.slot_archive_per_key_gb,
+                        host.slot_archive_gb
+                    );
+                    anyhow::ensure!(
+                        host.slot_archive_pin_gb.is_none_or(|g| g <= host.slot_archive_gb),
+                        "--slot-archive-pin-gb {} cannot exceed --slot-archive-gb {}",
+                        host.slot_archive_pin_gb.unwrap_or_default(),
+                        host.slot_archive_gb
+                    );
+                    let ttl_ms = parse_ttl(&host.slot_archive_ttl)
+                        .with_context(|| format!("--slot-archive-ttl {:?}", host.slot_archive_ttl))?;
                     let cfg = ArchiveConfig {
                         dir: dir.clone(),
                         budget_bytes: host.slot_archive_gb.saturating_mul(1 << 30),
@@ -1991,9 +2019,18 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         min_delta: host.slot_archive_min_delta,
                         versions: host.slot_archive_versions,
                     };
-                    let a = Archive::open(cfg).with_context(|| format!("opening the slot archive at {}", dir.display()))?;
-                    say!("slot archive: {} ({} GiB, min {} tokens, min delta {}, {} version(s) per lineage)",
-                        dir.display(), host.slot_archive_gb, host.slot_archive_min_tokens, host.slot_archive_min_delta, host.slot_archive_versions);
+                    let budget_bytes = cfg.budget_bytes;
+                    let per_key_bytes = host.slot_archive_per_key_gb.saturating_mul(1 << 30);
+                    // The default pin cap follows docs/SLOT-ARCHIVE-PHASE2.md §15: 10% of the budget. An explicit
+                    // 0 means "no cap"; the pin route itself is admin-only.
+                    let pin_bytes = host.slot_archive_pin_gb
+                        .map_or(budget_bytes / 10, |gb| gb.saturating_mul(1 << 30));
+                    let mut a = Archive::open(cfg).with_context(|| format!("opening the slot archive at {}", dir.display()))?;
+                    a.set_policy(ttl_ms, per_key_bytes, pin_bytes);
+                    say!("slot archive: {} ({} GiB, min {} tokens, min delta {}, {} version(s) per lineage; ttl {}, per-key {} GiB, pin cap {})",
+                        dir.display(), host.slot_archive_gb, host.slot_archive_min_tokens, host.slot_archive_min_delta, host.slot_archive_versions,
+                        host.slot_archive_ttl, host.slot_archive_per_key_gb,
+                        if pin_bytes == 0 { "off".to_string() } else { format!("{pin_bytes} bytes") });
                     Some(std::sync::Arc::new(std::sync::Mutex::new(a)))
                 }
                 None => None,
@@ -2109,14 +2146,14 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         && (k.any() || serve::host_ok(&r.host, &a, &allowed)) && k.who(&r.auth).is_some_and(|w| w.admin) {
                         if r.path == "/metrics" {
                             let mut b = st.lock().unwrap().prometheus(oc.load(Relaxed) - 1, t0.elapsed().as_secs());
-                            if let Some(a) = &ar && let Ok(a) = a.lock() { archive_prometheus(&a.stats(), &mut b); }
+                            if let Some(a) = &ar && let Ok(a) = a.lock() { archive_prometheus(&a.stats(), a.pinned_bytes(), &mut b); }
                             let _ = write!(&c, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
                             oc.fetch_sub(1, Relaxed);
                             return;
                         }
                         let mut v = json!(*st.lock().unwrap());
                         (v["system"], v["uptime_s"]) = (serve::system(), t0.elapsed().as_secs().into());
-                        if let Some(a) = &ar && let Ok(a) = a.lock() { v["archive"] = archive_metrics(&a.stats()); }
+                        if let Some(a) = &ar && let Ok(a) = a.lock() { v["archive"] = archive_metrics(&a.stats(), a.pinned_bytes()); }
                         return reply(v, "200 OK");
                     }
                     // MCP tools for the page. Answered here: a tool can run for minutes and must not hold the model's
@@ -3527,6 +3564,27 @@ impl Serving {
 /// The archive handle shared by the serving loop, the scheduler and the explicit routes.
 type ArchiveHandle = std::sync::Arc<std::sync::Mutex<Archive>>;
 
+/// Parse a `--slot-archive-ttl` duration into milliseconds. A plain number means seconds; `d`, `h`, `m` and `s`
+/// are the units, and `0` disables the TTL. Fractions are refused rather than silently rounded.
+fn parse_ttl(s: &str) -> anyhow::Result<u64> {
+    let t = s.trim();
+    anyhow::ensure!(!t.is_empty(), "empty duration: use a number with an optional d, h, m or s unit");
+    let (digits, unit) = match t.find(|c: char| !c.is_ascii_digit()) {
+        Some(i) => t.split_at(i),
+        None => (t, ""),
+    };
+    anyhow::ensure!(!digits.is_empty(), "missing number in {t:?}: use a number with an optional d, h, m or s unit");
+    let n: u64 = digits.parse().with_context(|| format!("{digits:?} is not a whole number of units"))?;
+    let per_unit = match unit.to_ascii_lowercase().as_str() {
+        "" | "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        other => anyhow::bail!("unknown unit {other:?}: use d, h, m or s"),
+    };
+    n.checked_mul(per_unit).context("duration is too large")
+}
+
 /// One successful checkpoint's metadata, for the explicit `action=checkpoint` answer.
 struct CheckpointInfo { id: String, n_saved: usize, n_written: u64, save_ms: f64 }
 
@@ -3586,10 +3644,12 @@ fn checkpoint_slot(archive: &ArchiveHandle, g: &mut GpuModel, slot: usize, targe
     }
 }
 
-/// Look an exact archived prefix up. Errors and misses are logged but never fail the request.
-fn archive_lookup(archive: &ArchiveHandle, owner: u64, ids: &[u32], keep: usize, fingerprint: u64, ctx: usize) -> Option<ArchiveEntry> {
+/// Look an exact archived prefix up, taking a lease that protects it from DELETE and GC. Errors and misses are
+/// logged but never fail the request. The caller must keep the lease until the restore (or until it abandons the
+/// lookup); dropping it early reopens the phase-1 "deleted between lookup and restore" race.
+fn archive_lookup(archive: &ArchiveHandle, owner: u64, ids: &[u32], keep: usize, fingerprint: u64, ctx: usize) -> Option<(ArchiveEntry, Lease)> {
     let mut a = match archive.lock() { Ok(a) => a, Err(_) => return None };
-    match a.lookup(owner, ids, keep, fingerprint, ctx) {
+    match a.lookup_leased(owner, ids, keep, fingerprint, ctx) {
         Ok(hit) => hit,
         Err(e) => { a.note_failure(); say!("archive: lookup: {e:#}"); None }
     }
@@ -3616,7 +3676,9 @@ fn archive_restore(archive: &ArchiveHandle, g: &mut GpuModel, slot: usize, entry
 /// prefill path in place (docs/SLOT-ARCHIVE.md §13).
 fn archive_before_single(archive: &ArchiveHandle, g: &mut GpuModel, owner: u64, ids: &[u32], keep: usize) {
     let hit = archive_lookup(archive, owner, ids, keep, g.slot_fingerprint(), g.ctx());
-    if let Some(hit) = hit && hit.n_tokens <= keep {
+    // The lease lives until the restore finishes (or the block is left without one). It cannot outlive this
+    // function, and no queue wait happens while it is held.
+    if let Some((hit, _lease)) = hit && hit.n_tokens <= keep {
         let (sv, o) = g.slot_saved(0);
         let ram = if o == owner && ids[..keep].starts_with(sv) { sv.len() } else { 0 };
         if hit.n_tokens > ram {
@@ -3633,6 +3695,8 @@ fn archive_before_single(archive: &ArchiveHandle, g: &mut GpuModel, owner: u64, 
                 }
             }
         }
+        // `_lease` is dropped here: the restore was not attempted (blocked, or RAM already had it), or it failed
+        // and left the entry unused, so nothing protects it any more.
     }
     // The prompt diverges from the slot's history (switch or compact): save it before `prefill_cached` resets it.
     let h = g.slot_tokens(0).to_vec();
@@ -3650,23 +3714,35 @@ fn archive_before_single(archive: &ArchiveHandle, g: &mut GpuModel, owner: u64, 
 }
 
 /// The archive metrics shared by `/metrics` and `/api/stats`.
-fn archive_metrics(s: &slot_archive::ArchiveStats) -> Value {
+fn archive_metrics(s: &slot_archive::ArchiveStats, pinned_bytes: u64) -> Value {
     json!({"entries": s.entries, "bytes": s.bytes, "budget_bytes": s.budget_bytes, "hits": s.hits, "misses": s.misses,
-        "restores": s.restores, "evictions": s.evictions, "failures": s.failures})
+        "restores": s.restores, "evictions": s.evictions, "expired": s.expired, "failures": s.failures,
+        "pinned_bytes": pinned_bytes})
 }
 
-fn archive_prometheus(s: &slot_archive::ArchiveStats, out: &mut String) {
+fn archive_prometheus(s: &slot_archive::ArchiveStats, pinned_bytes: u64, out: &mut String) {
     let mut m = |name: &str, kind: &str, help: &str, v: u64| {
         out.push_str(&format!("# HELP strata_{name} {help}\n# TYPE strata_{name} {kind}\nstrata_{name} {v}\n"));
     };
     m("slot_archive_entries", "gauge", "Conversations in the slot archive.", s.entries as u64);
     m("slot_archive_bytes", "gauge", "Logical bytes in the slot archive.", s.bytes);
     m("slot_archive_budget_bytes", "gauge", "Logical budget of the slot archive.", s.budget_bytes);
+    m("slot_archive_pinned_bytes", "gauge", "Logical bytes held by pinned archive entries.", pinned_bytes);
     m("slot_archive_hits_total", "counter", "Archive lookups that matched a saved prefix.", s.hits);
     m("slot_archive_misses_total", "counter", "Archive lookups with no match.", s.misses);
     m("slot_archive_restores_total", "counter", "Successful restores from the archive.", s.restores);
     m("slot_archive_evictions_total", "counter", "Entries removed by the archive budget.", s.evictions);
+    m("slot_archive_expired_total", "counter", "Entries removed by the archive TTL.", s.expired);
     m("slot_archive_failures_total", "counter", "Archive save/restore/lookup failures.", s.failures);
+}
+
+/// Outcome of an admin `action=pin|unpin` request, before it is turned into an HTTP status.
+enum PinResult {
+    Done,
+    Missing,
+    /// Pinning would exceed the policy's pin cap; the tuple is `(after, cap)` in bytes.
+    OverCap { after: u64, cap: u64 },
+    Failed(anyhow::Error),
 }
 
 /// An explicit slot-file operation requested by the admin HTTP routes.
@@ -4057,7 +4133,10 @@ impl Serving {
                     if let Some(archive) = &self.archive {
                         let (sv, o) = g.slot_saved(sl);
                         let ram = if o == *owner && ids[..*keep].starts_with(sv) { sv.len() } else { 0 };
-                        if let Some(hit) = archive_lookup(archive, *owner, ids, *keep, g.slot_fingerprint(), g.ctx())
+                        // The lease protects the chosen hit only until this iteration has tried the restore. Every
+                        // early exit below (RAM already longer, no free slot, blocked unified growth) leaves the
+                        // block with `_lease` still unused and drops it before admission continues.
+                        if let Some((hit, _lease)) = archive_lookup(archive, *owner, ids, *keep, g.slot_fingerprint(), g.ctx())
                             && hit.n_tokens <= *keep && hit.n_tokens > ram
                             && let Some(rs) = (0..n).filter(|&i| free(i))
                                 .min_by_key(|&i| (if g.slot_tokens(i).is_empty() { 0u8 } else { 1 }, s.freed[i])) {
@@ -4472,13 +4551,13 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, mut l: Option<&mu
             let owner = query.split('&').find_map(|kv| kv.strip_prefix("owner=")).and_then(|v| v.parse::<u64>().ok());
             let fingerprint = query.split('&').find_map(|kv| kv.strip_prefix("fingerprint="))
                 .and_then(|v| u64::from_str_radix(v, 16).ok());
-            let (dir, budget, used, entries) = {
+            let (dir, budget, used, pinned_bytes, entries) = {
                 let a = match archive.lock() { Ok(a) => a, Err(_) => return send(&mut w, "500 Internal Server Error", json!({"error": {"message": "slot archive lock poisoned", "type": "server_error"}})) };
                 let st = a.stats();
                 let mut entries = a.list(owner, 0);
                 if let Some(fp) = fingerprint { entries.retain(|e| e.fingerprint == fp); }
                 if limit > 0 { entries.truncate(limit); }
-                (a.config().dir.display().to_string(), st.budget_bytes, st.bytes, entries)
+                (a.config().dir.display().to_string(), st.budget_bytes, st.bytes, a.pinned_bytes(), entries)
             };
             let entries: Vec<Value> = entries.into_iter().map(|e| json!({
                 "id": e.id,
@@ -4491,7 +4570,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, mut l: Option<&mu
                 "reason": e.reason,
                 "fingerprint": format!("{:016x}", e.fingerprint),
             })).collect();
-            send(&mut w, "200 OK", json!({"dir": dir, "budget_bytes": budget, "used_bytes": used, "entries": entries}))
+            send(&mut w, "200 OK", json!({"dir": dir, "budget_bytes": budget, "used_bytes": used, "pinned_bytes": pinned_bytes, "entries": entries}))
         }
         ("DELETE", r) if r.starts_with("/slots/archive/") => {
             let Some(archive) = &s.archive else {
@@ -4503,7 +4582,19 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, mut l: Option<&mu
             if id.is_empty() || id.contains('/') {
                 return send(&mut w, "400 Bad Request", json!({"error": {"message": "Invalid archive entry id", "type": "invalid_request_error"}}));
             }
-            let res = match archive.lock() { Ok(mut a) => a.delete(id), Err(_) => Err(anyhow::anyhow!("slot archive lock poisoned")) };
+            let mut a = match archive.lock() { Ok(a) => a, Err(_) => return send(&mut w, "500 Internal Server Error", json!({"error": {"message": "slot archive lock poisoned", "type": "server_error"}})) };
+            // A lease means a restore is reading the file: deleting it now would pull the file out from under that
+            // restore, so answer a clear conflict instead of the core's lease error. The check and the delete share
+            // the archive lock, so no new lease can slip in between them.
+            let held = a.leases(id);
+            if held > 0 {
+                drop(a);
+                return send(&mut w, "409 Conflict", json!({"error": {
+                    "message": format!("archive entry {id} is leased by {held} in-flight restore(s); retry after it completes"),
+                    "type": "conflict"}}));
+            }
+            let res = a.delete(id);
+            drop(a);
             match res {
                 Ok(freed) => send(&mut w, "200 OK", json!({"id": id, "deleted": true, "freed_bytes": freed})),
                 Err(err) => send(&mut w, "404 Not Found", json!({"error": {"message": format!("{err:#}"), "type": "not_found"}})),
@@ -4517,8 +4608,63 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, mut l: Option<&mu
             };
             let res = match archive.lock() { Ok(mut a) => a.gc(), Err(_) => Err(anyhow::anyhow!("slot archive lock poisoned")) };
             match res {
-                Ok(r) => send(&mut w, "200 OK", json!({"evicted": r.evicted, "freed_bytes": r.freed_bytes})),
+                Ok(r) => send(&mut w, "200 OK", json!({"evicted": r.evicted, "expired": r.expired, "freed_bytes": r.freed_bytes})),
                 Err(err) => send(&mut w, "500 Internal Server Error", json!({"error": {"message": format!("{err:#}"), "type": "server_error"}})),
+            }
+        }
+        // Admin pin/unpin of one archive entry: `POST /slots/archive/{id}?action=pin|unpin`. It must answer before
+        // the generic `/slots/{id}` parser below, which would treat the entry id as a slot number. The body is
+        // ignored (the existing POST content-type check still applies).
+        ("POST", r) if r.starts_with("/slots/archive/") => {
+            let Some(archive) = &s.archive else {
+                return send(&mut w, "501 Not Implemented", json!({"error": {
+                    "message": "This server does not have a slot archive. Start it with `--slot-archive-dir`",
+                    "type": "not_supported"}}));
+            };
+            let id = r.trim_start_matches("/slots/archive/");
+            if id.is_empty() || id.contains('/') {
+                return send(&mut w, "400 Bad Request", json!({"error": {"message": "Invalid archive entry id", "type": "invalid_request_error"}}));
+            }
+            let query = path.split('?').nth(1).unwrap_or("");
+            let pinned = match query.split('&').find_map(|kv| kv.strip_prefix("action=")).unwrap_or("") {
+                "pin" => true,
+                "unpin" => false,
+                other => return send(&mut w, "400 Bad Request", json!({"error": {
+                    "message": format!("Invalid archive action {other:?}: use action=pin or action=unpin"),
+                    "type": "invalid_request_error"}})),
+            };
+            let res = match archive.lock() {
+                Ok(mut a) => {
+                    // `set_pinned` has no getter by id, and a missing id must be 404 rather than a pin-cap 409.
+                    match a.list(None, 0).into_iter().find(|e| e.id == id) {
+                        None => PinResult::Missing,
+                        Some(entry) => {
+                            // Mirror the core's documented cap rule so the HTTP answer is a conflict rather than
+                            // a string-matched error. Already-pinned entries add no bytes.
+                            let cap = a.policy().2;
+                            let after = if pinned && !entry.pinned {
+                                a.pinned_bytes().saturating_add(entry.bytes)
+                            } else { a.pinned_bytes() };
+                            if pinned && cap > 0 && after > cap {
+                                PinResult::OverCap { after, cap }
+                            } else {
+                                match a.set_pinned(id, pinned) {
+                                    Ok(()) => PinResult::Done,
+                                    Err(err) => PinResult::Failed(err),
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => return send(&mut w, "500 Internal Server Error", json!({"error": {"message": "slot archive lock poisoned", "type": "server_error"}})),
+            };
+            match res {
+                PinResult::Done => send(&mut w, "200 OK", json!({"id": id, "pinned": pinned})),
+                PinResult::OverCap { after, cap } => send(&mut w, "409 Conflict", json!({"error": {
+                    "message": format!("pinning {id} would use {after} pinned bytes, over the {cap}-byte pin cap"),
+                    "type": "conflict"}})),
+                PinResult::Failed(err) => send(&mut w, "500 Internal Server Error", json!({"error": {"message": format!("{err:#}"), "type": "server_error"}})),
+                PinResult::Missing => send(&mut w, "404 Not Found", json!({"error": {"message": format!("no archive entry {id}"), "type": "not_found"}})),
             }
         }
         ("POST", r) if r.starts_with("/slots/") => {
@@ -5630,5 +5776,30 @@ mod kv_type_tests {
     fn invalid_types_are_rejected() {
         assert!(effective_kv("f16", Some("bogus"), None).is_err());
         assert!(effective_kv("f16", None, Some("turbo9")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod archive_ttl_tests {
+    use super::parse_ttl;
+
+    #[test]
+    fn ttl_accepts_units_and_zero() {
+        assert_eq!(parse_ttl("0").unwrap(), 0);
+        assert_eq!(parse_ttl("0d").unwrap(), 0);
+        assert_eq!(parse_ttl("30d").unwrap(), 30 * 86_400_000);
+        assert_eq!(parse_ttl("12h").unwrap(), 12 * 3_600_000);
+        assert_eq!(parse_ttl("15m").unwrap(), 15 * 60_000);
+        assert_eq!(parse_ttl("45s").unwrap(), 45_000);
+        // A bare number is seconds, and the unit is case-insensitive.
+        assert_eq!(parse_ttl("90").unwrap(), 90_000);
+        assert_eq!(parse_ttl("2D").unwrap(), 2 * 86_400_000);
+    }
+
+    #[test]
+    fn ttl_rejects_bad_values() {
+        for bad in ["", " ", "-1", "1.5h", "12x", "d", "30 d", "h30", "99999999999999999999d"] {
+            assert!(parse_ttl(bad).is_err(), "{bad:?} should be refused");
+        }
     }
 }
