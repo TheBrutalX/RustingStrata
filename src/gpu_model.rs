@@ -1407,8 +1407,14 @@ impl<'a> GpuModel<'a> {
 
 
 
-    /// Context size in tokens (per slot).
+    /// Context size in tokens (per slot; the total budget with `--kv-unified`).
     pub fn ctx(&self) -> usize { self.ctx }
+
+    /// Positions each slot's KV currently holds (empty when every slot holds `ctx`).
+    pub fn kv_caps(&self) -> &[usize] { &self.kv_cap }
+
+    /// Whether the slots share one `--ctx` budget (`--kv-unified`).
+    pub fn kv_unified(&self) -> bool { self.kv_budget > 0 }
 
     fn slot_pos(&mut self, s: usize) -> &mut usize { if s == self.cur { &mut self.pos } else { &mut self.seqs[s].pos } }
 
@@ -1421,12 +1427,18 @@ impl<'a> GpuModel<'a> {
         if let Some(n) = self.next.as_mut() { n.kv_need(s, upto)?; }
         let Some(&cap) = self.kv_cap.get(s) else { return Ok(()) };
         if upto <= cap || upto > self.ctx { return Ok(()) }
-        let mut new = upto.max(2 * cap).next_multiple_of(self.kv0).min(self.ctx);
+        let mut new = if self.kv_budget > 0 {
+            // Unified growth is exact: a slot that needs one more token takes one chunk, not twice its share.
+            upto.next_multiple_of(1024).min(self.ctx)
+        } else {
+            upto.max(2 * cap).next_multiple_of(self.kv0).min(self.ctx)
+        };
         if self.kv_budget > 0 {
             // One token per other slot stays reserved, so the sum of the capacities never exceeds the budget.
             let max = self.kv_budget.saturating_sub(self.kv_cap.len().saturating_sub(1));
             anyhow::ensure!(upto <= max, "unified KV budget full: a slot can hold {max} tokens with the other slots reserved");
             new = new.min(max);
+            crate::say!("unified KV: slot {s} needs {upto} > {cap} (growing to {new})");
             self.kv_grow_unified(s, new)
         } else {
             self.kv_resize(s, new, true)
