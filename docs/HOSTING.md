@@ -62,6 +62,12 @@ On the V100 32 GB, `--parallel 4 --ctx 1048576 --kv-unified --kv q8` reserved 10
 experts resident. Four 31k-token prompts completed 4/4 on those 256k slots. An 801,742-token prompt allocated an
 801,792-token slot, prefilled at 368.6 tok/s and generated 4 tokens at 25.3 tok/s in 36m22s; the cap can reach
 1,048,573 (one token per idle slot is reserved).
+
+With `--chunk 16384` the same 1M/4-slot plan keeps all 10,240 experts resident (15,008 MB weights+state+scratch plus
+15,150 MB of expert slots) and four 31k prompts finish in 45.8 s (2,760 tok/s each) instead of 47.8 s at 8192.
+`--chunk 32768` only fits by leaving 223 experts out of VRAM (10,017 of 10,240 resident), so 16384 is the largest
+fully resident chunk. Prompt token embeddings are dequantized in parallel on the CPU and reused by the MTP draft
+layer, which removes the 65-80 ms stalls at the chunk boundaries.
   | `--ctx` | `--kv` | KV for 4 slots | Resident experts | Total |
   |---|---|---|---|---|
   | 16384 | f16 | 1280 MB | 6876 of 10240 | 160 tok/s |
