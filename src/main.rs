@@ -11,7 +11,7 @@ use rusting_strata::{backend, gpu_model::GpuModel};
 use rusting_strata::{config::ModelConfig, gguf::Gguf, hf, ops, ops::Sampler, quant::GgmlType, serve, tokenizer::Tokenizer};
 use rusting_strata::chat::{Hold, Msg, Template, Think};
 use rusting_strata::vision::{self, VisionProjector};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::{collections::BTreeMap, net::{TcpListener, TcpStream}, sync::atomic::Ordering::Relaxed, path::{Path, PathBuf}, time::{Duration, Instant, SystemTime}};
 
@@ -281,6 +281,10 @@ struct Hosting {
     /// can grow past its base share and reclaim the KV of idle slots, up to the total.
     #[arg(long)]
     kv_unified: bool,
+    /// Directory for explicit per-slot state files (`GET /slots`, `POST /slots/{id}?action=save|restore|erase`).
+    /// Without it those endpoints answer 501. Files contain plaintext KV: treat the directory as sensitive.
+    #[arg(long, value_name = "DIR")]
+    slot_save_path: Option<PathBuf>,
     /// Free the model (its VRAM and its memory in this process) after this many seconds without a chat request. The
     /// next chat request loads it again, with the same options, and is answered after the load.
     #[arg(long, value_name = "SECONDS")]
@@ -1947,6 +1951,9 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             // Before the model is loaded: a slot count outside 1..=255 is an invalid request, not a downgrade.
             anyhow::ensure!((1..=255).contains(&engine.parallel), "--parallel {}: 1 to 255 slots", engine.parallel);
             anyhow::ensure!(!engine.kv_unified || engine.parallel > 1, "--kv-unified needs --parallel greater than 1");
+            if let Some(p) = &host.slot_save_path {
+                anyhow::ensure!(p.is_dir(), "--slot-save-path {} is not a directory", p.display());
+            }
             let api_key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
             anyhow::ensure!(api_key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
             let mut allowed_hosts = host.allowed_hosts.clone();
@@ -2157,7 +2164,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 });
             });
             let s = Serving { rx: rx.into(), waiting, stop, addr, allowed_hosts, keys, usage, max_tokens: host.max_tokens.unwrap_or(usize::MAX), dir, model: model.clone(), extra,
-                dl: Default::default(), stats, opts: Default::default(), idle: host.auto_unload.map(Duration::from_secs), asleep: Default::default(), parked: Default::default(), alias: host.alias };
+                dl: Default::default(), stats, opts: Default::default(), idle: host.auto_unload.map(Duration::from_secs),
+                slot_save_path: host.slot_save_path.clone(), asleep: Default::default(), parked: Default::default(), alias: host.alias };
             // The model to load next and the /api/load request waiting for the outcome (none for --model).
             let mut next = model.map(|p| (p, None));
             say!("listening on {} (models folder: {})", term::hl(&url), s.dir.display());
@@ -3347,6 +3355,8 @@ struct Serving {
     opts: std::sync::Mutex<serde_json::Value>,
     /// `--auto-unload`: the model is freed after this long without a chat request.
     idle: Option<Duration>,
+    /// `--slot-save-path`: directory of explicit slot state files; the endpoints answer 501 without it.
+    slot_save_path: Option<PathBuf>,
     /// The model `--auto-unload` freed (while another loads for a chat request: the model to go back to if that load
     /// fails), and the chat request that waits for a load (answered once the model has loaded).
     asleep: std::sync::Mutex<Option<PathBuf>>,
@@ -3465,6 +3475,13 @@ impl Serving {
     }
 }
 
+/// An explicit slot-file operation requested by the admin HTTP routes.
+enum SlotAction {
+    Save { slot: usize, path: PathBuf, owner: u64 },
+    Restore { slot: usize, path: PathBuf, force: bool },
+    Erase { slot: usize },
+}
+
 /// What a request thread asks of the model's thread under `--parallel` (`Serving::serve_slots`).
 enum Job {
     /// `prefill_cached` in a free slot; answers the logits, the tokens reused, the slot and when the prefill began.
@@ -3476,6 +3493,10 @@ enum Job {
     Step { slot: usize, token: u32, logits: bool, back: std::sync::mpsc::Sender<anyhow::Result<(u32, Vec<f32>)>> },
     /// The request is done with its slot.
     Done(usize),
+    /// Explicit slot save/restore/erase; answered with the JSON body of the HTTP route.
+    Slot { action: SlotAction, back: std::sync::mpsc::Sender<anyhow::Result<Value>> },
+    /// `GET /slots`; answered on the model thread so it sees `held`/`pinned` and the slot histories.
+    Slots { back: std::sync::mpsc::Sender<anyhow::Result<Value>> },
 }
 
 /// A request's handle on the model under `--parallel`; dropping it frees the slot.
@@ -3491,6 +3512,25 @@ impl Client {
     fn chat_image(&mut self, p: &vision::Prompt, embs: &[Vec<Vec<f32>>]) -> anyhow::Result<Vec<f32>> {
         let (p, embs) = (p.clone(), embs.to_vec());
         Ok(self.submit(|owner, gone, back| Job::Image { p, embs, owner, gone, back })?.0)
+    }
+
+    /// Send one explicit slot operation to the model thread and wait for its JSON answer.
+    fn control(&mut self, job: impl FnOnce(std::sync::mpsc::Sender<anyhow::Result<Value>>) -> Job) -> anyhow::Result<Value> {
+        let (back, r) = std::sync::mpsc::channel();
+        self.tx.send(job(back)).map_err(|_| anyhow::anyhow!("model gone"))?;
+        r.recv()?
+    }
+    fn slot_save(&mut self, slot: usize, path: PathBuf, owner: u64) -> anyhow::Result<Value> {
+        self.control(|back| Job::Slot { action: SlotAction::Save { slot, path, owner }, back })
+    }
+    fn slot_restore(&mut self, slot: usize, path: PathBuf, force: bool) -> anyhow::Result<Value> {
+        self.control(|back| Job::Slot { action: SlotAction::Restore { slot, path, force }, back })
+    }
+    fn slot_erase(&mut self, slot: usize) -> anyhow::Result<Value> {
+        self.control(|back| Job::Slot { action: SlotAction::Erase { slot }, back })
+    }
+    fn slots_info(&mut self) -> anyhow::Result<Value> {
+        self.control(|back| Job::Slots { back })
     }
     /// Send a prompt job and wait for its slot.
     fn submit(&mut self, job: impl FnOnce(u64, std::sync::Arc<std::sync::atomic::AtomicBool>, std::sync::mpsc::Sender<anyhow::Result<(Vec<f32>, usize, usize, Instant)>>) -> Job)
@@ -3541,7 +3581,13 @@ struct Sched {
     chats: std::collections::VecDeque<Job>,
     steps: Vec<(usize, u32, bool, std::sync::mpsc::Sender<anyhow::Result<(u32, Vec<f32>)>>)>,
     since: Option<Instant>,
+    /// Explicit slot operations, deferred while their slot is held or prefilling.
+    controls: std::collections::VecDeque<Control>,
+    /// Restored slots that must not be reclaimed by `kv_grow_unified` while idle.
+    pinned: Vec<bool>,
 }
+
+enum Control { Action(SlotAction, std::sync::mpsc::Sender<anyhow::Result<Value>>), Info(std::sync::mpsc::Sender<anyhow::Result<Value>>) }
 
 impl Sched {
     /// How long a decode step waits for the other decoding slots' steps to share its forward.
@@ -3550,7 +3596,9 @@ impl Sched {
     fn decoding(&self) -> usize { self.held.iter().filter(|&&h| h).count() }
 
     /// Slots a request holds or is prefilling now; `GpuModel` may reclaim only from the others.
-    fn active(&self) -> Vec<bool> { self.held.iter().zip(&self.prefill).map(|(&h, &p)| h || p).collect() }
+    fn active(&self) -> Vec<bool> {
+        (0..self.held.len()).map(|i| self.held[i] || self.prefill[i] || self.pinned.get(i).copied().unwrap_or(false)).collect()
+    }
 
     /// The queued chat to start next: the one whose key holds the fewest slots, the oldest among those, so that one
     /// customer's burst of requests does not hold back the others'. With one key (or none) it is the oldest.
@@ -3576,12 +3624,93 @@ impl Sched {
             match j {
                 Job::Done(s) => { self.held[s] = false; self.tick += 1; self.freed[s] = self.tick; }
                 Job::Step { slot, token, logits, back } => { self.since.get_or_insert_with(Instant::now); self.steps.push((slot, token, logits, back)); }
+                Job::Slot { action, back } => self.controls.push_back(Control::Action(action, back)),
+                Job::Slots { back } => self.controls.push_back(Control::Info(back)),
                 c => self.chats.push_back(c),
             }
         }
     }
 
     fn ready(&self) -> bool { self.since.is_some_and(|t| self.steps.len() >= self.decoding() || t.elapsed() >= Self::GATHER) }
+
+    /// Run queued slot-file operations whose slot is idle; keep the others for the next loop. The model thread is
+    /// blocked while a save/restore streams (an explicit admin action).
+    fn controls(&mut self, g: &mut GpuModel) {
+        if self.controls.is_empty() { return; }
+        let mut deferred = std::collections::VecDeque::new();
+        let ops: Vec<Control> = self.controls.drain(..).collect();
+        for c in ops {
+            match c {
+                Control::Info(back) => {
+                    let slots: Vec<Value> = (0..self.held.len()).map(|i| json!({
+                        "id": i,
+                        "is_processing": self.held[i] || self.prefill[i],
+                        "n_ctx": g.kv_caps().get(i).copied().unwrap_or_else(|| g.ctx()),
+                        "n_past": g.slot_tokens(i).len(),
+                        "pinned": self.pinned.get(i).copied().unwrap_or(false),
+                    })).collect();
+                    let _ = back.send(Ok(json!({"slots": slots})));
+                }
+                Control::Action(action, back) => {
+                    let slot = match &action {
+                        SlotAction::Save { slot, .. } | SlotAction::Restore { slot, .. } | SlotAction::Erase { slot } => *slot,
+                    };
+                    if slot >= self.held.len() {
+                        let _ = back.send(Err(anyhow::anyhow!("Invalid slot ID")));
+                        continue;
+                    }
+                    if self.held[slot] || self.prefill[slot] {
+                        deferred.push_back(Control::Action(action, back));
+                        continue;
+                    }
+                    let t = Instant::now();
+                    let r = (|| -> anyhow::Result<Value> { match action {
+                        SlotAction::Save { slot, path, owner } => {
+                            let n = g.slot_tokens(slot).len();
+                            g.owner = owner;
+                            g.set_active(&self.active());
+                            g.save_slot_file(slot, &path).map(|bytes| json!({
+                                "id_slot": slot,
+                                "filename": path.file_name().and_then(|s| s.to_str()).unwrap_or_default(),
+                                "n_saved": n,
+                                "n_written": bytes,
+                                "timings": {"save_ms": t.elapsed().as_secs_f64() * 1e3},
+                            }))
+                        }
+                        SlotAction::Restore { slot, path, force } => {
+                            self.pinned[slot] = true;
+                            g.set_active(&self.active());
+                            match g.restore_slot_file(slot, &path, force) {
+                                Ok(bytes) => {
+                                    let n = g.slot_tokens(slot).len();
+                                    Ok(json!({
+                                        "id_slot": slot,
+                                        "filename": path.file_name().and_then(|s| s.to_str()).unwrap_or_default(),
+                                        "n_restored": n,
+                                        "n_read": bytes,
+                                        "timings": {"restore_ms": t.elapsed().as_secs_f64() * 1e3},
+                                    }))
+                                }
+                                Err(e) => {
+                                    self.pinned[slot] = false;
+                                    g.set_active(&self.active());
+                                    Err(e)
+                                }
+                            }
+                        }
+                        SlotAction::Erase { slot } => {
+                            let n = g.erase_slot(slot)?;
+                            self.pinned[slot] = false;
+                            g.set_active(&self.active());
+                            Ok(json!({"id_slot": slot, "n_erased": n}))
+                        }
+                    } })();
+                    let _ = back.send(r);
+                }
+            }
+        }
+        self.controls = deferred;
+    }
 
     /// One forward over the oldest steps (with more than `STEP_ROWS` slots decoding, each waits its turn), in slot order
     /// (fewer graphs to capture).
@@ -3640,7 +3769,8 @@ impl Serving {
         std::thread::scope(|sc| {
             // Owned here, so that a panic drops the queued jobs' reply channels and the request threads end (the
             // scope then joins them and the panic goes on).
-            let (jobs, mut s) = (jobs, Sched { held: vec![false; n], prefill: vec![false; n], freed: vec![0; n], who: vec![0; n], ..Default::default() });
+            let (jobs, mut s) = (jobs, Sched { held: vec![false; n], prefill: vec![false; n], freed: vec![0; n], who: vec![0; n],
+                pinned: vec![false; n], ..Default::default() });
             let mut open = true;
             loop {
                 while open && wake.is_none() && next.lock().unwrap().is_none() {
@@ -3675,6 +3805,7 @@ impl Serving {
                 // A request that comes now stays in the queue and loads the model again.
                 if live.load(Relaxed) == 0 && self.idle.is_some_and(|d| last.lock().unwrap().elapsed() >= d) { idle = true; break; }
                 s.take(&jobs, s.wait());
+                s.controls(g);
                 // Prefill between decode steps, in the free slot whose saved state the prompt extends the furthest, else
                 // the least recently used one.
                 s.chats.retain(|j| !matches!(j, Job::Chat { gone, .. } | Job::Image { gone, .. } if gone.load(Relaxed)));
@@ -3686,6 +3817,7 @@ impl Serving {
                 // An image prompt runs alone, in the least recently used free slot.
                 if let Some(j) = s.next_chat().filter(|&j| matches!(s.chats[j], Job::Image { .. }))
                     && let Some(sl) = (0..n).filter(|&i| !s.held[i]).min_by_key(|&i| s.freed[i]) {
+                    s.pinned[sl] = false;
                     adm.push((sl, s.chats.remove(j).unwrap()));
                 }
                 while adm.len() < lim && !matches!(adm.first(), Some((_, Job::Image { .. }))) {
@@ -3697,6 +3829,7 @@ impl Serving {
                         (if o == *owner && ids[..*keep].starts_with(sv) { sv.len() } else { 0 }, std::cmp::Reverse(s.freed[i]))
                     }) else { break };
                     // Held while the rest are chosen, so that `next_chat` counts it against its key.
+                    s.pinned[sl] = false;
                     (s.held[sl], s.who[sl]) = (true, *owner);
                     adm.push((sl, s.chats.remove(j).unwrap()));
                 }
@@ -3987,7 +4120,7 @@ fn anthropic_refused(w: &mut TcpStream, r: &Runner) -> bool {
     own
 }
 
-fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Loaded>, e: &Engine, s: &Serving, i: usize,
+fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, mut l: Option<&mut Loaded>, e: &Engine, s: &Serving, i: usize,
     next: &mut Option<(PathBuf, TcpStream)>) -> anyhow::Result<()> {
     // The response head of a streamed chat that waited in the queue may be out already: then a refusal is one
     // error line of the stream.
@@ -4020,6 +4153,109 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
         return send(&mut w, "403 Forbidden", json!({"error": {"message": "this key may use only /v1/chat/completions, /v1/messages (and count_tokens), /v1/models, /tokenize and /detokenize", "type": "permission_error"}}));
     }
     match (method.as_str(), route) {
+        // Explicit per-slot state files (llama.cpp routes). Admin-only: the key guard above already restricts the
+        // other keys to the chat/tokenizer routes.
+        ("GET", "/slots") => {
+            let Some(l) = l.as_deref_mut() else {
+                return send(&mut w, "503 Service Unavailable", json!({"error": {"message": "no model loaded", "type": "server_error"}}));
+            };
+            let v = match &mut l.r {
+                Runner::Gpu(g) => {
+                    let slots: Vec<Value> = (0..g.slots()).map(|i| json!({
+                        "id": i,
+                        "is_processing": false,
+                        "n_ctx": g.kv_caps().get(i).copied().unwrap_or_else(|| g.ctx()),
+                        "n_past": g.slot_tokens(i).len(),
+                        "pinned": false,
+                    })).collect();
+                    json!({"slots": slots})
+                }
+                Runner::Slot(c) => match c.slots_info() {
+                    Ok(v) => v,
+                    Err(err) => return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})),
+                },
+                _ => return send(&mut w, "400 Bad Request", json!({"error": {"message": "slot actions need a GPU model", "type": "invalid_request_error"}})),
+            };
+            send(&mut w, "200 OK", v)
+        }
+        ("POST", r) if r.starts_with("/slots/") => {
+            let Some(dir) = s.slot_save_path.as_deref() else {
+                return send(&mut w, "501 Not Implemented", json!({"error": {
+                    "message": "This server does not support slots action. Start it with `--slot-save-path`",
+                    "type": "not_supported"}}));
+            };
+            let Some(id) = r.strip_prefix("/slots/").and_then(|x| x.parse::<usize>().ok()) else {
+                return send(&mut w, "400 Bad Request", json!({"error": {"message": "Invalid slot ID", "type": "invalid_request_error"}}));
+            };
+            let query = path.split('?').nth(1).unwrap_or("");
+            let action = query.split('&').find_map(|kv| kv.strip_prefix("action=")).unwrap_or("");
+            if !matches!(action, "save" | "restore" | "erase") {
+                return send(&mut w, "400 Bad Request", json!({"error": {"message": "Invalid slots action", "type": "invalid_request_error"}}));
+            }
+            let force = query.split('&').any(|kv| kv == "force=1" || kv == "force=true");
+            let file = if action == "erase" {
+                PathBuf::new()
+            } else {
+                let Some(name) = serde_json::from_slice::<Value>(&body).ok().and_then(|v| v["filename"].as_str().map(str::to_owned)) else {
+                    return send(&mut w, "400 Bad Request", json!({"error": {"message": "Invalid filename", "type": "invalid_request_error"}}));
+                };
+                if let Err(err) = rusting_strata::slot_file::validate_filename(&name) {
+                    return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("Invalid filename: {err:#}"), "type": "invalid_request_error"}}));
+                }
+                dir.join(name)
+            };
+            let Some(l) = l.as_deref_mut() else {
+                return send(&mut w, "503 Service Unavailable", json!({"error": {"message": "no model loaded", "type": "server_error"}}));
+            };
+            let t = Instant::now();
+            let res = match &mut l.r {
+                Runner::Gpu(g) => {
+                    g.owner = who.id;
+                    match action {
+                        "save" => {
+                            let n = g.slot_tokens(id).len();
+                            g.save_slot_file(id, &file).map(|bytes| json!({
+                                "id_slot": id,
+                                "filename": file.file_name().and_then(|s| s.to_str()).unwrap_or_default(),
+                                "n_saved": n,
+                                "n_written": bytes,
+                                "timings": {"save_ms": t.elapsed().as_secs_f64() * 1e3},
+                            }))
+                        }
+                        "restore" => g.restore_slot_file(id, &file, force).map(|bytes| {
+                            let n = g.slot_tokens(id).len();
+                            json!({
+                                "id_slot": id,
+                                "filename": file.file_name().and_then(|s| s.to_str()).unwrap_or_default(),
+                                "n_restored": n,
+                                "n_read": bytes,
+                                "timings": {"restore_ms": t.elapsed().as_secs_f64() * 1e3},
+                            })
+                        }),
+                        "erase" => g.erase_slot(id).map(|n| json!({"id_slot": id, "n_erased": n})),
+                        _ => unreachable!(),
+                    }
+                }
+                Runner::Slot(c) => {
+                    c.owner = who.id;
+                    match action {
+                        "save" => c.slot_save(id, file, who.id),
+                        "restore" => c.slot_restore(id, file, force),
+                        "erase" => c.slot_erase(id),
+                        _ => unreachable!(),
+                    }
+                }
+                _ => Err(anyhow::anyhow!("slot actions need a GPU model")),
+            };
+            match res {
+                Ok(v) => send(&mut w, "200 OK", v),
+                Err(err) => {
+                    let msg = format!("{err:#}");
+                    let status = if msg.contains("evict") { "409 Conflict" } else { "400 Bad Request" };
+                    send(&mut w, status, json!({"error": {"message": msg, "type": "invalid_request_error"}}))
+                }
+            }
+        }
         ("GET", "/api/models") => {
             // The model `--auto-unload` freed counts as loaded: a chat loads it again.
             let asleep = s.asleep.lock().unwrap().clone();
