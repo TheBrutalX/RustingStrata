@@ -56,7 +56,8 @@ What changes with `--parallel N`:
   more takes the KV of idle slots (down to one token each), so a 1M budget is four 256k slots or one near-1M
   slot. The reclaim drops that slot's VRAM prefix cache and saved state. It is one GPU only, and the budget is
   reserved at load: a 1M q8 budget is 10.9 GB of KV with every expert resident on a 32 GB card. Unified mode
-  prefills prompts one at a time and does not reuse a saved prompt prefix (each request starts at position 0).
+  prefills prompts one at a time but reuses a slot's saved prefix when the next prompt continues it (a diverging
+  prompt clears the slot, with no host-memory parking).
 
 On the V100 32 GB, `--parallel 4 --ctx 1048576 --kv-unified --kv q8` reserved 10,880 MB of KV with all 10,240
 experts resident. Four 31k-token prompts completed 4/4 on those 256k slots. An 801,742-token prompt allocated an
@@ -317,6 +318,75 @@ the routing profile it learned, so that the next start places the experts as wel
 `TimeoutStopSec` must cover a full queue, or keep `--max-waiting` low. A load balancer
 sends the new requests to the other servers meanwhile, so restarting one server at a time cuts no reply. `systemd`
 sends `SIGKILL` after `TimeoutStopSec`; Ctrl+C still stops at once. On Windows there is no such drain.
+
+### Slot state files
+
+`--slot-save-path DIR` enables explicit per-slot state files: `GET /slots` and
+`POST /slots/{id}?action=save|restore|erase`, as in [USAGE.md](USAGE.md#slot-state-files-save-and-restore). It is
+off by default, and the POST routes answer `501` without it.
+
+Create the directory once, owned by the service user and closed to everyone else, then add the flag to the unit:
+
+```sh
+sudo install -d -o strata -g strata -m 0700 /var/lib/strata/slots
+```
+
+```ini
+ExecStart=/usr/local/bin/rustingstrata serve --model /srv/models/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf --gpu --ctx 32768 \
+    --addr 127.0.0.1:8080 --api-keys /etc/strata/keys.txt --usage-log /var/lib/strata/usage.jsonl --max-tokens 4096 \
+    --parallel 4 --kv q8 --max-per-key 4 --slot-save-path /var/lib/strata/slots
+```
+
+`serve` checks at startup that the path is a directory and exits with
+`--slot-save-path /var/lib/strata/slots is not a directory` otherwise. `StateDirectory=strata` creates the parent
+but not `slots`. The server writes the files itself (mode `0600` on Unix), so the directory must be writable by
+`strata`; `0700` keeps other local users from listing or opening them.
+
+**Disk.** A file is a full snapshot of one slot: KV rows, DeltaNet/MTP/PLE/QSA state and the token history, with no
+compression and no deltas. Size scales with `--ctx`, `--kv` and how many slots you save (one file per saved slot;
+with `--parallel N` and private KV per slot, each can hold a full `--ctx` worth of KV). A 1M-token q8 slot is about
+10.9 GB with the 35B-A3B layout. A slot that is only partly used writes its `n_past` rows, so short conversations
+are smaller. Keep free space for the new file beside the old one until the rename, prune old files yourself, and
+note that a crashed or killed save leaves a `.<name>.<pid>.<nanos>.tmp` file in the directory (the previous target
+stays intact), which is safe to delete.
+
+**Use.** Save and restore are explicit admin actions; the server never snapshots a slot on its own. Both block the
+model thread for the length of the copy, so treat them as maintenance operations, not something to run per request.
+A redeploy that keeps a long conversation:
+
+1. save the slot (`POST /slots/0?action=save`, body `{"filename":"conversation.slot"}`);
+2. stop the service (the queue drains first);
+3. start the new binary with the same model, `--kv`, YaRN/RoPE flags and `--device`/`--split`, and enough `--ctx` for
+   the saved token count;
+4. restore the file into a slot and send the continuation.
+
+A file from another model, KV layout, YaRN setting or split is refused, so changing one of these means prefilling
+again.
+
+**Concurrency.** A save/restore/erase for a busy slot is deferred, not rejected: the request waits until that slot is
+idle. With `--parallel N` the other slots keep their conversations and resume after the copy, but no forward runs
+while the file streams, so every stream pauses for its length. `GET /slots` shows `is_processing`, `pinned` and
+`n_past`, which helps find the slot worth saving.
+
+**`--kv-unified`.** A restore grows the target slot and reclaims only inactive slots. If the growth would take a
+non-empty slot, the restore answers `409`; `?force=1` lets it erase those idle victims. A restored slot is pinned
+until a request uses it or `action=erase` clears it, so another slot's growth cannot take the restored KV. Use
+`force=1` deliberately: it discards the victims' conversations.
+
+**Security and backups.** The files are plaintext: the full token history (prompt, system prompt, tools and
+generated tokens) and the KV/recurrent state. Treat a file as a copy of the conversation: keep the directory `0700`,
+do not serve it over HTTP, and include it in (or deliberately exclude it from) backups and retention. With
+`--api-keys` the routes are admin-only and a customer key gets `403`; without the flag the POST routes answer `501`,
+while `GET /slots` still lists slot metadata.
+
+**Troubleshooting.**
+
+- `400`: bad slot id or action, invalid filename (separator, `.`/`..`, control character, over 255 bytes),
+  missing/unreadable/truncated/corrupt file, a file from another model/KV/YaRN/split, or a save of an empty slot.
+- `409`: a unified restore would erase a non-empty slot; retry with `?force=1` if that is intended.
+- `501`: the server was started without `--slot-save-path`.
+- `503`: no model is loaded.
+- Startup: `--slot-save-path ... is not a directory`; create it, fix its ownership and mode, and restart.
 
 ## Docker
 

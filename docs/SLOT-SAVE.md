@@ -8,6 +8,12 @@ This document is the implementation contract for the `feat/slot-save` branch (is
 state that is saved, the `STRATASLOT` v1 file format, the save/restore algorithm, the HTTP API, the
 scheduler behaviour, unified-KV safety, security, limits, and the test matrix.
 
+**Status: implemented.** The branch carries the format module (`src/slot_file.rs`), the per-slot token
+history, GPU streaming save/restore/erase (`src/gpu_model/slot.rs`), unified prefix reuse, the HTTP
+control plane and `--slot-save-path` in `src/main.rs`, the unit/GPU tests and the E2E script
+`tools/test_slot_save.sh`. The sections below describe the code as implemented on the branch, not a plan;
+where an earlier design assumed a different shape, the text follows the code.
+
 ## 1. Goals and non-goals
 
 ### Goals
@@ -54,27 +60,25 @@ buffer length divided by its row count is the bytes per token; rows are position
 
 ### Token history
 
-The current implementation persists `saved_ids`, the prompt prefix saved by `prefill_cached`, but not
-the generated tokens. A real slot file needs the **full history**. Add:
-
-- `GpuModel::ids: Vec<u32>` for the current slot;
-- `Seq::ids: Vec<u32>` for the other slots, swapped by `use_slot`.
+The full history lives in `GpuModel::history` for the current slot and in `Seq::history` for the other
+slots; `use_slot` swaps the two. It is one token per KV row in use, prompt and generated tokens
+included. `GpuModel::ids` remains the backend's small token-id buffer and is not the history.
 
 Update rules:
 
 | path | update |
 |---|---|
-| `prefill_with`, `prefill_chunk` | append the processed chunk tokens; at the end `ids.len() == pos` |
-| `prefill_slots_run` | set each job slot's `ids` to its full prompt |
-| `step`, `step_embed` | append the input token after a successful forward |
-| `verify_run` | append all fed tokens; `rollback` truncates to `start + keep` |
-| `prefill_image` | append `p.ids[i]`; set `rope_offset` |
-| `unpark`, `unstash`, `restore_slot_file` | set `ids` from the saved/stashed token list |
-| `reset`, `drop_slot_cache` | clear `ids` |
-| `save_slot_file` | require `ids.len() == pos`; otherwise refuse with a clear error |
+| `prefill_cached`/`prefill_chunk` | appends the processed chunk tokens, then sets the history to the reused prefix plus that chunk; at the end `history.len() == pos` |
+| `prefill_slots_run` | sets each job slot's history to its full prompt |
+| `step`, `step_embed`, `step_rows` | appends the fed token after a successful forward |
+| `verify_run` | appends all fed tokens; `rollback` truncates to `start + keep` |
+| `prefill_image` | appends `p.ids[i]`; keeps `rope_offset` |
+| `unpark`, `unstash`, `restore_slot_file` | sets the history from the saved/stashed token list |
+| `reset`, `drop_slot_cache` | clears the history |
+| `save_slot_file` | requires `history.len() == pos`; otherwise refuses with a clear error |
 
-`slot_saved(s)` keeps returning `saved_ids` for prompt-cache admission. `slot_tokens(s)` is the new getter
-for `GET /slots` and for save.
+`slot_saved(s)` still returns `saved_ids` for prompt-cache admission. `slot_tokens(s)` returns the full
+history and backs `GET /slots` and `n_saved`/`n_restored`/`n_erased`.
 
 ### What is not stored
 
@@ -165,11 +169,11 @@ fingerprint is rejected with `400` and the slot is not touched.
 
 ```
 save_slot_file(path):
-    require pos == ids.len()
+    require pos == history.len()
     require the slot is not held/prefilling (enforced by the scheduler)
     save_state()                       # copies recurrent state into `saved`
-    write header (fingerprint, n_tokens=ids.len(), rope_offset, owner, n_parts)
-    write ids
+    write header (fingerprint, n_tokens=history.len(), rope_offset, owner, n_parts)
+    write history
     for each part:
         write slot buffer count and each saved buffer in 64 MB chunks
         write KV buffer count, row_bytes and rows 0..n_tokens in 64 MB chunks
@@ -177,12 +181,16 @@ save_slot_file(path):
     flush, fsync, rename temp -> path
 ```
 
-- The temp file is created in the destination directory with `create_new` and a random suffix; the target
-  is replaced atomically by `rename`.
+- The temp file is created in the destination directory with `create_new` and a suffix made of the PID and
+  a nanosecond timestamp; the target is replaced atomically by `rename`.
 - On Unix the file mode is `0600`.
 - A failed write removes the temp file and leaves the previous target intact.
 - The model thread is blocked for the duration. A 1M q8 slot is ~10.9 GB: roughly 1 s of PCIe transfer
-  and 10-20 s of disk at 0.5-1 GB/s. Progress is logged every 1 GB.
+  and 10-20 s of disk at 0.5-1 GB/s. There is no progress log; the admin request returns when the stream
+  and the rename are done.
+
+After a successful save the slot's `saved_ids` is set to the full history, so a later request that
+continues the same conversation can reuse the whole prefix, not only the original prompt prefix.
 
 ## 5. Restore algorithm
 
@@ -202,7 +210,7 @@ restore_slot_file(path, allow_evict):
         read KV rows into the slot's KV buffers
     saved_pos = n_tokens
     saved_ids = tokens
-    ids = tokens
+    history = tokens
     saved_owner = owner
     rope_offset = header.rope_offset
     restore_state()                    # recurrent buffers -> current, pos = n_tokens
@@ -221,16 +229,20 @@ The routes and fields mirror llama.cpp's server. They are admin-only, like `/api
 
 ### `GET /slots`
 
-Returns the slots with at least:
+Returns a JSON object with a `slots` array:
 
 ```json
-[
-  {"id": 0, "is_processing": false, "n_ctx": 262144, "n_past": 1234, "pinned": false},
-  {"id": 1, "is_processing": true,  "n_ctx": 262144, "n_past": 42,   "pinned": false}
-]
+{
+  "slots": [
+    {"id": 0, "is_processing": false, "n_ctx": 262144, "n_past": 1234, "pinned": false},
+    {"id": 1, "is_processing": true,  "n_ctx": 262144, "n_past": 42,   "pinned": false}
+  ]
+}
 ```
 
-`n_past` is `ids.len()`; `pinned` is an extension for unified slots. Extra llama.cpp fields are optional.
+`n_past` is `history.len()`; `n_ctx` is the slot's current KV capacity (under `--kv-unified` it grows as
+the slot is used); `pinned` is true for a slot whose restored state must not be reclaimed. On a server
+without `--parallel` there is one slot and `is_processing` is always `false`.
 
 ### `POST /slots/{id}?action=save`
 
@@ -269,13 +281,20 @@ Body: `{"filename": "slot1.bin"}`
 ### Errors
 
 - no `--slot-save-path`: `501` with
-  `"This server does not support slots action. Start it with --slot-save-path"`;
+  `This server does not support slots action. Start it with \`--slot-save-path\``;
+- no model loaded: `503 "no model loaded"`;
 - invalid slot id: `400 "Invalid slot ID"`;
-- invalid filename: `400 "Invalid filename"`;
-- wrong fingerprint / truncated file / bad footer: `400` with a specific message;
-- unified restore that would evict a non-empty slot: `409`, unless `?force=1`;
-- I/O error: `500`/`507` with the OS error.
+- invalid filename: `400 "Invalid filename: ..."`;
+- save of an empty slot: `400 "slot N has no token history to save"`;
+- wrong fingerprint / truncated file / bad footer / wrong part or buffer length: `400` with a specific
+  message, before the target slot is left usable;
+- unified restore that would evict a non-empty slot: `409` with a message containing `evict`, unless
+  `?force=1`;
+- other I/O and read/write errors: `400` with the OS error (the route maps every error without `evict`
+  to `400`).
 - A busy slot is **deferred**, not rejected: the request waits until the slot is idle, as llama.cpp does.
+
+`n_written` and `n_read` are total file bytes; `n_saved`, `n_restored` and `n_erased` are token counts.
 
 ### `--slot-save-path`
 
@@ -303,8 +322,8 @@ fingerprint matches.
 2. If `n_tokens` fits in the current capacity, no growth and no victims.
 3. Otherwise `kv_need` grows exactly as for a prompt. Compute the victims it would reclaim (inactive,
    non-pinned slots sorted by capacity, largest first). If any victim has `pos > 1` or a non-empty
-   `ids`/`saved_ids`, refuse with `409` unless the request has `force=1`. With `force=1` the victims are
-   erased as part of the growth.
+   `history`/`saved_ids`, refuse with `409` unless the request has `force=1`. With `force=1` the victims
+   are erased as part of the growth.
 4. After a successful restore the slot stays pinned until it is used by a request or erased. Pinning
    prevents a later prompt in another slot from reclaiming the restored state while it is idle.
 5. If a pinned slot is somehow reclaimed (should not happen), `drop_slot_cache` clears its state and the
@@ -312,8 +331,7 @@ fingerprint matches.
 
 ### Reuse after restore
 
-The current unified path in `prefill_cached_with` calls `reset()` unconditionally. Replace it with
-`cache_begin_unified`:
+`prefill_cached_with` calls `cache_begin_unified` when the server runs with `--kv-unified`:
 
 ```
 hit = saved_ids.len()
@@ -327,49 +345,50 @@ else
        reused = 0
 ```
 
-No `park`/`unstash`: in unified mode a diverging prompt discards the old state instead of copying a
-possibly 10 GB KV to host RAM. The existing `saved` buffers are enough for the recurrent state.
+There is no `park`/`unstash` in unified mode: a diverging prompt discards the old state instead of copying
+a possibly 10 GB KV to host RAM. The existing `saved` buffers are enough for the recurrent state.
 
 After prefilling the reusable prefix, `prefill_cached_with` saves the state as in the non-unified path
 (`save_state`, `saved_ids = tokens[..keep]`, `saved_owner = owner`), so subsequent requests can reuse it.
 The slot's KV rows 0..hit are valid because:
 
 - growth with `keep=true` preserves the old rows;
-- a victim's `drop_slot_cache` clears `saved_ids` and `ids`, so it cannot be reused;
+- a victim's `drop_slot_cache` clears `saved_ids`, `history` and the pin, so it cannot be reused;
 - `reset` clears the state.
 
 This also enables ordinary prompt reuse under `--kv-unified`, which the first unified version deliberately
-disabled. The new tests must cover both the restored-state path and the normal continuation path.
+disabled. The tests cover both the restored-state path and the normal continuation path.
 
 ## 8. Scheduler and control plane
 
 ### `--parallel N`
 
-The model thread owns the slots. Add control jobs:
+The model thread owns the slots. The request threads send:
 
 ```
-Control::Slots { back }
-Control::Save { slot, path, back }
-Control::Restore { slot, path, force, back }
-Control::Erase { slot, back }
+Job::Slot { action: SlotAction::Save { slot, path, owner } | Restore { slot, path, force } | Erase { slot }, back }
+Job::Slots { back }
 ```
 
-- `Sched` keeps a `VecDeque<Control>` and a `pinned: Vec<bool>`.
+`Sched::take` queues them as `Control::Action(action, back)` or `Control::Info(back)` in a
+`VecDeque<Control>`; `Sched` also keeps `pinned: Vec<bool>`.
+
 - `Sched::active()` = held || prefill || pinned.
-- A save/restore/erase for a slot with `held[slot] || prefill[slot]` is deferred to the back of the queue
+- A save/restore/erase for a slot with `held[slot] || prefill[slot]` is moved to the back of the queue
   and retried after the next forward; the HTTP thread waits.
 - Info is answered immediately.
 - Save/restore/erase run between forwards, with the model thread blocked.
-- The target slot is validated (`0..n`). Save/restore do not take `held`; they use `pinned` so a concurrent
-  chat cannot be admitted while the operation runs? In practice the scheduler is single-threaded and a
-  control runs synchronously, so no other job runs. Pinning matters while the operation is queued.
-- After a restore, `pinned[slot] = true`. On admission of a chat to that slot, clear the pin.
-- `erase` clears the pin.
+- The target slot is validated (`0..n`). A restore sets `pinned[slot] = true` before growing the slot and
+  clears it if the restore fails; `erase` clears it. On admission of a chat to that slot the scheduler
+  clears the pin, since the request now owns the state.
+- `GET /slots` is answered on the model thread so `is_processing`, `pinned`, `n_ctx` and `n_past` are
+  consistent with the slots.
 
 ### `--parallel 1` / no slots
 
 `handle` owns `Runner::Gpu(g)` directly. The request is serialized with chats by the server's model lock;
-save/restore/erase call the `GpuModel` methods directly. `GET /slots` reports the single slot 0.
+save/restore/erase call the `GpuModel` methods directly. `GET /slots` reports the single slot 0 with
+`is_processing: false` and `pinned: false`.
 
 ## 9. Security and privacy
 
@@ -384,63 +403,68 @@ save/restore/erase call the `GpuModel` methods directly. `GET /slots` reports th
 
 ## 10. Tests
 
-### Unit / format
+### Unit / format (`src/slot_file.rs`, 13 tests)
 
-- header/tokens/footer round-trip;
-- wrong magic, version, footer, payload length;
-- truncated token list and truncated buffer;
-- `n_tokens` over the buffer row count;
-- filename validation: empty, `.`, `..`, `../x`, `/abs`, `a/b`, control chars, >255 bytes.
-- fingerprint changes with model config, tensor table, KV mode, YaRN parameters, split.
+- header/tokens/footer round-trip, including an empty token list;
+- wrong magic, version, flag, footer magic;
+- footer payload-length mismatch and truncated footer;
+- truncated token list and `n_tokens` over the rows before allocating;
+- `n_tokens` mismatch between header and token list;
+- filename matrix: empty, `.`, `..`, `../x`, `/abs`, `a/b`, control characters, >255 bytes, and accepted
+  plain names.
 
-### GPU round-trip (short prompt, e.g. 2k)
+### GPU round-trip
 
-- prefill, generate 4-8 greedy tokens, save;
-- erase/reset, restore, prefill a continuation that starts with the saved history;
-- compare the continuation with an uninterrupted run token by token;
-- check `cached_tokens` is at least `saved_n - 1`;
-- verify `slot_tokens` covers prompt + generated tokens;
-- repeat with `--kv q8` and, where available, a model with DeltaNet/MTP (the 35B-A3B case).
+- `slot_save_restore_round_trip`: prefill + generate, save, erase, restore, continue; the continuation's
+  next-token logits match an uninterrupted run (`|dlogit| 0.000e0`).
+- `slot_history_tracks_prefill_step_verify_and_rollback`: the history covers prefill, `step`, `verify`
+  and `rollback`, and stays equal to `pos`.
+- `unified_cache_reuses_the_saved_prefix`: under `--kv-unified` a continuation reuses the saved prefix.
+- The round-trip covers prompt + generated tokens, KV rows, DeltaNet/MTP/PLE state and `q8` KV.
 
-### Cross-slot and restart
+### Cross-slot and restart (E2E)
 
-- save slot 1, restore into slot 0, use both;
-- stop the server, restart with the same model, restore the file, continue.
+- save slot 1, restore into slot 0, continue there (`tools/test_slot_save.sh`, `full`);
+- stop the server, start a fresh process with the same model, restore the file and continue (`restart`);
+- `truncated.bin` and `corrupt.bin` are rejected with `400` while the server stays healthy.
 
 ### Unified
 
-- save at 32k/64k, restore into a slot with a smaller capacity; verify growth;
-- restore that would evict a non-empty slot → 409; with `force=1` → success;
-- pinned restored slot is not reclaimed by another slot's growth;
-- the next request reuses the restored prefix (`cached_tokens`);
-- `drop_slot_cache` invalidates a reclaimed slot's history;
-- existing `unified_kv_budget_grows_one_slot` stays green.
+- `unified_kv_budget_grows_one_slot` stays green;
+- E2E `unified`: a slot grown past `ctx / parallel`, restored into another slot without `force` → `409`;
+  with `force=1` → `200` and `n_restored == n_saved`; the restored slot reports `pinned: true`;
+- `unified_cache_reuses_the_saved_prefix` covers the next-request prefix reuse;
+- `drop_slot_cache` invalidates a reclaimed slot's history.
 
-### API
+### API (E2E `tools/test_slot_save.sh`)
 
 - `501` without `--slot-save-path`;
-- `400` for bad slot/filename/file;
-- save/restore/erase response fields and timings;
-- busy slot defers and then succeeds;
-- admin-only: a customer key gets `403`.
+- `400` for bad slot, filename, missing/truncated/corrupt file and path traversal;
+- save/restore/erase response fields and timings, including `n_saved`/`n_written` and
+  `n_restored`/`n_read`;
+- a busy slot defers the save and then succeeds (`busy`);
+- admin-only: a customer key gets `403` (checked by the route guard; the E2E script runs as admin).
 
 ### Regression
 
-- 162 lib tests;
+- 175 lib tests;
 - `prefill_matches_reference`;
 - `unified_kv_budget_grows_one_slot`;
-- a 31k/64k prefill benchmark to check no regression in the normal path.
+- the E2E script's 21 `full` checks, 21 restart/busy/unified checks and the `501` check.
 
 ## 11. Rollout
 
-1. Land the design document and the format module with unit tests.
-2. Land token-history tracking with no behaviour change (the new field is only observed by save).
-3. Land GPU save/restore/erase behind the `--slot-save-path` API; default off.
-4. Land unified pin/reuse; keep the existing non-unified path unchanged.
-5. Document the API and the disk/privacy implications.
-6. Merge, then update the production command with `--slot-save-path` only if the operator wants it.
+The branch lands the feature in reviewable commits:
 
-The feature is opt-in: without `--slot-save-path` the server behaves exactly as before.
+1. `35e5a8d` — this design document.
+2. `5be4ad4` — the `STRATASLOT` v1 format module and its 13 unit tests.
+3. `cccf98e` — token-history tracking and `--kv-unified` prefix reuse.
+4. `36beb76` — streaming GPU save/restore/erase.
+5. `af43fe1` — the history, unified-reuse and round-trip tests.
+6. `1677ba1` — the HTTP routes, scheduler control jobs, pinning and `--slot-save-path`.
+
+The feature is opt-in: without `--slot-save-path` the server behaves exactly as before. Update a
+production command only when the operator wants explicit slot files and has provisioned the directory.
 
 ## 12. Open decisions
 
