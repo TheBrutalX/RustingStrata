@@ -1271,3 +1271,174 @@ fn slot_async_save_as_records_explicit_owner() {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+/// Segmented dedup I/O: a >2048-token prefix saved as `save_kv_segment` payloads plus `save_recurrent_to` restores
+/// into a second model and continues with the same logits as the uninterrupted run and a full `restore_slot_file`.
+/// (GPU integration test; not part of the CPU-only pass.)
+#[test]
+fn slot_segmented_round_trip() {
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let mut ids = tok
+        .encode(&"The quick brown fox jumps over the lazy dog. ".repeat(400))
+        .unwrap();
+    assert!(ids.len() > 2048, "{} tokens, need more than 2048", ids.len());
+    ids.truncate(3072);
+    let owner = 0x5151_0000_0000_0001u64;
+    let open = |bk: &str| -> Option<Box<dyn rusting_strata::backend::Backend>> {
+        Some(match bk {
+            "cuda" => Box::new(rusting_strata::cuda::Gpu::new(0).ok()?),
+            _ => Box::new(rusting_strata::vulkan::Vk::new(0).ok()?),
+        })
+    };
+    let base = std::env::temp_dir().join(format!("strata-slot-segments-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    for (bk, gpu) in common::backends() {
+        eprintln!("backend {bk}");
+        let mut gm = GpuModel::load(&m, gpu, 4096, 256, 512 << 20, 0).unwrap();
+        gm.adapt_every = 0;
+        gm.prefill(&ids).unwrap();
+        assert_eq!(gm.slot_tokens(0), &ids[..], "{bk}: prefill history");
+
+        let mut segments = Vec::new();
+        for (index, start) in (0..ids.len()).step_by(1024).enumerate() {
+            let end = (start + 1024).min(ids.len());
+            let path = base.join(format!("{bk}-{index}.kv"));
+            {
+                use std::io::Write;
+                let mut f = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+                let n = gm.save_kv_segment(0, start, end, &mut f).unwrap();
+                assert!(n > 0, "{bk}: KV segment {index} wrote no bytes");
+                f.flush().unwrap();
+            }
+            segments.push((start, end, path));
+        }
+        let recurrent = base.join(format!("{bk}-recurrent.bin"));
+        {
+            use std::io::Write;
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&recurrent).unwrap());
+            let n = gm.save_recurrent_to(0, &mut f).unwrap();
+            assert!(n > 0, "{bk}: recurrent segment wrote no bytes");
+            f.flush().unwrap();
+        }
+        let full = base.join(format!("{bk}-full.bin"));
+        gm.save_slot_file_as(0, &full, owner).unwrap();
+        let want = gm.step(42).unwrap();
+        drop(gm);
+
+        let Some(gpu) = open(bk) else {
+            eprintln!("{bk}: could not reopen the backend for restore; skipped");
+            continue;
+        };
+        let mut gm = GpuModel::load(&m, gpu, 4096, 256, 512 << 20, 0).unwrap();
+        gm.adapt_every = 0;
+
+        // Reference: the full synchronous restore of the same state.
+        gm.restore_slot_file(0, &full, false).unwrap();
+        assert_eq!(gm.slot_tokens(0), &ids[..], "{bk}: full restore history");
+        assert_eq!(gm.slot_owner(0), owner, "{bk}: full restore owner");
+        let full_next = gm.step(42).unwrap();
+        gm.reset().unwrap();
+
+        // Segmented restore: all KV segments, then the recurrent snapshot, then the commit.
+        for (start, end, path) in &segments {
+            let mut f = std::io::BufReader::new(std::fs::File::open(path).unwrap());
+            gm.restore_kv_segment(0, *start, *end, &mut f).unwrap();
+        }
+        {
+            let mut f = std::io::BufReader::new(std::fs::File::open(&recurrent).unwrap());
+            gm.restore_recurrent_from(0, &mut f).unwrap();
+        }
+        gm.finish_segmented_restore(0, &ids, owner, 0).unwrap();
+        assert_eq!(gm.slot_tokens(0), &ids[..], "{bk}: segmented history");
+        assert_eq!(gm.slot_owner(0), owner, "{bk}: segmented owner");
+        assert_eq!(gm.slot_pos(0), ids.len(), "{bk}: segmented position");
+        let segmented_next = gm.step(42).unwrap();
+
+        let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).fold(0f32, |x, (p, q)| x.max((p - q).abs()));
+        for (what, a, b) in [
+            ("full vs uninterrupted", &want, &full_next),
+            ("segmented vs uninterrupted", &want, &segmented_next),
+            ("segmented vs full", &full_next, &segmented_next),
+        ] {
+            let d = diff(a, b);
+            eprintln!(
+                "{bk} {what}: argmax {} vs {}, max |dlogit| {d:.3e}",
+                ops::argmax(a),
+                ops::argmax(b)
+            );
+            assert_eq!(ops::argmax(a), ops::argmax(b), "{bk}: {what}");
+            assert!(d <= 1e-4, "{bk}: {what} differs by {d}");
+        }
+
+        for (_, _, path) in &segments { let _ = std::fs::remove_file(path); }
+        let _ = std::fs::remove_file(&recurrent);
+        let _ = std::fs::remove_file(&full);
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A KV segment whose header disagrees with the request or the model (range, row size or buffer count) is rejected
+/// before any row is installed: the slot's K/V bytes are unchanged afterwards. (GPU integration test; not part of
+/// the CPU-only pass.)
+#[test]
+fn slot_segment_rejects_bad_header_before_install() {
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let ids = tok
+        .encode("The quick brown fox jumps over the lazy dog. The capital of France is")
+        .unwrap();
+    for (bk, gpu) in common::backends() {
+        eprintln!("backend {bk}");
+        let mut gm = GpuModel::load(&m, gpu, 512, 0, 512 << 20, 0).unwrap();
+        gm.adapt_every = 0;
+        gm.prefill(&ids).unwrap();
+        let end = ids.len();
+
+        let mut baseline = Vec::new();
+        let n = gm.save_kv_segment(0, 0, end, &mut baseline).unwrap();
+        assert_eq!(n as usize, baseline.len(), "{bk}: segment byte count");
+        assert_eq!(&baseline[..8], b"STRKVSEG", "{bk}: segment magic");
+
+        // Offsets in the `STRKVSEG` header: magic 0, version 8, start 12, end 20, n_parts 28, n_buffers 32,
+        // first row size 36.
+        let n_parts = u32::from_le_bytes(baseline[28..32].try_into().unwrap());
+        let n_buffers = u32::from_le_bytes(baseline[32..36].try_into().unwrap());
+        assert!(n_parts >= 1 && n_buffers >= 1, "{bk}: model has no KV buffers");
+
+        let mut bad_start = baseline.clone();
+        bad_start[12..20].copy_from_slice(&1u64.to_le_bytes());
+        let mut bad_end = baseline.clone();
+        bad_end[20..28].copy_from_slice(&(end as u64 + 1).to_le_bytes());
+        let mut bad_row = baseline.clone();
+        let row = u64::from_le_bytes(bad_row[36..44].try_into().unwrap());
+        bad_row[36..44].copy_from_slice(&(row + 1).to_le_bytes());
+        let mut bad_count = baseline.clone();
+        bad_count[32..36].copy_from_slice(&(n_buffers + 1).to_le_bytes());
+
+        for (what, bad) in [
+            ("start", bad_start),
+            ("end", bad_end),
+            ("row size", bad_row),
+            ("buffer count", bad_count),
+        ] {
+            let err = gm
+                .restore_kv_segment(0, 0, end, &mut std::io::Cursor::new(&bad))
+                .unwrap_err();
+            eprintln!("{bk} bad {what}: {err:#}");
+            assert!(!err.to_string().is_empty(), "{bk}: bad {what} was accepted");
+            let mut after = Vec::new();
+            gm.save_kv_segment(0, 0, end, &mut after).unwrap();
+            assert_eq!(after, baseline, "{bk}: bad {what} changed the slot");
+        }
+        assert_eq!(gm.slot_tokens(0), &ids[..], "{bk}: history after rejected segments");
+    }
+}
