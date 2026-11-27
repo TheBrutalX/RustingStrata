@@ -2251,9 +2251,18 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                                 let state = st.lock().unwrap();
                                 (state.model.clone(), state.file.clone(), state.ctx, state.ctx_train)
                             };
+                            // Expose the context in the shapes common OpenAI-compatible clients read. The
+                            // OpenAI schema has no context field, so clients disagree: OpenRouter-style
+                            // `context_length`/`top_provider`, vLLM's `max_model_len`, and a nested `meta` for
+                            // clients that already read the RustingStrata extension.
                             let mut data: Vec<_> = m.iter().map(|id| json!({
                                 "id": id, "object": "model", "created": created, "owned_by": "strata",
-                                "meta": {"n_ctx": n_ctx, "n_ctx_train": n_ctx_train}
+                                "context_length": n_ctx,
+                                "max_context_length": n_ctx,
+                                "max_model_len": n_ctx,
+                                "context_window": n_ctx,
+                                "top_provider": {"context_length": n_ctx},
+                                "meta": {"n_ctx": n_ctx, "n_ctx_train": n_ctx_train, "context_length": n_ctx}
                             })).collect();
                             // An admin key also sees the other models the server offers, by file name: a chat request
                             // that names one loads it (`Serving::other`). Customer keys may not load models.

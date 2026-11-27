@@ -468,13 +468,14 @@ phase-1 deployment keeps its behavior; on a shared server, tune all three:
   Pinning is an admin-only `POST /slots/archive/{id}?action=pin|unpin`; the entry's `pinned` flag is persisted in
   the manifest, so a pin survives a restart and protects the entry from the TTL, the budget and lineage pruning.
 
-**Checkpoint stalls.** Format-2 saves and restores are still synchronous in this wave: the model thread copies
-the state, writes the new segments/state and commits the manifest, and every stream pauses for the duration. The
-GPU core now has resumable `_with` variants (a callback after each 64 MiB copy or segment) and a bounded 256 MB
-writer/reader, but the scheduler is not wired to them yet; automatic v2 checkpoints do not interleave. A 1 GB state
-costs 1-2 s at 0.5-1 GB/s; a 10.9 GB 1M-token state costs 10-20 s. Expect a visible pause when a conversation
-switches or a unified slot is reclaimed. Keep `--slot-archive-min-tokens` and `--slot-archive-min-delta` high
-enough that small states and tiny extensions are not written on every turn.
+**Checkpoint stalls.** Automatic format-2 saves/restores now run through a background writer/reader: the model
+thread performs only the GPU copies (and H2D on restore), while segment/state files and the manifest are written
+off-thread; `Sched::yield_between` services other slots' decode steps for up to 2 ms per copy. The archive mutex is
+not held during the copies. `finish` still waits for the final commit, so the model thread may wait for that commit
+at the end; explicit `action=save`/`action=checkpoint` remain synchronous by design. A 1 GB state costs 1-2 s of
+disk at 0.5-1 GB/s; expect a shorter but still visible pause on very large states. Keep
+`--slot-archive-min-tokens`/`--slot-archive-min-delta` high enough that tiny states/extensions are not written on
+every turn.
 
 **Restore behavior.** Automatic restore uses a free slot only and never takes a slot a request holds. It never
 uses the `force=1` of the explicit route. If the chosen free slot holds another conversation, the server

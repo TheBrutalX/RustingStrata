@@ -2,10 +2,11 @@ mod common;
 use rusting_strata::gguf::Gguf;
 use rusting_strata::gpu_model::GpuModel;
 use rusting_strata::model::Model;
-use rusting_strata::slot_archive::{Archive, ArchiveConfig};
+use rusting_strata::slot_archive::{start_async_segmented_save, Archive, ArchiveConfig};
 use rusting_strata::slot_segments::SegmentStore;
 use rusting_strata::tokenizer::Tokenizer;
 use std::io::Write;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// Manual phase breakdown for the archive save. Run with:
@@ -85,6 +86,17 @@ fn archive_phase_breakdown() {
     let entry = archive.save_segmented(&mut gm, 0, 0, "phase-bench").unwrap();
     eprintln!("archive save_segmented total: {:.1} ms, entry {} bytes, {} segments",
         t.elapsed().as_secs_f64() * 1e3, entry.bytes, entry.segments.len());
+
+    let async_archive = Arc::new(Mutex::new(Archive::open(ArchiveConfig {
+        dir: root.join("archive-async"), budget_bytes: 8 << 30, min_tokens: 64, min_delta: 1, versions: 1,
+    }).unwrap()));
+    let t = Instant::now();
+    let (mut sink, handle) = start_async_segmented_save(async_archive.clone(), 0, "async-phase").unwrap();
+    gm.save_segmented_to(0, 0, &mut sink, &mut |_| Ok(())).unwrap();
+    let gpu_and_send = t.elapsed();
+    let async_entry = handle.join().unwrap();
+    eprintln!("archive async save: gpu+send {:.1} ms, total {:.1} ms, entry {} bytes",
+        gpu_and_send.as_secs_f64() * 1e3, t.elapsed().as_secs_f64() * 1e3, async_entry.bytes);
     eprintln!("summary: full={} segments={} state={} entry={}", full.len(), seg_bytes, state.len(), entry.bytes);
 
     drop(gm);
