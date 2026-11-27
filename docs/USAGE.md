@@ -80,6 +80,11 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 
 - `--backend NAME` GPU backend: `cuda`, `vulkan` or `hip` (AMD cards through ROCm, one device per run, see [HIP.md](HIP.md)). Without it CUDA is used when it loads, else Vulkan.
 - `--ctx` KV cache size in tokens (default 4096). For Inkling 2, Hy4, GLM, DeepSeek, Kolibri and Gemma 4 it is the prompt plus reply limit instead, and the default is the context the model was trained on; their caches grow with the text.
+- `--kv-unified` (`serve`): with `--parallel N`, `--ctx` is the total KV budget shared by the slots, not per slot.
+  Each slot starts at `ctx / N`; a slot that needs more reclaims the KV of idle slots down to one token each, so a
+  1M budget gives four 256k slots or lets one slot grow to ~1M. The reclaimed slot loses its VRAM prefix cache and
+  its saved state. One GPU only; a 1M budget needs `--kv q8` on a 32 GB card. The first version does not reuse a
+  saved prompt prefix in unified mode: each request prefills from position 0.
 - `--rope-scaling none|linear|yarn` changes the RoPE plan, not only the KV size. `yarn` and `linear` need
   `--rope-scale FACTOR` (2 doubles the context); `yarn` also needs `--yarn-orig-ctx N` (the context the model was
   trained on) and takes `--yarn-beta-fast`/`--yarn-beta-slow` (32/1, llama.cpp's defaults). A file that carries

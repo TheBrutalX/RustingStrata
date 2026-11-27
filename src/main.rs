@@ -198,6 +198,9 @@ struct Engine {
     /// Sequences in GPU memory at once (`serve --parallel`).
     #[arg(skip)]
     parallel: usize,
+    /// `serve --parallel`: `--ctx` is the total token budget shared by the slots instead of per slot.
+    #[arg(skip)]
+    kv_unified: bool,
     /// Multimodal projector (mmproj) GGUF used by `--image` (default: an `mmproj*.gguf` next to the model; `none`
     /// loads no projector).
     #[arg(long)]
@@ -274,6 +277,10 @@ struct Hosting {
     /// decode for as long as the chunk took (a smaller `--chunk` gives shorter pauses). MTP drafting is off.
     #[arg(long, default_value_t = 1)]
     parallel: usize,
+    /// Share one `--ctx` token budget across the `--parallel` slots instead of allocating `ctx` per slot. A slot
+    /// can grow past its base share and reclaim the KV of idle slots, up to the total.
+    #[arg(long)]
+    kv_unified: bool,
     /// Free the model (its VRAM and its memory in this process) after this many seconds without a chat request. The
     /// next chat request loads it again, with the same options, and is answered after the load.
     #[arg(long, value_name = "SECONDS")]
@@ -596,7 +603,7 @@ impl Engine {
         let (ns, k) = if self.parallel > 1 { (self.parallel, 0) } else { (1, mtp) };
         let mut bk = Some(bk);
         let mut g = loop {
-            match GpuModel::load_split_margins(m, bk.take().unwrap(), self.ctx, self.chunk(), &margins, split.as_deref(), k, ns) {
+            match GpuModel::load_split_margins_kv(m, bk.take().unwrap(), self.ctx, self.chunk(), &margins, split.as_deref(), k, ns, self.kv_unified) {
                 // The prefill scratch grows with the chunk: when the default or calibrated chunk runs VRAM out or
                 // leaves it under the margin, halve it (down to 512) and load again on freshly opened devices.
                 Err(e) if auto_chunk && self.chunk() > 512 && vram_short(&e) => {
@@ -1936,8 +1943,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             engine.ds_env()?;
             anyhow::ensure!(host.auto_unload != Some(0), "--auto-unload must be at least 1 second");
             engine.parallel = host.parallel;
+            engine.kv_unified = host.kv_unified;
             // Before the model is loaded: a slot count outside 1..=255 is an invalid request, not a downgrade.
             anyhow::ensure!((1..=255).contains(&engine.parallel), "--parallel {}: 1 to 255 slots", engine.parallel);
+            anyhow::ensure!(!engine.kv_unified || engine.parallel > 1, "--kv-unified needs --parallel greater than 1");
             let api_key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
             anyhow::ensure!(api_key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
             let mut allowed_hosts = host.allowed_hosts.clone();
@@ -3522,6 +3531,8 @@ impl Drop for Client {
 struct Sched {
     /// Slots held by a request, and when each was last freed (the least recently used goes first).
     held: Vec<bool>,
+    /// Slots whose prompt is being prefilled now (held while the prefill runs).
+    prefill: Vec<bool>,
     freed: Vec<u64>,
     tick: u64,
     /// The key that holds each slot (`Client::owner`).
@@ -3537,6 +3548,9 @@ impl Sched {
     const GATHER: Duration = Duration::from_millis(2);
 
     fn decoding(&self) -> usize { self.held.iter().filter(|&&h| h).count() }
+
+    /// Slots a request holds or is prefilling now; `GpuModel` may reclaim only from the others.
+    fn active(&self) -> Vec<bool> { self.held.iter().zip(&self.prefill).map(|(&h, &p)| h || p).collect() }
 
     /// The queued chat to start next: the one whose key holds the fewest slots, the oldest among those, so that one
     /// customer's burst of requests does not hold back the others'. With one key (or none) it is the oldest.
@@ -3572,6 +3586,7 @@ impl Sched {
     /// One forward over the oldest steps (with more than `STEP_ROWS` slots decoding, each waits its turn), in slot order
     /// (fewer graphs to capture).
     fn run(&mut self, g: &mut GpuModel) {
+        g.set_active(&self.active());
         // ponytail: fixed row count from which the GEMM forward (`step_batch`) replaces the matvec one; `calibrate`
         // should measure it per model and machine. STRATA_BATCH_MIN overrides. With experts 16: below it the step of
         // `STEP_ROWS` rows, whose missed experts the CPU worker runs beside the GPU, was faster (Qwen3.6-35B-A3B, RTX 3060).
@@ -3625,7 +3640,7 @@ impl Serving {
         std::thread::scope(|sc| {
             // Owned here, so that a panic drops the queued jobs' reply channels and the request threads end (the
             // scope then joins them and the panic goes on).
-            let (jobs, mut s) = (jobs, Sched { held: vec![false; n], freed: vec![0; n], who: vec![0; n], ..Default::default() });
+            let (jobs, mut s) = (jobs, Sched { held: vec![false; n], prefill: vec![false; n], freed: vec![0; n], who: vec![0; n], ..Default::default() });
             let mut open = true;
             loop {
                 while open && wake.is_none() && next.lock().unwrap().is_none() {
@@ -3663,8 +3678,9 @@ impl Serving {
                 // Prefill between decode steps, in the free slot whose saved state the prompt extends the furthest, else
                 // the least recently used one.
                 s.chats.retain(|j| !matches!(j, Job::Chat { gone, .. } | Job::Image { gone, .. } if gone.load(Relaxed)));
-                // Models with a batched forward prefill the queued prompts together, one free slot each.
-                let lim = g.batch_cap().max(1);
+                // Models with a batched forward prefill the queued prompts together, one free slot each. A unified
+                // KV budget grows one slot at a time, so its prompts are prefilled one at a time (decode still batches).
+                let lim = if g.kv_unified() { 1 } else { g.batch_cap().max(1) };
                 let fits = |c: &Job| matches!(c, Job::Chat { ids, .. } if ids.len() <= g.ctx());
                 let mut adm: Vec<(usize, Job)> = vec![];
                 // An image prompt runs alone, in the least recently used free slot.
@@ -3686,6 +3702,8 @@ impl Serving {
                 }
                 for (sl, _) in &adm { s.held[*sl] = false; }
                 if !adm.is_empty() {
+                    for (sl, _) in &adm { s.prefill[*sl] = true; }
+                    g.set_active(&s.active());
                     // Between two prefill forwards the decoding slots run for as long as the forward before took, so
                     // long prompts share the GPU with them evenly instead of stalling them.
                     // ponytail: an even share; weigh it (or cap the prompt's chunk) if first-token time matters more.
@@ -3725,6 +3743,8 @@ impl Serving {
                             }
                         }
                     };
+                    for (sl, _) in &adm { s.prefill[*sl] = false; }
+                    g.set_active(&s.active());
                     for ((sl, c), r) in adm.into_iter().zip(res) {
                         let (Job::Chat { owner, back, .. } | Job::Image { owner, back, .. }) = c else { unreachable!() };
                         (s.held[sl], s.who[sl]) = (r.is_ok(), owner);
