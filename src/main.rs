@@ -4054,7 +4054,6 @@ impl Serving {
                     }) else { break };
                     // An archived prefix longer than anything in RAM: restore it into a free slot (empty first,
                     // else LRU). A failed restore falls back to the normal slot and prefill.
-                    let mut restored = false;
                     if let Some(archive) = &self.archive {
                         let (sv, o) = g.slot_saved(sl);
                         let ram = if o == *owner && ids[..*keep].starts_with(sv) { sv.len() } else { 0 };
@@ -4063,6 +4062,7 @@ impl Serving {
                             && let Some(rs) = (0..n).filter(|&i| free(i))
                                 .min_by_key(|&i| (if g.slot_tokens(i).is_empty() { 0u8 } else { 1 }, s.freed[i])) {
                             // Under a unified KV budget, never evict a non-empty slot for an automatic restore.
+                            g.set_active(&s.active());
                             let blocked = g.kv_reclaim_plan(rs, hit.n_tokens).iter()
                                 .any(|&v| v != rs && !g.slot_tokens(v).is_empty());
                             if !blocked {
@@ -4077,7 +4077,7 @@ impl Serving {
                                 s.pinned[rs] = true;
                                 g.set_active(&s.active());
                                 match archive_restore(archive, g, rs, &hit) {
-                                    Ok(_) => { sl = rs; restored = true; }
+                                    Ok(_) => { sl = rs; }
                                     Err(e) => {
                                         say!("archive: restore into slot {rs} (falling back to prefill): {e:#}");
                                         s.pinned[rs] = false;
@@ -4088,9 +4088,10 @@ impl Serving {
                         }
                     }
                     // Held while the rest are chosen, so that `next_chat` counts it against its key. A restored
-                    // slot keeps its pin; the request's prefill clears it as usual.
-                    if !restored { s.pinned[sl] = false; }
+                    // slot was pinned during the restore; once the request holds it, `held` protects it and the pin
+                    // must be cleared or the slot could never be reclaimed again.
                     (s.held[sl], s.who[sl]) = (true, *owner);
+                    s.pinned[sl] = false;
                     adm.push((sl, s.chats.remove(j).unwrap()));
                 }
                 for (sl, _) in &adm { s.held[*sl] = false; }
@@ -4469,10 +4470,15 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, mut l: Option<&mu
             let query = path.split('?').nth(1).unwrap_or("");
             let limit = query.split('&').find_map(|kv| kv.strip_prefix("limit=")).and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
             let owner = query.split('&').find_map(|kv| kv.strip_prefix("owner=")).and_then(|v| v.parse::<u64>().ok());
+            let fingerprint = query.split('&').find_map(|kv| kv.strip_prefix("fingerprint="))
+                .and_then(|v| u64::from_str_radix(v, 16).ok());
             let (dir, budget, used, entries) = {
                 let a = match archive.lock() { Ok(a) => a, Err(_) => return send(&mut w, "500 Internal Server Error", json!({"error": {"message": "slot archive lock poisoned", "type": "server_error"}})) };
                 let st = a.stats();
-                (a.config().dir.display().to_string(), st.budget_bytes, st.bytes, a.list(owner, limit))
+                let mut entries = a.list(owner, 0);
+                if let Some(fp) = fingerprint { entries.retain(|e| e.fingerprint == fp); }
+                if limit > 0 { entries.truncate(limit); }
+                (a.config().dir.display().to_string(), st.budget_bytes, st.bytes, entries)
             };
             let entries: Vec<Value> = entries.into_iter().map(|e| json!({
                 "id": e.id,
