@@ -441,7 +441,7 @@ struct MtpHead {
 
 /// What a slot keeps while another slot is current (`use_slot`): the `GpuModel` fields of the same names.
 #[derive(Default)]
-struct Seq { pos: usize, rope: i32, saved: Vec<(Buf, Buf)>, saved_pos: usize, saved_ids: Vec<u32>, saved_owner: u64, sys: Option<Stash>, sys_owner: u64 }
+struct Seq { pos: usize, rope: i32, saved: Vec<(Buf, Buf)>, saved_pos: usize, saved_ids: Vec<u32>, history: Vec<u32>, saved_owner: u64, sys: Option<Stash>, sys_owner: u64 }
 
 /// See `GpuModel::sys`.
 type Stash = (Vec<Vec<u8>>, usize, [i64; 2], Vec<u32>);
@@ -494,6 +494,8 @@ pub struct GpuModel<'a> {
     saved_pos: usize,
     /// The tokens behind the saved state when `prefill_cached` saved it (else empty).
     saved_ids: Vec<u32>,
+    /// The full token history of the current slot (prompt and generated tokens), one per KV row in use.
+    history: Vec<u32>,
     /// Host copy of the saved state at the end of the system prompt (`stash`): buffers, position, PLE tokens, the
     /// tokens behind it. A request whose history no longer extends the saved one (a rewritten or compacted
     /// conversation) restarts from it.
@@ -1226,13 +1228,17 @@ impl<'a> GpuModel<'a> {
         let reset_counts_after_prefill = std::env::var_os("STRATA_RESET_COUNTS").is_some();
         let _ = &mut ext_draft;
         crate::weights::trim_working_set();
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], ple_undo: ([-1, -1], vec![]), bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, hada, mrope: false, mrope_buf: gpu_mrope, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every, adapt_swaps, reset_counts_after_prefill, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, nsnap, short: 32, pf, prompt_cache_path: None, bt, mtp, dflash, ext_draft, ext_draft_pend: Vec::new(), mhc_ones, graph_tag: 0, ngram: None, first: range.start, next: None,
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], ple_undo: ([-1, -1], vec![]), bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, hada, mrope: false, mrope_buf: gpu_mrope, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], history: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every, adapt_swaps, reset_counts_after_prefill, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, nsnap, short: 32, pf, prompt_cache_path: None, bt, mtp, dflash, ext_draft, ext_draft_pend: Vec::new(), mhc_ones, graph_tag: 0, ngram: None, first: range.start, next: None,
                       cur: 0, seqs, kv_cap: if grow { vec![kv0; ns] } else { vec![] }, kv0, kv_budget: if unified { ctx } else { 0 }, active: vec![false; ns], rows: vec![], row_tokens: 0, cpu_frac: 0.5, kv_stage })
     }
 
     /// Clear KV and recurrent state (and forget the `prefill_cached` prefix, whose KV this zeroes).
     pub fn reset(&mut self) -> anyhow::Result<()> {
         self.saved_ids.clear();
+        self.history.clear();
+        self.saved_pos = 0;
+        self.saved_owner = 0;
+        self.saved_ple_prev = [-1, -1];
         self.sys = None;
         if let Some(h) = self.mtp.as_mut() {
             h.pos = 0; h.pend.clear(); h.adapt_window = 0x0FFF; h.adapt_skip = 0;
@@ -1373,6 +1379,7 @@ impl<'a> GpuModel<'a> {
         let mut logits = t.gpu.get::<f32>(&t.logits, 0, self.m.cfg.n_vocab)?;
         if t.finish(1, gq_min(self.pos, 1), None)? { logits = t.gpu.get::<f32>(&t.logits, 0, self.m.cfg.n_vocab)?; }
         self.after_forward(1)?;
+        self.history_push_all(&[id]);
         Ok(logits)
     }
 
@@ -1389,6 +1396,7 @@ impl<'a> GpuModel<'a> {
         std::mem::swap(&mut self.saved, &mut q.saved);
         std::mem::swap(&mut self.saved_pos, &mut q.saved_pos);
         std::mem::swap(&mut self.saved_ids, &mut q.saved_ids);
+        std::mem::swap(&mut self.history, &mut q.history);
         std::mem::swap(&mut self.saved_owner, &mut q.saved_owner);
         std::mem::swap(&mut self.sys, &mut q.sys);
         std::mem::swap(&mut self.sys_owner, &mut q.sys_owner);
@@ -1403,6 +1411,33 @@ impl<'a> GpuModel<'a> {
     /// The tokens behind slot `s`'s saved state and their owner (see `prefill_cached`).
     pub fn slot_saved(&self, s: usize) -> (&[u32], u64) {
         if s == self.cur { (&self.saved_ids, self.saved_owner) } else { (&self.seqs[s].saved_ids, self.seqs[s].saved_owner) }
+    }
+
+    /// The full token history of slot `s` (prompt and generated tokens), one per KV row in use.
+    pub fn slot_tokens(&self, s: usize) -> &[u32] {
+        if s == self.cur { &self.history } else { &self.seqs[s].history }
+    }
+
+    fn slot_ids_mut(&mut self, s: usize) -> &mut Vec<u32> {
+        if s == self.cur { &mut self.history } else { &mut self.seqs[s].history }
+    }
+
+    /// Append fed tokens to every part's current-slot history (decode/verify updates both halves of a split).
+    fn history_push_all(&mut self, tokens: &[u32]) {
+        let mut p = Some(&mut *self);
+        while let Some(q) = p {
+            q.history.extend_from_slice(tokens);
+            p = q.next.as_deref_mut();
+        }
+    }
+
+    /// Set every part's current-slot history to `tokens` (a restored prefix).
+    fn history_set_all(&mut self, tokens: &[u32]) {
+        let mut p = Some(&mut *self);
+        while let Some(q) = p {
+            q.history = tokens.to_vec();
+            p = q.next.as_deref_mut();
+        }
     }
 
     /// The most rows `step_batch` takes (0: this model has no batched decode).
@@ -1468,12 +1503,13 @@ impl<'a> GpuModel<'a> {
     fn drop_slot_cache(&mut self, i: usize) {
         if i == self.cur {
             self.pos = 0; self.rope_offset = 0;
-            self.saved_ids.clear(); self.saved.clear(); self.saved_pos = 0;
+            self.saved_ids.clear(); self.history.clear(); self.saved.clear(); self.saved_pos = 0;
+            self.saved_ple_prev = [-1, -1];
             self.sys = None; self.saved_owner = 0; self.sys_owner = 0;
         } else {
             let q = &mut self.seqs[i];
             q.pos = 0; q.rope = 0;
-            q.saved_ids.clear(); q.saved.clear(); q.saved_pos = 0;
+            q.saved_ids.clear(); q.history.clear(); q.saved.clear(); q.saved_pos = 0;
             q.sys = None; q.saved_owner = 0; q.sys_owner = 0;
         }
     }
@@ -1596,6 +1632,7 @@ impl<'a> GpuModel<'a> {
             q.rows.clear();
             if res.is_ok() {
                 for &(s, ..) in rows { *q.slot_pos(s) += 1; }
+                for &(s, tok, _) in rows { q.slot_ids_mut(s).push(tok); }
                 q.row_tokens += nt;
                 q.adapt_every = every;
                 q.adapt_swaps = swaps;
@@ -1701,6 +1738,7 @@ impl<'a> GpuModel<'a> {
         if t.finish(1, gq_min(self.pos, 1), None)? { logits = t.gpu.get::<f32>(&t.logits, 0, self.m.cfg.n_vocab)?; }
         let t3 = prof.then(std::time::Instant::now);
         self.after_forward(1)?;
+        self.history_push_all(&[token]);
         if let (Some(t0), Some(t1), Some(t2), Some(t3)) = (t0, t1, t2, t3) {
             let t4 = std::time::Instant::now();
             crate::say!("step_prof pos={}: embed_htod={:.1}us pass_submit={:.1}us gpu_wait_dtoh={:.1}us after_experts={:.1}us total={:.1}us",
@@ -1723,6 +1761,7 @@ impl<'a> GpuModel<'a> {
         let mut logits = t.gpu.get::<f32>(&t.logits, 0, tokens.len() * nvoc)?;
         if t.finish(tokens.len(), gq_min(self.pos, tokens.len()), None)? { logits = t.gpu.get::<f32>(&t.logits, 0, tokens.len() * nvoc)?; }
         self.after_forward(tokens.len())?;
+        self.history_push_all(tokens);
         Ok(logits.chunks(nvoc).map(|c| c.to_vec()).collect())
     }
 
@@ -1752,6 +1791,7 @@ impl<'a> GpuModel<'a> {
         let n = keep(&am);
         let t3 = prof.then(std::time::Instant::now);
         self.after_forward(nt)?;
+        self.history_push_all(tokens);
         if let (Some(t0), Some(t1), Some(t2), Some(t3)) = (t0, t1, t2, t3) {
             let t4 = std::time::Instant::now();
             crate::say!("greedy_prof pos={}: embed_htod={:.1}us pass_submit={:.1}us gpu_wait_dtoh={:.1}us after_experts={:.1}us total={:.1}us",
@@ -1884,7 +1924,9 @@ impl<'a> GpuModel<'a> {
 
     /// Snapshot the current saved state into `parked` and persist to `prompt_cache_path` (Warm Start).
     pub(crate) fn sync_saved_to_prompt_cache(&mut self) -> anyhow::Result<()> {
-        if self.prompt_cache_path.is_none() { return Ok(()) }
+        // Unified KV lives in one budget and can be reclaimed; parking it would copy the whole slot to host RAM and
+        // the parked prefix ownership is not tracked per slot.
+        if self.kv_budget > 0 || self.prompt_cache_path.is_none() { return Ok(()) }
         if let Some(pk) = self.snapshot_saved()? {
             self.insert_parked(pk);
             self.save_prompt_cache()?;
@@ -2059,6 +2101,7 @@ impl<'a> GpuModel<'a> {
             for (b, d) in m.slot().iter().zip(&c.slot) { m.gpu.put(d, b, 0)?; }
             for ((b, _), d) in m.kv_bufs().iter().zip(&c.kv) { m.gpu.put(d, b, 0)?; }
             (m.saved_pos, m.saved_ple_prev, m.saved_ids, m.saved_owner) = (p.ids.len(), c.ple_prev, p.ids.clone(), p.owner);
+            m.history = p.ids.clone();
             q = m.next.as_deref_mut();
         }
         self.restore_state()
@@ -2071,6 +2114,7 @@ impl<'a> GpuModel<'a> {
             let s = q.sys.as_ref().ok_or_else(|| anyhow::anyhow!("unstash without stash"))?;
             for (b, d) in q.slot().iter().zip(&s.0) { q.gpu.put(d, b, 0)?; }
             (q.saved_pos, q.saved_ple_prev, q.saved_ids, q.saved_owner) = (s.1, s.2, s.3.clone(), q.sys_owner);
+            q.history = s.3.clone();
             p = q.next.as_deref_mut();
         }
         self.restore_state()
@@ -2096,11 +2140,12 @@ impl<'a> GpuModel<'a> {
         if !self.has_delta() {
             ensure!((1..=self.tmax()).contains(&keep) && start + keep <= self.pos, "rollback: keep {keep} of verify at {start}");
             self.pos = start + keep;
+            self.history.truncate(start + keep);
             if let Some(n) = self.next.as_mut() { n.rollback(start, keep)?; }
             return Ok(());
         }
         let nsnap = self.nsnap;
-        if !(1..=nsnap).contains(&keep) || start + keep > self.pos { bail!("rollback: keep {keep} of verify at {start}"); }
+        if !(1..=nsnap).contains(&keep) || start + keep > self.pos { bail!("rollback: keep {keep} of verify at {start} (pos {}, snapshots {nsnap})", self.pos); }
         if self.layers.iter().any(|l| matches!(l.mixer, Mixer::Delta { .. })) {
             let g = &self.gpu;
             let stride = g.delta_snap_stride().max(1);
@@ -2150,6 +2195,7 @@ impl<'a> GpuModel<'a> {
             }
         }
         self.pos = start + keep;
+        self.history.truncate(start + keep);
         if let Some(n) = self.next.as_mut() { n.rollback(start, keep)?; }
         Ok(())
     }
@@ -2173,7 +2219,9 @@ impl<'a> GpuModel<'a> {
         let t = self.tail();
         let _ = t.finish(rem.len(), gq_min(self.pos, rem.len()), None)?;
         t.gpu.sync()?;
-        self.after_forward(rem.len())
+        self.after_forward(rem.len())?;
+        self.history_push_all(rem);
+        Ok(())
     }
 
     /// Return to the state of the last `save_state`.

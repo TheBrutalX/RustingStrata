@@ -207,8 +207,8 @@ impl GpuModel<'_> {
         // the slot's position and capacity consistent; the prompt cache can come back once the prefix ownership is
         // tracked per slot.
         let (sys, keep, reused) = if self.kv_budget > 0 {
-            self.reset()?;
-            (0, 0, 0)
+            let reused = self.cache_begin_unified(tokens, keep)?;
+            (0, keep, reused)
         } else {
             let reused = self.cache_begin(tokens, keep)?;
             // The restored/stashed state must leave the write cursor at the prefix it reused; a stale `pos` from the
@@ -232,7 +232,7 @@ impl GpuModel<'_> {
         // A restored state can be longer than the HTTP prompt-cache prefix (`keep`), e.g. a parked conversation or a
         // stashed system block. Start at the further of the two, or the full state would be prefilled a second time.
         let start = if reused >= tokens.len() { tokens.len() - 1 } else { keep.max(from) };
-        if reused >= tokens.len() { self.pos = start; }
+        if reused >= tokens.len() { self.pos = start; self.history.truncate(start); }
         let logits = self.prefill_with(&tokens[start..], between)?;
         self.ext_draft_sync_prompt(tokens)?;
         if let Some(ng) = self.ngram.as_mut() { ng.begin(tokens); }
@@ -256,6 +256,8 @@ impl GpuModel<'_> {
             n
         } else if extends {
             self.restore_state()?;
+            let ids = self.saved_ids.clone();
+            self.history_set_all(&ids);
             hit
         } else if stashed > 0 {
             self.park()?;
@@ -269,7 +271,27 @@ impl GpuModel<'_> {
         // The stash stays valid while its KV entries do: this prompt rewrites them only past `reused`. A parked state
         // brings its own KV, which may have been computed in other chunks.
         if best.is_some() || stashed == 0 && self.sys.as_ref().is_some_and(|s| reused < s.3.len()) { self.sys = None; }
+        anyhow::ensure!(self.history.len() == reused, "cache_begin: history {} tokens, reused {reused}", self.history.len());
         Ok(reused)
+    }
+
+    /// `cache_begin` for `--kv-unified`: reuse only an intact saved prefix, never park or stash a multi-GB KV in host
+    /// RAM. A diverging prompt resets the slot; a reclaimed slot has already lost its `saved_ids`/history.
+    fn cache_begin_unified(&mut self, tokens: &[u32], keep: usize) -> anyhow::Result<usize> {
+        self.rope_offset = 0;
+        let hit = self.saved_ids.len();
+        let extends = hit > 0 && hit <= keep && hit <= self.kv_rows() && self.saved_pos == hit
+            && self.saved_owner == self.owner && tokens[..keep].starts_with(&self.saved_ids);
+        if extends {
+            self.restore_state()?;
+            let ids = self.saved_ids.clone();
+            self.history_set_all(&ids);
+            anyhow::ensure!(self.history.len() == hit, "cache_begin_unified: history {} tokens, reused {hit}", self.history.len());
+            Ok(hit)
+        } else {
+            self.reset()?;
+            Ok(0)
+        }
     }
 
     /// `prefill_cached` for several slots in shared forwards (models with `batch_cap`): `jobs` holds (slot, owner,
@@ -298,7 +320,7 @@ impl GpuModel<'_> {
             self.use_slot(sl);
             self.kv_need(sl, tokens.len())?;
             self.owner = owner;
-            let n = self.cache_begin(tokens, keep)?;
+            let n = if self.kv_budget > 0 { self.cache_begin_unified(tokens, keep)? } else { self.cache_begin(tokens, keep)? };
             if dense {
                 if sys > n { self.pos = sys; self.stash(&tokens[..sys])?; }
                 if keep > n.max(sys) {
@@ -973,6 +995,7 @@ impl GpuModel<'_> {
             df.pend_ctx = 0;
         }
         self.pos += toks.len();
+        self.history.extend_from_slice(toks);
         let Some(nx) = self.next.as_deref_mut() else { return Ok(()) };
         let xs = self.gpu.get::<f32>(&self.pf.as_ref().unwrap().slab, 0, toks.len() * d)?;
         nx.prefill_chunk(toks, Some((&xs, pe)), None)
@@ -1078,6 +1101,7 @@ impl GpuModel<'_> {
         let mut q = Some(&mut *self);
         while let Some(p) = q {
             for &(s, ..) in rows { *p.slot_pos(s) += 1; }
+            for &(s, tok, _) in rows { p.slot_ids_mut(s).push(tok); }
             p.row_tokens += t;
             p.after_experts(t, p.row_tokens)?;
             q = p.next.as_deref_mut();
