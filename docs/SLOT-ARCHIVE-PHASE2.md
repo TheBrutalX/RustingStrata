@@ -88,6 +88,69 @@ trade-off; zstd at -3 could be an optional later flag, not a default. The real l
 deduplication of shared prefixes (same system prompt/tools/RAG) via a content-addressed segment store, which is
 phase 3 and changes the storage layout, not a codec.
 
+### 2.3 Deduplication (chosen)
+
+Deduplication is promoted from “phase 3 idea” to a chosen phase-2 workstream. It is the largest storage and
+write-amplification win, and it does not depend on quantization or compression.
+
+**Problem.** Every checkpoint currently writes the whole slot again, including the KV rows of the system prompt,
+tools, RAG documents and every earlier turn. A new turn writes the full prefix; two conversations with the same
+system prompt write it twice. Lineage pruning only removes older whole files; it does not share bytes.
+
+**Unit.** A segment is a fixed token range `[start, end)` of a history (for example 1024 tokens, aligned from
+position 0). A segment stores the K/V rows for its positions (and, for recovery/debug, its token ids). Segment id:
+
+```
+segment_id = hash(fingerprint, kv_layout, start, end, parent_segment_id, tokens[start..end])
+```
+
+The parent chain is required: the KV of a token depends on the whole prefix, not only on the segment's own
+tokens. A shared system prompt produces the same chain and therefore the same segments; a branch shares only
+the prefix before its divergence. A checkpoint stores the leaf chain plus the final recurrent/MTP state.
+
+**Write path.** Find the longest existing chain that matches the new history (manifest/index lookup, same
+owner/fingerprint); write only the segments after the last matching boundary and the final partial segment. An
+entry references the ordered segment ids and stores the recurrent state and owner as today. A conversation that
+grows by 2k tokens writes ~2 new 1k segments, not the whole 50k-token prefix.
+
+**Read path.** Resolve the chain, read the segment files in order, install the KV rows, then install the
+entry's recurrent state. Segment reads are sequential and can use the same bounded ring as the async restore.
+A missing/corrupt segment rejects the entry and falls back to prefill.
+
+**GC and references.** Segments are content-addressed and refcounted by entries. The manifest (or a sidecar
+segment table) tracks references; GC deletes a segment when its refcount reaches zero, and skips segments leased
+by an in-flight restore/save. Archive entry TTL/pin/LRU applies to entries; segments disappear with their last
+entry. A segment is shared by entries but never exposed by the HTTP API.
+
+**Privacy.** Segments are global within the archive directory, so two entries with the exact same token prefix
+share bytes. Entries remain owner-scoped and only an entry with the matching owner/fingerprint can be restored;
+a shared segment does not give one key access to another key's entry. If the operator wants stricter isolation,
+a `--slot-archive-dedup owner` mode namespaces segments by owner at the cost of hit rate. The default is global
+within the server, matching the fact that the same tokens produce the same KV.
+
+**Trade-offs.**
+
+- Segment size: 256 tokens gives more sharing and smaller writes but more files/metadata; 1024–2048 is a better
+  default for agents with long prefixes. Benchmark 512/1024/2048.
+- The fixed ~66 MB recurrent/MTP state is still stored per entry. Deduplicating it at boundaries is possible
+  (same chain → same state) but adds complexity; leave it per entry for v2 and revisit.
+- Directory layout: `segments/<2 hex>/<id>.bin`; refcounts in the manifest/segment table; orphan adoption on
+  startup.
+- Format: a new archive entry format/version (`STRATASLOT` v2 or a segment sidecar). The explicit
+  `--slot-save-path` files remain v1; v1 archive entries remain readable, new entries use segments.
+- Crash safety: write segment temp + rename, then the entry manifest; a crash leaves orphan segments (adopted or
+  GC'd), never an entry pointing at a missing segment.
+- Expected win: large shared system prompt/tools/RAG and every growing conversation; unrelated one-shot
+  conversations only save the rewrite of their own prefix, which is still the common case.
+
+**Acceptance.** A checkpoint after N new tokens writes ~N/segment-size new segment bytes, not the full state; a
+second conversation sharing a 20k-token system prompt reuses its segments; restore is bit-exact; deleting one
+entry does not delete segments still referenced by another; crash/orphan and owner-isolation tests pass.
+
+Deduplication changes the storage layout, so it lands after the async job/lease model (which it needs for
+refcounts) and before TTL/quota polish. It is independent of the async writer: it can be implemented on the
+synchronous path first, then switched to the chunked writer.
+
 ## 3. Goals and non-goals
 
 ### Goals
@@ -118,11 +181,12 @@ phase 3 and changes the storage layout, not a codec.
 | P0 | B. Async save writer | Disk off the model thread |
 | P0 | C. Async restore reader | Disk read off the model thread |
 | P0 | D. Leases and lock scope | No DELETE/GC race; archive mutex not held over I/O |
-| P1 | E. Shutdown checkpoint | Opt-in, deadline, bounded |
-| P1 | F. TTL / per-key quota / pin | Lifecycle and fairness |
-| P1 | G. Manifest batching/journal | 10k+ entries, fewer rewrites |
-| P2 | H. Metrics/alerts and soak tests | Operability |
-| P3 | I. Multi-version/branch retention | Rollback/branch workflow |
+| P1 | E. Segment dedup | Share KV prefixes; write only new segments |
+| P1 | F. Shutdown checkpoint | Opt-in, deadline, bounded |
+| P1 | G. TTL / per-key quota / pin | Lifecycle and fairness |
+| P1 | H. Manifest batching/journal | 10k+ entries, fewer rewrites |
+| P2 | I. Metrics/alerts and soak tests | Operability |
+| P3 | J. Multi-version/branch retention | Rollback/branch workflow |
 
 P0 is one coherent change: splitting the format I/O and adding a bounded pipeline. E/F can proceed in parallel
 once the job model exists. G should be justified by a measured manifest size, not done pre-emptively.
@@ -356,25 +420,38 @@ After the chunk protocol is defined (one interface commit), four agents can work
 Dependencies: scheduler needs the chunk API; lifecycle needs leases; verification can write harnesses against the
 documented states first. Keep the phase-1 E2E (`test_slot_archive.sh`, `test_slot_save.sh`) green throughout.
 
-## 15. Open decisions
+## 15. Chosen decisions and remaining questions
 
-1. Ring size/default (`--slot-archive-stage-mb`): 128, 256 or 512 MB? One active job or two?
-2. Chunk size: keep 64 MB or drop to 16 MB for latency?
-3. Should `action=checkpoint` be synchronous (simple, deterministic) or return a job id (async)? Recommendation:
-   keep synchronous; automatic triggers async.
-4. Shutdown checkpoint default: off (phase 1 choice) or on when the archive is enabled? Recommendation: off by
-   default, documented as recommended for overnight use.
-5. TTL default: off or 30 days? Per-key quota default: off or a fraction of the global budget?
-6. Manifest: batched JSON first, journal only if 10k+ entries are real. Confirm target entry count.
-7. Pin API shape and `--slot-archive-pin-gb` default.
-8. Should a chat waiting for a saving slot cancel the save after a timeout, losing that checkpoint? Recommendation:
-   wait up to a short deadline, then use another slot or prefill; never fail the chat.
-9. Do we need restore read-ahead depth > 1? Benchmark on NVMe.
-10. Compression: not in phase 2; revisit only for token history, not KV.
+### Chosen (approved)
 
-### Proposed defaults (tuning)
+- **Deduplication: yes.** Content-addressed KV segments with parent-chain ids, global within the archive
+  directory, owner-scoped entries, default segment size 1024 tokens (benchmark 512/1024/2048), refcounted and
+  GC'd with the manifest. New entries use a v2 segment layout; v1 entries remain readable. It lands after the
+  async job/lease model and before TTL/quota polish.
+- **Async pipeline:** chunked, bounded ring, one save + one restore in flight, restore prioritized.
+- **Explicit `action=checkpoint` stays synchronous**; automatic triggers use the pipeline.
+- **Leases/refcounts** protect in-flight entries; the archive mutex is never held over a GPU copy or disk I/O.
+- **Shutdown checkpoint is opt-in (off)** with a 30 s deadline.
+- **TTL and per-key quota are off by default**; documented recommendations are 30 days and 25% of the global
+  budget (or 20 GB) on shared servers.
+- **Pin** is an admin-only route, capped at 10% of the budget.
+- **Manifest:** batched JSON touches first; journal/SQLite only if a real 10k+ workload justifies it.
+- **Compression: off.** q4/q2 is the storage lever; no archive-only re-quantization.
+- **Owner-scoped restore, global segment sharing.** A shared segment never exposes another owner's entry.
 
-These are the values I would ship unless a benchmark says otherwise:
+### Still open (benchmark or operator input)
+
+1. Segment size: benchmark 512/1024/2048; the default is 1024 unless the numbers say otherwise.
+2. Ring size: 256 MB (4 × 64 MB) proposed; validate on NVMe.
+3. Chunk size: keep 64 MB unless latency measurements favor 16 MB.
+4. Restore read-ahead depth > 1: benchmark.
+5. Optional conversation-id hint for listing/deletion UX (matching remains token-based).
+6. Exact behavior when a chat waits for a saving slot: 2 s wait, then another slot/prefill.
+7. Whether to add an optional zstd mode later (6–8% saving; not now).
+
+### Chosen tuning defaults
+
+These are the approved defaults unless a benchmark in §15 changes a specific value:
 
 | setting | default | rationale |
 |---|---|---|
@@ -409,9 +486,11 @@ Do phase 2 in this order:
    long contexts.
 2. **Async restore read** + install split, leases and the manifest lock scope. This removes the remaining stall and
    the GC/delete race.
-3. **Shutdown checkpoint**, TTL, per-key quota, pin/unpin. These are small once the job model exists.
-4. **Manifest batching**; journal/SQLite only if a real 10k+ workload justifies it.
-5. **Metrics, fault injection, soak**, then reconsider branching/version retention.
+3. **Segment deduplication** (v2 entries): parent-chain KV segments, write only new segments, refcounted GC,
+   owner-scoped entries with global segment sharing.
+4. **Shutdown checkpoint**, TTL, per-key quota, pin/unpin. These are small once the job model exists.
+5. **Manifest batching**; journal/SQLite only if a real 10k+ workload justifies it.
+6. **Metrics, fault injection, soak**, then reconsider branching/version retention.
 
 USAGE/HOSTING should add the measured decomposition: the 10.9 GB/1M figure is q8 **KV**, correct for this model,
 and a checkpoint also carries ~66 MB of fixed slot state; q4/q2 reduce the KV to ~5.8/3.9 GB per 1M. A 200 GB
