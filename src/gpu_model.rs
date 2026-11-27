@@ -38,6 +38,7 @@ fn gq_min(pos: usize, nt: usize) -> i32 {
 
 
 mod prefill;
+mod slot;
 
 /// A tensor `GpuModel::load_part` never uploads: the PLE table stays on the CPU.
 fn cpu_only(name: &str) -> bool { name == "per_layer_token_embd.weight" }
