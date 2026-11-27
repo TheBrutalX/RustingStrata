@@ -45,12 +45,11 @@ fn push_copy_chunks(plan: &mut Vec<CopyPlan>, part: usize, buf: &Buf, offset: us
 /// segmented variants keep their old behaviour by passing this for `between`.
 fn no_yield(_: &mut GpuModel<'_>) -> Result<()> { Ok(()) }
 
-/// The framing and bounded copies of one model part in a `STRATASLOT` stream.
-struct SlotPartPlan {
-    saved_frame: Vec<u8>,
-    saved: Vec<CopyPlan>,
-    kv_frame: Vec<u8>,
-    kv: Vec<CopyPlan>,
+/// One step of a `STRATASLOT` save: a framing write or a bounded GPU→host copy. The frame and its data must stay
+/// interleaved exactly as the v1 format defines (`len`, bytes, `len`, bytes, ...).
+enum SlotWriteStep {
+    Frame(Vec<u8>),
+    Copy(CopyPlan),
 }
 
 /// Magic of a segmented K/V payload (`STRKVSEG`), see [`GpuModel::save_kv_segment`].
@@ -649,37 +648,53 @@ impl GpuModel<'_> {
         self.save_state()?;
         let r = (|| -> Result<u64> {
             for part in 0..n_parts {
-                // Frame of this part: PLE pair, the recurrent buffer count/lengths, then the KV count/row sizes.
-                // Everything is validated before a byte is copied into the slot.
-                let (ple0, ple1, saved, kv) = {
+                // The v1 format interleaves each length with its bytes: PLE pair, n_slot, then
+                // (len, bytes) per recurrent buffer, n_kv, then (row, bytes) per KV buffer. Read and install each
+                // buffer immediately; the resumable callback runs between its bounded chunks.
+                self.use_slot(slot);
+                let (ple0, ple1) = {
+                    let p = self.part_mut(part)?;
+                    let _ = p;
+                    (slot_file::read_u64(&mut inp)? as i64, slot_file::read_u64(&mut inp)? as i64)
+                };
+                let n_slot = {
                     self.use_slot(slot);
                     let p = self.part_mut(part)?;
-                    let ple0 = slot_file::read_u64(&mut inp)? as i64;
-                    let ple1 = slot_file::read_u64(&mut inp)? as i64;
                     let n_slot = slot_file::read_u32(&mut inp)? as usize;
-                    let bufs = p.slot();
-                    ensure!(n_slot == bufs.len(), "slot file has {n_slot} recurrent buffers, this model has {}", bufs.len());
-                    let mut saved = Vec::new();
-                    for b in bufs {
+                    ensure!(n_slot == p.slot().len(), "slot file has {n_slot} recurrent buffers, this model has {}", p.slot().len());
+                    n_slot
+                };
+                for i in 0..n_slot {
+                    self.use_slot(slot);
+                    let (b, len) = {
+                        let p = self.part_mut(part)?;
+                        let b = p.slot()[i];
                         let len = slot_file::read_u64(&mut inp)? as usize;
                         ensure!(len == b.len(), "slot file recurrent buffer {len} bytes, this model has {}", b.len());
-                        push_copy_chunks(&mut saved, part, b, 0, len);
-                    }
+                        (Buf::clone(b), len)
+                    };
+                    self.read_copies(slot, &[(part, b, 0, len)], &mut inp, between)?;
+                }
+                let n_kv = {
+                    self.use_slot(slot);
+                    let p = self.part_mut(part)?;
                     let n_kv = slot_file::read_u32(&mut inp)? as usize;
-                    let kv_bufs = p.kv_bufs();
-                    ensure!(n_kv == kv_bufs.len(), "slot file has {n_kv} KV buffers, this model has {}", kv_bufs.len());
-                    let mut kv = Vec::new();
-                    for (b, rows) in kv_bufs {
+                    ensure!(n_kv == p.kv_bufs().len(), "slot file has {n_kv} KV buffers, this model has {}", p.kv_bufs().len());
+                    n_kv
+                };
+                for i in 0..n_kv {
+                    self.use_slot(slot);
+                    let (b, bytes) = {
+                        let p = self.part_mut(part)?;
+                        let (b, rows) = p.kv_bufs()[i];
                         let row = slot_file::read_u64(&mut inp)? as usize;
                         ensure!(row == b.len() / rows.max(1), "slot file KV row is {row} bytes, this model has {}", b.len() / rows.max(1));
                         let bytes = row.checked_mul(n).context("slot file KV size overflow")?;
                         ensure!(bytes <= b.len(), "slot file KV rows do not fit the slot buffer");
-                        push_copy_chunks(&mut kv, part, b, 0, bytes);
-                    }
-                    (ple0, ple1, saved, kv)
-                };
-                self.read_copies(slot, &saved, &mut inp, between)?;
-                self.read_copies(slot, &kv, &mut inp, between)?;
+                        (Buf::clone(b), bytes)
+                    };
+                    self.read_copies(slot, &[(part, b, 0, bytes)], &mut inp, between)?;
+                }
                 self.use_slot(slot);
                 let p = self.part_mut(part)?;
                 p.saved_ple_prev = [ple0, ple1];
@@ -857,43 +872,51 @@ impl GpuModel<'_> {
         // Allocate the recurrent copies and make the current recurrent state the saved one.
         self.save_state()?;
 
-        // Capture the framing and the buffer handles once. The clones keep the target slot's device memory alive
-        // if the callback selects another slot; `use_slot(slot)` at each copy makes the model state target it too.
-        let mut parts = Vec::new();
+        // Capture the framing and the buffer handles once, preserving the v1 interleaving: each buffer's length is
+        // written immediately before its bytes. The clones keep the target slot's device memory alive if the
+        // callback selects another slot; `use_slot(slot)` at each copy makes the model state target it too.
+        let mut steps = Vec::new();
         let mut part = 0usize;
         let mut q = Some(&mut *self);
         while let Some(p) = q {
-            let mut saved_frame = Vec::new();
-            for v in p.saved_ple_prev { slot_file::write_u64(&mut saved_frame, v as u64)?; }
+            let mut head = Vec::new();
+            for v in p.saved_ple_prev { slot_file::write_u64(&mut head, v as u64)?; }
             let slot_bufs = p.slot();
-            slot_file::write_u32(&mut saved_frame, slot_bufs.len() as u32)?;
-            let mut saved = Vec::new();
+            slot_file::write_u32(&mut head, slot_bufs.len() as u32)?;
+            steps.push(SlotWriteStep::Frame(head));
             for b in slot_bufs {
-                slot_file::write_u64(&mut saved_frame, b.len() as u64)?;
-                push_copy_chunks(&mut saved, part, b, 0, b.len());
+                let mut len = Vec::new();
+                slot_file::write_u64(&mut len, b.len() as u64)?;
+                steps.push(SlotWriteStep::Frame(len));
+                let mut plan = Vec::new();
+                push_copy_chunks(&mut plan, part, b, 0, b.len());
+                steps.extend(plan.into_iter().map(SlotWriteStep::Copy));
             }
             let kv = p.kv_bufs();
-            let mut kv_frame = Vec::new();
-            slot_file::write_u32(&mut kv_frame, kv.len() as u32)?;
-            let mut kv_plan = Vec::new();
+            let mut kv_head = Vec::new();
+            slot_file::write_u32(&mut kv_head, kv.len() as u32)?;
+            steps.push(SlotWriteStep::Frame(kv_head));
             for (b, rows) in kv {
                 let row = b.len() / rows.max(1);
-                slot_file::write_u64(&mut kv_frame, row as u64)?;
+                let mut frame = Vec::new();
+                slot_file::write_u64(&mut frame, row as u64)?;
+                steps.push(SlotWriteStep::Frame(frame));
                 let bytes = row.checked_mul(tokens.len()).context("slot file KV size overflow")?;
-                push_copy_chunks(&mut kv_plan, part, b, 0, bytes);
+                let mut plan = Vec::new();
+                push_copy_chunks(&mut plan, part, b, 0, bytes);
+                steps.extend(plan.into_iter().map(SlotWriteStep::Copy));
             }
-            parts.push(SlotPartPlan { saved_frame, saved, kv_frame, kv: kv_plan });
             part += 1;
             q = p.next.as_deref_mut();
         }
 
         let mut out = Count::new(out);
         slot_file::write_header(&mut out, header, tokens)?;
-        for pp in &parts {
-            out.write_all(&pp.saved_frame)?;
-            self.write_copies(slot, &pp.saved, &mut out, between)?;
-            out.write_all(&pp.kv_frame)?;
-            self.write_copies(slot, &pp.kv, &mut out, between)?;
+        for step in steps {
+            match step {
+                SlotWriteStep::Frame(frame) => out.write_all(&frame)?,
+                SlotWriteStep::Copy(copy) => self.write_copies(slot, &[copy], &mut out, between)?,
+            }
         }
         let payload = out.count();
         slot_file::write_footer(&mut out, payload)?;
