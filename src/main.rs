@@ -2249,7 +2249,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             });
             let s = Serving { rx: rx.into(), waiting, stop, addr, allowed_hosts, keys, usage, max_tokens: host.max_tokens.unwrap_or(usize::MAX), dir, model: model.clone(), extra,
                 dl: Default::default(), stats, opts: Default::default(), idle: host.auto_unload.map(Duration::from_secs),
-                slot_save_path: host.slot_save_path.clone(), archive, asleep: Default::default(), parked: Default::default(), alias: host.alias };
+                slot_save_path: host.slot_save_path.clone(), archive, pending: Default::default(), asleep: Default::default(), parked: Default::default(), alias: host.alias };
             // The model to load next and the /api/load request waiting for the outcome (none for --model).
             let mut next = model.map(|p| (p, None));
             say!("listening on {} (models folder: {})", term::hl(&url), s.dir.display());
@@ -3443,6 +3443,9 @@ struct Serving {
     slot_save_path: Option<PathBuf>,
     /// `--slot-archive-dir`: the automatic conversation archive; the archive routes answer 501 without it.
     archive: Option<ArchiveHandle>,
+    /// Automatic archive commits still writing their file or manifest. Shared across model loads and joined when a
+    /// serving loop ends (bounded: a wedged disk must not hold shutdown).
+    pending: PendingSaves,
     /// The model `--auto-unload` freed (while another loads for a chat request: the model to go back to if that load
     /// fails), and the chat request that waits for a load (answered once the model has loaded).
     asleep: std::sync::Mutex<Option<PathBuf>>,
@@ -3481,7 +3484,16 @@ fn on_sigterm() -> &'static std::sync::atomic::AtomicBool {
 impl Serving {
     /// Answers requests until one asks for a model to be loaded, or until the model is to be freed or loaded again
     /// for `--auto-unload`.
-    fn serve(&self, mut l: Option<&mut Loaded>, e: &Engine) -> Next {
+    fn serve(&self, l: Option<&mut Loaded>, e: &Engine) -> Next {
+        let next = self.serve_loop(l, e);
+        // Every loop end (stop, idle, model switch) happens after the model thread and its request threads: join
+        // the automatic archive commits, bounded so a wedged disk cannot hold a restart.
+        drain_pending_saves(&self.pending);
+        next
+    }
+
+    /// One serving loop; [`Serving::serve`] drains the background archive commits after it returns.
+    fn serve_loop(&self, mut l: Option<&mut Loaded>, e: &Engine) -> Next {
         if l.is_some() { *self.asleep.lock().unwrap() = None; }
         if let Some(l) = l.as_deref_mut() && matches!(&l.r, Runner::Gpu(g) if g.slots() > 1) { return self.serve_slots(l, e); }
         let rx = self.rx.lock().unwrap();
@@ -3564,6 +3576,33 @@ impl Serving {
 /// The archive handle shared by the serving loop, the scheduler and the explicit routes.
 type ArchiveHandle = std::sync::Arc<std::sync::Mutex<Archive>>;
 
+/// Background archive commits started by automatic checkpoints, shared by the serving loop, the scheduler and the
+/// single-slot path (docs/SLOT-ARCHIVE-PHASE2.md §5.2).
+type PendingSaves = std::sync::Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>>;
+
+/// How long shutdown waits for in-flight automatic commits. The writer may still be copying a multi-GB file to a
+/// slow disk; a restart must not hang on it, so the rest are logged and left to finish (or die) with the process.
+const PENDING_SAVE_JOIN: Duration = Duration::from_secs(10);
+
+/// Wait for the background commits taken by [`checkpoint_slot`], but never longer than `timeout`.
+fn drain_pending_saves_within(pending: &PendingSaves, timeout: Duration) {
+    let handles: Vec<_> = std::mem::take(&mut *pending.lock().unwrap_or_else(|p| p.into_inner()));
+    let n = handles.len();
+    if n == 0 { return; }
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Join on a helper thread so a wedged disk cannot hold the serving loop: `recv_timeout` is the bound.
+    std::thread::spawn(move || {
+        for h in handles { let _ = h.join(); }
+        let _ = tx.send(());
+    });
+    if rx.recv_timeout(timeout).is_err() {
+        say!("archive: {n} background save(s) still writing at shutdown; not waiting further");
+    }
+}
+
+/// [`drain_pending_saves_within`] with the server's bounded shutdown wait.
+fn drain_pending_saves(pending: &PendingSaves) { drain_pending_saves_within(pending, PENDING_SAVE_JOIN); }
+
 /// Parse a `--slot-archive-ttl` duration into milliseconds. A plain number means seconds; `d`, `h`, `m` and `s`
 /// are the units, and `0` disables the TTL. Fractions are refused rather than silently rounded.
 fn parse_ttl(s: &str) -> anyhow::Result<u64> {
@@ -3588,58 +3627,122 @@ fn parse_ttl(s: &str) -> anyhow::Result<u64> {
 /// One successful checkpoint's metadata, for the explicit `action=checkpoint` answer.
 struct CheckpointInfo { id: String, n_saved: usize, n_written: u64, save_ms: f64 }
 
+/// How `checkpoint_slot` writes the file (docs/SLOT-ARCHIVE-PHASE2.md §5.2 and §15). Automatic triggers stream on
+/// the async writer; an explicit admin action waits for the file and the manifest commit, because its caller
+/// expects both in the answer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SaveMode {
+    Sync,
+    Async,
+}
+
+/// Record a background save failure: metrics and the log, without an archive lock held by the caller.
+fn note_save_failure(archive: &ArchiveHandle, path: &Path, e: &anyhow::Error, reason: &str) {
+    if let Ok(mut a) = archive.lock() { a.note_failure(); }
+    let _ = std::fs::remove_file(path);
+    say!("archive: async save reason={reason} failed: {e:#}");
+}
+
 /// Save the idle slot `slot` to the archive, if policy allows it. One place for the divergence, eviction and
 /// explicit triggers (docs/SLOT-ARCHIVE.md §9). `target` is the slot the caller is about to use: the model cursor is
 /// left there, never on a victim. A failure is returned for the caller to log or surface; it never fails a chat.
-fn checkpoint_slot(archive: &ArchiveHandle, g: &mut GpuModel, slot: usize, target: usize, reason: &str, busy: bool)
-    -> anyhow::Result<Option<CheckpointInfo>> {
+///
+/// The archive lock covers only the manifest work (prefix check, `prepare_save`, `touch`, `commit_save`). The GPU
+/// copy and the disk write run outside it. In [`SaveMode::Async`] the model thread hands the bytes to the writer
+/// and the join + commit continue on a background thread pushed to `pending`; the slot is free to be reused because
+/// the async save captured an immutable stream and set `saved_ids`/`saved_owner` at hand-off.
+#[allow(clippy::too_many_arguments)]
+fn checkpoint_slot(archive: &ArchiveHandle, g: &mut GpuModel, slot: usize, target: usize, reason: &str, busy: bool,
+                   mode: SaveMode, pending: &PendingSaves) -> anyhow::Result<Option<CheckpointInfo>> {
     if busy || slot >= g.slots() { return Ok(None); }
     let tokens = g.slot_tokens(slot).to_vec();
     if tokens.is_empty() { return Ok(None); }
-    let mut a = match archive.lock() { Ok(a) => a, Err(_) => anyhow::bail!("slot archive lock poisoned") };
-    if tokens.len() < a.config().min_tokens { return Ok(None); }
-    // A partial state (mid-prefill/decode) or an image prompt (M-RoPE offset) is not a plain text prefix.
-    if g.slot_pos(slot) != tokens.len() || g.slot_shifted(slot) { return Ok(None); }
-    // The conversation's owner, not the request that triggered the eviction.
-    let owner = g.slot_owner(slot);
-    let fp = g.slot_fingerprint();
-    let small = a.longest_prefix(owner, &tokens, fp).is_some_and(|e| tokens.len().saturating_sub(e.n_tokens) < a.config().min_delta);
-    let (id, path) = match a.prepare_save(owner, &tokens, fp, reason) {
-        // The same state is already archived: only its LRU position changes, even below `min_delta`.
-        Ok(SaveSlot::Existing(e)) => {
-            a.touch(&e.id);
-            if g.current_slot() != target { g.use_slot(target); }
-            return Ok(Some(CheckpointInfo { id: e.id, n_saved: tokens.len(), n_written: 0, save_ms: 0.0 }));
+    // The manifest work is short; the lock is dropped before any GPU copy or disk I/O.
+    let (id, path) = {
+        let mut a = match archive.lock() { Ok(a) => a, Err(_) => anyhow::bail!("slot archive lock poisoned") };
+        if tokens.len() < a.config().min_tokens { return Ok(None); }
+        // A partial state (mid-prefill/decode) or an image prompt (M-RoPE offset) is not a plain text prefix.
+        if g.slot_pos(slot) != tokens.len() || g.slot_shifted(slot) { return Ok(None); }
+        // The conversation's owner, not the request that triggered the eviction.
+        let owner = g.slot_owner(slot);
+        let fp = g.slot_fingerprint();
+        let small = a.longest_prefix(owner, &tokens, fp).is_some_and(|e| tokens.len().saturating_sub(e.n_tokens) < a.config().min_delta);
+        match a.prepare_save(owner, &tokens, fp, reason) {
+            // The same state is already archived: only its LRU position changes, even below `min_delta`.
+            Ok(SaveSlot::Existing(e)) => {
+                a.touch(&e.id);
+                if g.current_slot() != target { g.use_slot(target); }
+                return Ok(Some(CheckpointInfo { id: e.id, n_saved: tokens.len(), n_written: 0, save_ms: 0.0 }));
+            }
+            Ok(SaveSlot::New { .. }) if small => {
+                if g.current_slot() != target { g.use_slot(target); }
+                return Ok(None);
+            }
+            Ok(SaveSlot::New { id, path }) => (id, path),
+            Err(e) => { a.note_failure(); return Err(e); }
         }
-        Ok(SaveSlot::New { .. }) if small => {
-            if g.current_slot() != target { g.use_slot(target); }
-            return Ok(None);
-        }
-        Ok(SaveSlot::New { id, path }) => (id, path),
-        Err(e) => { a.note_failure(); return Err(e); }
     };
+    let (owner, fp) = (g.slot_owner(slot), g.slot_fingerprint());
     let t = Instant::now();
-    let written = match g.save_slot_file_as(slot, &path, owner) {
-        Ok(n) => n,
-        Err(e) => {
-            a.note_failure();
-            let _ = std::fs::remove_file(&path);
+    match mode {
+        SaveMode::Sync => {
+            let written = match g.save_slot_file_as(slot, &path, owner) {
+                Ok(n) => n,
+                Err(e) => {
+                    if let Ok(mut a) = archive.lock() { a.note_failure(); }
+                    let _ = std::fs::remove_file(&path);
+                    if g.current_slot() != target { g.use_slot(target); }
+                    return Err(e);
+                }
+            };
             if g.current_slot() != target { g.use_slot(target); }
-            return Err(e);
+            let saved = match archive.lock() { Ok(mut a) => a.commit_save(&id, &path, owner, &tokens, fp, reason), Err(_) => Err(anyhow::anyhow!("slot archive lock poisoned")) };
+            match saved {
+                Ok(e) => {
+                    let save_ms = t.elapsed().as_secs_f64() * 1e3;
+                    say!("archive: saved slot {slot} reason={reason} n={} bytes={written} ms={save_ms:.1}", tokens.len());
+                    Ok(Some(CheckpointInfo { id: e.id, n_saved: tokens.len(), n_written: written, save_ms }))
+                }
+                Err(e) => {
+                    if let Ok(mut a) = archive.lock() { a.note_failure(); }
+                    let _ = std::fs::remove_file(&path);
+                    Err(e)
+                }
+            }
         }
-    };
-    let saved = a.commit_save(&id, &path, owner, &tokens, fp, reason);
-    if g.current_slot() != target { g.use_slot(target); }
-    match saved {
-        Ok(e) => {
-            let save_ms = t.elapsed().as_secs_f64() * 1e3;
-            say!("archive: saved slot {slot} reason={reason} n={} bytes={written} ms={save_ms:.1}", tokens.len());
-            Ok(Some(CheckpointInfo { id: e.id, n_saved: tokens.len(), n_written: written, save_ms }))
-        }
-        Err(e) => {
-            a.note_failure();
-            let _ = std::fs::remove_file(&path);
-            Err(e)
+        SaveMode::Async => {
+            // Returns once every byte is in the writer's ring; from here the stream is immutable and the slot may
+            // be reused (the model thread also has its owner and the saved-state marker restored).
+            let save = match g.save_slot_file_async_as(slot, &path, owner) {
+                Ok(s) => s,
+                Err(e) => {
+                    if let Ok(mut a) = archive.lock() { a.note_failure(); }
+                    let _ = std::fs::remove_file(&path);
+                    if g.current_slot() != target { g.use_slot(target); }
+                    return Err(e);
+                }
+            };
+            if g.current_slot() != target { g.use_slot(target); }
+            let n_saved = tokens.len();
+            let (bg_archive, bg_id, bg_path, bg_reason) = (archive.clone(), id.clone(), path.clone(), reason.to_string());
+            let handle = std::thread::spawn(move || {
+                let save_ms = t.elapsed().as_secs_f64() * 1e3;
+                let written = match save.join() {
+                    Ok(n) => n,
+                    Err(e) => { note_save_failure(&bg_archive, &bg_path, &e, &bg_reason); return; }
+                };
+                // The archive lock is taken only for the manifest commit, after the file is complete.
+                let saved = match bg_archive.lock() {
+                    Ok(mut a) => a.commit_save(&bg_id, &bg_path, owner, &tokens, fp, &bg_reason),
+                    Err(_) => Err(anyhow::anyhow!("slot archive lock poisoned")),
+                };
+                match saved {
+                    Ok(_) => say!("archive: saved slot {slot} reason={bg_reason} n={n_saved} bytes={written} ms={save_ms:.1} async=1"),
+                    Err(e) => note_save_failure(&bg_archive, &bg_path, &e, &bg_reason),
+                }
+            });
+            pending.lock().unwrap_or_else(|p| p.into_inner()).push(handle);
+            Ok(Some(CheckpointInfo { id, n_saved, n_written: 0, save_ms: t.elapsed().as_secs_f64() * 1e3 }))
         }
     }
 }
@@ -3655,11 +3758,12 @@ fn archive_lookup(archive: &ArchiveHandle, owner: u64, ids: &[u32], keep: usize,
     }
 }
 
-/// Restore `entry` into an idle slot with the existing validated reader. Records the outcome in the metrics; the
-/// caller decides whether to fall back to the normal prefill.
+/// Restore `entry` into an idle slot with the validated async reader. Records the outcome in the metrics; the
+/// caller decides whether to fall back to the normal prefill. The caller's entry lease is held through the call.
 fn archive_restore(archive: &ArchiveHandle, g: &mut GpuModel, slot: usize, entry: &ArchiveEntry) -> anyhow::Result<usize> {
     let t = Instant::now();
-    let r = g.restore_slot_file(slot, &entry.file, false);
+    // The disk read runs on the reader thread; the model thread still performs the H2D copies and install.
+    let r = g.restore_slot_file_async(slot, &entry.file, false);
     let mut a = match archive.lock() { Ok(a) => a, Err(_) => anyhow::bail!("slot archive lock poisoned") };
     match r {
         Ok(_) => {
@@ -3674,7 +3778,7 @@ fn archive_restore(archive: &ArchiveHandle, g: &mut GpuModel, slot: usize, entry
 /// Single-slot archive policy: restore a matching entry into slot 0 before the prefill, else checkpoint a slot whose
 /// conversation the prompt diverges from. Everything is best-effort: a failure only logs and leaves the normal
 /// prefill path in place (docs/SLOT-ARCHIVE.md §13).
-fn archive_before_single(archive: &ArchiveHandle, g: &mut GpuModel, owner: u64, ids: &[u32], keep: usize) {
+fn archive_before_single(archive: &ArchiveHandle, g: &mut GpuModel, owner: u64, ids: &[u32], keep: usize, pending: &PendingSaves) {
     let hit = archive_lookup(archive, owner, ids, keep, g.slot_fingerprint(), g.ctx());
     // The lease lives until the restore finishes (or the block is left without one). It cannot outlive this
     // function, and no queue wait happens while it is held.
@@ -3686,7 +3790,7 @@ fn archive_before_single(archive: &ArchiveHandle, g: &mut GpuModel, owner: u64, 
             let blocked = g.kv_reclaim_plan(0, hit.n_tokens).iter().any(|&v| v != 0 && !g.slot_tokens(v).is_empty());
             if !blocked {
                 if !g.slot_tokens(0).is_empty()
-                    && let Err(e) = checkpoint_slot(archive, g, 0, 0, "evict", false) {
+                    && let Err(e) = checkpoint_slot(archive, g, 0, 0, "evict", false, SaveMode::Async, pending) {
                     say!("archive: checkpoint slot 0 before restore: {e:#}");
                 }
                 match archive_restore(archive, g, 0, &hit) {
@@ -3701,13 +3805,13 @@ fn archive_before_single(archive: &ArchiveHandle, g: &mut GpuModel, owner: u64, 
     // The prompt diverges from the slot's history (switch or compact): save it before `prefill_cached` resets it.
     let h = g.slot_tokens(0).to_vec();
     if !h.is_empty() && !(keep >= h.len() && ids[..keep].starts_with(&h))
-        && let Err(e) = checkpoint_slot(archive, g, 0, 0, "divergence", false) {
+        && let Err(e) = checkpoint_slot(archive, g, 0, 0, "divergence", false, SaveMode::Async, pending) {
         say!("archive: checkpoint slot 0 (divergence): {e:#}");
     }
     // The reclaim plan is empty with a single slot outside a unified budget, but keep the trigger in one place.
     for v in g.kv_reclaim_plan(0, ids.len()) {
         if v != 0 && !g.slot_tokens(v).is_empty()
-            && let Err(e) = checkpoint_slot(archive, g, v, 0, "evict", false) {
+            && let Err(e) = checkpoint_slot(archive, g, v, 0, "evict", false, SaveMode::Async, pending) {
             say!("archive: checkpoint unified victim slot {v}: {e:#}");
         }
     }
@@ -3862,6 +3966,8 @@ struct Sched {
     pinned: Vec<bool>,
     /// `--slot-archive-dir`: shared with the serving loop (None: the archive is off).
     archive: Option<ArchiveHandle>,
+    /// Background automatic commits, joined when this serving loop ends.
+    pending: PendingSaves,
 }
 
 enum Control { Action(SlotAction, std::sync::mpsc::Sender<anyhow::Result<Value>>), Info(std::sync::mpsc::Sender<anyhow::Result<Value>>) }
@@ -3989,7 +4095,7 @@ impl Sched {
                             g.set_active(&self.active());
                             let target = g.current_slot();
                             let busy = self.held.get(slot).copied().unwrap_or(false) || self.prefill.get(slot).copied().unwrap_or(false);
-                            match checkpoint_slot(archive, g, slot, target, "checkpoint", busy)? {
+                            match checkpoint_slot(archive, g, slot, target, "checkpoint", busy, SaveMode::Sync, &self.pending)? {
                                 Some(cp) => Ok(json!({
                                     "id_slot": slot,
                                     "id": cp.id,
@@ -4066,7 +4172,7 @@ impl Serving {
             // Owned here, so that a panic drops the queued jobs' reply channels and the request threads end (the
             // scope then joins them and the panic goes on).
             let (jobs, mut s) = (jobs, Sched { held: vec![false; n], prefill: vec![false; n], freed: vec![0; n], who: vec![0; n],
-                pinned: vec![false; n], archive: self.archive.clone(), ..Default::default() });
+                pinned: vec![false; n], archive: self.archive.clone(), pending: self.pending.clone(), ..Default::default() });
             let mut open = true;
             loop {
                 while open && wake.is_none() && next.lock().unwrap().is_none() {
@@ -4148,7 +4254,7 @@ impl Serving {
                                 // The target's old conversation is lost by the restore: checkpoint it first.
                                 if !g.slot_tokens(rs).is_empty() {
                                     let busy = s.held[rs] || s.prefill[rs];
-                                    if let Err(e) = checkpoint_slot(archive, g, rs, rs, "evict", busy) {
+                                    if let Err(e) = checkpoint_slot(archive, g, rs, rs, "evict", busy, SaveMode::Async, &self.pending) {
                                         say!("archive: checkpoint slot {rs} before restore: {e:#}");
                                     }
                                     saved.insert(rs);
@@ -4181,13 +4287,13 @@ impl Serving {
                         let Job::Chat { ids, keep, .. } = job else { continue };
                         let h = g.slot_tokens(*sl);
                         if !h.is_empty() && !(*keep >= h.len() && ids[..*keep].starts_with(h)) && saved.insert(*sl) {
-                            if let Err(e) = checkpoint_slot(archive, g, *sl, *sl, "divergence", false) {
+                            if let Err(e) = checkpoint_slot(archive, g, *sl, *sl, "divergence", false, SaveMode::Async, &self.pending) {
                                 say!("archive: checkpoint slot {sl} (divergence): {e:#}");
                             }
                         }
                         for v in g.kv_reclaim_plan(*sl, ids.len()) {
                             if v != *sl && !g.slot_tokens(v).is_empty() && saved.insert(v) {
-                                if let Err(e) = checkpoint_slot(archive, g, v, *sl, "evict", false) {
+                                if let Err(e) = checkpoint_slot(archive, g, v, *sl, "evict", false, SaveMode::Async, &self.pending) {
                                     say!("archive: checkpoint unified victim slot {v}: {e:#}");
                                 }
                             }
@@ -4557,9 +4663,13 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, mut l: Option<&mu
                 let mut entries = a.list(owner, 0);
                 if let Some(fp) = fingerprint { entries.retain(|e| e.fingerprint == fp); }
                 if limit > 0 { entries.truncate(limit); }
+                // The restore path leases an entry for the whole async read/install; this is an approximate
+                // "in flight" flag (it can also be set by the short lookup lease). Additive, so phase-1 clients
+                // that do not know it are unaffected.
+                let entries: Vec<_> = entries.into_iter().map(|e| { let leased = a.leases(&e.id); (e, leased) }).collect();
                 (a.config().dir.display().to_string(), st.budget_bytes, st.bytes, a.pinned_bytes(), entries)
             };
-            let entries: Vec<Value> = entries.into_iter().map(|e| json!({
+            let entries: Vec<Value> = entries.into_iter().map(|(e, leased)| json!({
                 "id": e.id,
                 "owner": e.owner,
                 "n_tokens": e.n_tokens,
@@ -4567,6 +4677,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, mut l: Option<&mu
                 "created_ms": e.created_ms,
                 "last_used_ms": e.last_used_ms,
                 "pinned": e.pinned,
+                "restoring": leased > 0,
                 "reason": e.reason,
                 "fingerprint": format!("{:016x}", e.fingerprint),
             })).collect();
@@ -4690,7 +4801,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, mut l: Option<&mu
                             return send(&mut w, "400 Bad Request", json!({"error": {"message": "Invalid slot ID", "type": "invalid_request_error"}}));
                         }
                         let target = g.current_slot();
-                        checkpoint_slot(&archive, g, id, target, "checkpoint", false).and_then(|cp| {
+                        checkpoint_slot(&archive, g, id, target, "checkpoint", false, SaveMode::Sync, &s.pending).and_then(|cp| {
                             cp.map(|cp| json!({
                                 "id_slot": id,
                                 "id": cp.id,
@@ -4981,7 +5092,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, mut l: Option<&mu
             } else { 0 };
             if let Some(archive) = &s.archive && vision_prompt.is_none()
                 && let Runner::Gpu(g) = &mut *r && g.slots() == 1 {
-                archive_before_single(archive, g, who.id, &ids, chat_keep);
+                archive_before_single(archive, g, who.id, &ids, chat_keep, &s.pending);
             }
             let id = format!("chatcmpl-{i}");
             let chunk = |delta: serde_json::Value, finish: Option<&str>| json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": name,
@@ -5776,6 +5887,41 @@ mod kv_type_tests {
     fn invalid_types_are_rejected() {
         assert!(effective_kv("f16", Some("bogus"), None).is_err());
         assert!(effective_kv("f16", None, Some("turbo9")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod pending_save_tests {
+    use super::{PendingSaves, drain_pending_saves_within};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn drain_joins_finished_saves() {
+        let pending: PendingSaves = Default::default();
+        let done = Arc::new(AtomicUsize::new(0));
+        for _ in 0..3 {
+            let done = done.clone();
+            let h = std::thread::spawn(move || { done.fetch_add(1, Ordering::SeqCst); });
+            pending.lock().unwrap().push(h);
+        }
+        drain_pending_saves_within(&pending, Duration::from_secs(5));
+        assert_eq!(done.load(Ordering::SeqCst), 3);
+        assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn drain_gives_up_after_the_timeout() {
+        let pending: PendingSaves = Default::default();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let h = std::thread::spawn(move || { let _ = rx.recv_timeout(Duration::from_secs(30)); });
+        pending.lock().unwrap().push(h);
+        let t = Instant::now();
+        drain_pending_saves_within(&pending, Duration::from_millis(20));
+        assert!(t.elapsed() < Duration::from_secs(2), "the bounded join waited {:?}", t.elapsed());
+        // Release the worker so the helper thread that joined it can end too.
+        let _ = tx.send(());
     }
 }
 
