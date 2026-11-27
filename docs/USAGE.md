@@ -94,10 +94,10 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   `GET /slots/archive`, `DELETE /slots/archive/{id}`, `POST /slots/archive/gc` and
   `POST /slots/{id}?action=checkpoint`. The server creates a missing directory `0700` and keeps it separate from
   `--slot-save-path`. See [Conversation archive](#conversation-archive).
-- `--slot-archive-gb N` (default 50), `--slot-archive-min-tokens N` (default 256), `--slot-archive-min-delta N`
-  (default 1024) and `--slot-archive-versions N` (default 1) tune the archive: the logical disk budget, the
-  shortest state worth saving, the minimum growth since the last checkpoint, and how many entries to keep per
-  lineage.
+- `--slot-archive-gb N` (default 50 GiB), `--slot-archive-min-tokens N` (default 256), `--slot-archive-min-delta N`
+  (default 1024) and `--slot-archive-versions N` (default 1) tune the archive: the logical budget in GiB
+  (`N << 30` bytes), the shortest state worth saving, the minimum growth since the last checkpoint, and how many
+  entries to keep per lineage.
 - `--rope-scaling none|linear|yarn` changes the RoPE plan, not only the KV size. `yarn` and `linear` need
   `--rope-scale FACTOR` (2 doubles the context); `yarn` also needs `--yarn-orig-ctx N` (the context the model was
   trained on) and takes `--yarn-beta-fast`/`--yarn-beta-slow` (32/1, llama.cpp's defaults). A file that carries
@@ -386,26 +386,35 @@ curl -s -X POST -H 'Content-Type: application/json' \
 ### Conversation archive
 
 `serve --slot-archive-dir DIR` turns slot state files into a cache the server manages itself. Before a slot
-is reused for a prompt that does not extend its history, and before `--kv-unified` reclaims it, the server
-checkpoints its state to `DIR`. A later request whose prompt starts with an archived history restores that state
-into a free slot and prefills only the new suffix. The client keeps sending the full message list and sees the
-usual `usage.prompt_tokens_details.cached_tokens`; there is no conversation id and no client change.
+is reused for a prompt that does not extend its history, before `--kv-unified` reclaims it, and before an
+automatic restore overwrites a free slot's conversation, the server checkpoints its state to `DIR`. A later
+request whose prompt starts with an archived history restores that state into a free slot and prefills only the
+new suffix. The client keeps sending the full message list and sees the usual
+`usage.prompt_tokens_details.cached_tokens`; there is no conversation id and no client change.
 
 The match is exact on token ids, within the same model/KV/YaRN/split fingerprint and the same API-key owner. It is
-not a text-similarity or message-hash cache. The archive is off by default and is a different directory from
-`--slot-save-path`.
+not a text-similarity or message-hash cache. The archive is off by default and must be a different directory from
+`--slot-save-path`; the server refuses to start when they resolve to the same one.
 
-- `--slot-archive-gb N`: logical budget for the entry files, default 50 GB. A checkpoint that would exceed the
-  budget evicts unusable entries first, then (with `--slot-archive-versions 1`) archived ancestors, then the
-  least-recently-used entries. It never evicts a pinned entry or one a restore is reading.
+- `--slot-archive-gb N`: logical budget for the entry files in GiB (1 GiB = 2^30 bytes), default 50. A
+  checkpoint that would exceed `budget - 1 GiB` first prunes unpinned ancestors beyond `--slot-archive-versions`,
+  then evicts entries with a foreign fingerprint, then the least-recently-used unpinned entries. It never evicts a
+  pinned entry, but phase 1 has no route that sets `pinned`; that field is reserved.
 - `--slot-archive-min-tokens N`: do not archive a history shorter than this, default 256.
 - `--slot-archive-min-delta N`: do not rewrite a lineage unless it grew by at least this many tokens since the
-  last checkpoint, default 1024.
-- `--slot-archive-versions N`: keep up to N entries per lineage, default 1. A longer child cannot be rewound to
-  its shorter parent, so raise N when earlier points matter for rollback.
+  longest archived prefix, default 1024.
+- `--slot-archive-versions N`: keep up to N entries per lineage, default 1. Pruning is lazy: ancestors are removed
+  only under budget pressure or when `POST /slots/archive/gc` runs, so a parent and a continuation coexist while
+  there is room. A longer child cannot be rewound to its shorter parent, so raise N when earlier points matter for
+  rollback.
 
-`GET /slots/archive` reports the directory, the budget, the bytes in use and one row per entry. Optional `?limit=`,
-`?owner=` and `?fingerprint=` filter the list; the response never contains token text or file paths.
+`POST /slots/archive/gc` first drops rows whose file is missing, then applies the same lineage pruning and LRU
+eviction when the archive is over the target. It has no current-fingerprint argument, so foreign entries are
+ordinary LRU candidates there.
+
+`GET /slots/archive` reports the directory, the budget, the bytes in use and one row per entry. Optional `?limit=`
+(maximum rows), `?owner=` (API-key id) and `?fingerprint=` (hex) filter the list; the response never contains token
+text or file paths.
 
 ```json
 {
@@ -427,7 +436,8 @@ not a text-similarity or message-hash cache. The archive is off by default and i
   `{"evicted": 3, "freed_bytes": 123}`.
 - `POST /slots/{id}?action=checkpoint` with `{}` saves the idle slot now, using the archive budget instead of a
   client filename, and answers `{"id_slot": 0, "id": "...", "n_saved": 1058, "n_written": 77379688,
-  "timings": {"save_ms": 83.7}}`. Use it before building a compacted prompt or before a branch point.
+  "timings": {"save_ms": 83.7}}`. It needs `--slot-archive-dir`, not `--slot-save-path`. Use it before building
+  a compacted prompt or before a branch point.
 
 ```sh
 curl -s http://127.0.0.1:8080/slots/archive
@@ -440,22 +450,25 @@ curl -s -X POST -H 'Content-Type: application/json' -d '{}' \
 
 - **Owner.** An entry is matched only by a request with the same API-key owner, and a checkpoint records the
   conversation's owner, not the owner of the request that caused an eviction. Without `--api-keys` every request
-  has owner 0, so the archive is shared by all clients. With keys, a customer key gets `403` on the archive
-  routes, like the explicit slot routes.
-- **Unified KV.** Automatic restore uses a free slot only and never forces. If the growth would need a non-empty
-  victim, the server skips the archive hit and prefills normally; that is not a `409`. An explicit
-  `action=restore` keeps its `force=1` behavior. A restored slot is pinned until a request uses it or
-  `action=erase` clears it.
+  has owner 0, so the archive is shared by all clients. With keys, `GET /slots/archive`, `DELETE`,
+  `POST /slots/archive/gc` and `POST /slots/{id}?action=checkpoint` are admin-only: a customer key gets `403`,
+  like the explicit slot routes.
+- **Unified KV.** Automatic restore uses a free slot only, never takes a slot a request holds, and never forces.
+  If that free slot holds another conversation, the server checkpoints it before the restore overwrites it. If
+  the growth would need a non-empty reclaim victim, the server skips the archive hit and prefills normally; that
+  is not a `409`. An explicit `action=restore` keeps its `force=1` behavior. A restored slot is pinned until the
+  request is admitted or `action=erase` clears it, so a reclaim cannot take it between restore and admission.
 - **Best effort.** A missing, corrupt, truncated, foreign or owner-mismatched entry is a cache miss, not a
-  request error: the chat still runs and prefills from position 0. An archive directory that becomes unavailable
-  disables the archive for the process, logs once and keeps serving. The archive never changes the token stream
-  or a greedy reply; it only changes how much is prefilled.
+  request error: the chat still runs and prefills from position 0. A read or write that fails at run time is
+  logged and skipped (a lookup is a miss); a directory that cannot be opened at startup stops the server with
+  the path in the error. The archive never changes the token stream or a greedy reply; it only changes how much
+  is prefilled.
 - **Compaction.** A compacted prompt is a summary plus recent messages, generally not a prefix of the old
   conversation, so it still needs a full prefill. The pre-compact entry is for rollback and audit; the compacted
   prompt is prefilled once and checkpointed as a new lineage, and that entry is the fast resume afterwards.
 - **Restart.** The manifest and entries survive a restart, and a continuation restores from disk without the old
-  process. A server stop only keeps states that were checkpointed earlier; v1 has no shutdown checkpoint, so a
-  conversation still resident in VRAM at `SIGTERM` is lost unless it was checkpointed explicitly.
+  process. A server stop only keeps states that were checkpointed earlier; phase 1 has no shutdown checkpoint, so
+  a conversation still resident in VRAM at `SIGTERM` is lost unless it was checkpointed explicitly.
 - **Privacy.** An entry is a plaintext `STRATASLOT` file created `0600` in a directory created `0700`. It holds
   the full token history (prompt, system prompt, tools and generated tokens) and the KV/recurrent state, not a
   compressed transcript. Treat the directory as a copy of the conversations, keep it off any HTTP-served path,

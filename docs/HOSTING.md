@@ -393,7 +393,8 @@ while `GET /slots` still lists slot metadata.
 `--slot-archive-dir DIR` enables the automatic archive from
 [USAGE.md](USAGE.md#conversation-archive): a slot is checkpointed before its history diverges or before it is
 reclaimed, and a later prompt that continues an archived history restores it into a free slot. It is off by
-default and should not be the same directory as `--slot-save-path`.
+default and must be a different directory from `--slot-save-path`; the server refuses to start when the two resolve
+to the same directory.
 
 Create the directory once, owned by the service user, and add the archive flags to the unit:
 
@@ -413,48 +414,57 @@ The server creates a missing directory `0700` and writes entries and temp files 
 write access. `StateDirectory=strata` creates the parent but not `archive`. Keep the directory out of any path that
 the web server or a reverse proxy serves.
 
-**Disk and sizing.** The budget is logical. With q8 KV on the 35B-A3B layout, SLOT-SAVE measures about 10.9 GB per
-1M tokens: 8k tokens is about 90 MB, 32k about 350 MB, 100k about 1.1 GB, 256k about 2.8 GB and 1M about 10.9 GB.
-A 200 GB budget is about 18M archived tokens, roughly 180 conversations of 100k tokens or 18 of 1M. The token
-history is 4 bytes per token and the recurrent state is small next to the KV. Leave filesystem free space above the
-budget: a write needs room for its temp file, the manifest and the reserve below the logical limit.
+**Disk and sizing.** `--slot-archive-gb` is GiB (1 GiB = 2^30 bytes), and the example above reserves 200 GiB. The
+budget is logical, with 1 GiB kept free for the temp file and manifest. With q8 KV on the 35B-A3B layout, SLOT-SAVE
+measures about 10.9 GB per 1M tokens: 8k tokens is about 90 MB, 32k about 350 MB, 100k about 1.1 GB, 256k about
+2.8 GB and 1M about 10.9 GB. A 200 GiB budget is about 18M archived tokens, roughly 180 conversations of 100k
+tokens or 18 of 1M. The token history is 4 bytes per token and the recurrent state is small next to the KV. Leave
+filesystem free space above the budget: a write needs room for its temp file, the manifest and the reserve below
+the logical limit.
 
-**Eviction and lineage.** Before a write that would exceed the budget, the archive evicts entries with a foreign
-fingerprint or a bad file first, then, with `--slot-archive-versions 1`, unpinned ancestors, then the least
-recently used. Pinned entries, entries a restore is reading, and the entry being restored are never evicted.
-`POST /slots/archive/gc` runs the same policy by hand. Keeping only the latest entry per lineage saves disk but
-removes rollback points: a longer child is not a substitute for its shorter parent, so raise
-`--slot-archive-versions` if earlier states matter.
+**Eviction and lineage.** A checkpoint that would exceed `budget - 1 GiB` first prunes unpinned ancestors beyond
+`--slot-archive-versions`, then evicts entries with a foreign fingerprint, then the least recently used unpinned
+entries. Pinned entries are never evicted, but phase 1 has no route that sets `pinned`; that field is reserved.
+`POST /slots/archive/gc` drops rows whose file is missing, then applies the same lineage pruning and LRU eviction
+when the archive is over the target. Lineage pruning is lazy, so a parent and its continuation coexist while there
+is room. Keeping only the latest entry per lineage saves disk but removes rollback points: a longer child is not a
+substitute for its shorter parent, so raise `--slot-archive-versions` if earlier states matter. Foreign
+fingerprints are ordinary LRU candidates in manual GC, which has no current-fingerprint argument.
 
-**Checkpoint stalls.** In v1 a checkpoint is synchronous: the model thread copies the state and writes the file,
-and every stream pauses for the duration. At 0.5-1 GB/s a 1 GB state costs 1-2 s; a 10.9 GB 1M-token state costs
-10-20 s. Expect a visible pause when a conversation switches or a unified slot is reclaimed. Keep
+**Checkpoint stalls.** In phase 1 a checkpoint is synchronous: the model thread copies the state and writes the
+file, and every stream pauses for the duration. At 0.5-1 GB/s a 1 GB state costs 1-2 s; a 10.9 GB 1M-token state
+costs 10-20 s. Expect a visible pause when a conversation switches or a unified slot is reclaimed. Keep
 `--slot-archive-min-tokens` and `--slot-archive-min-delta` high enough that small states and tiny extensions are
 not written on every turn. A restore has the same kind of stall for the read and the copy into the slot, after
 which only the prompt suffix is prefilled. Phase 2 moves the disk part off the model thread.
 
-**Restore behavior.** Automatic restore uses an empty or free slot only. It never evicts a live conversation and
-never uses the `force=1` of the explicit route. If no slot is free the request queues as usual and then prefills;
-if a unified hit would need a non-empty victim, the hit is skipped and the prompt is prefilled normally. A corrupt,
-foreign or owner-mismatched entry is a cache miss, not a failed request. A restored slot is pinned until a request
-uses it or `action=erase` clears it. The restored prefix is reported as
-`usage.prompt_tokens_details.cached_tokens`.
+**Restore behavior.** Automatic restore uses a free slot only and never takes a slot a request holds. It never
+uses the `force=1` of the explicit route. If the chosen free slot holds another conversation, the server
+checkpoints it before the restore overwrites it. If no slot is free the request queues as usual and then
+prefills; if a unified hit would need a non-empty reclaim victim, the hit is skipped and the prompt is prefilled
+normally. A corrupt, foreign or owner-mismatched entry is a cache miss, not a failed request. A restored slot is
+pinned until the request is admitted or `action=erase` clears it, so a reclaim cannot take it between restore and
+admission. The restored prefix is reported as `usage.prompt_tokens_details.cached_tokens`.
 
 **Shutdown.** A graceful stop or a crash only keeps the entries that were already checkpointed. The slots still in
-VRAM are not archived on shutdown in v1, and `SIGKILL` cannot be covered; a conversation is recovered at its last
-divergence or explicit checkpoint. `--slot-archive-on-shutdown` is an opt-in phase-2 option, not a v1 behavior.
+VRAM are not archived on shutdown in phase 1, and `SIGKILL` cannot be covered; a conversation is recovered at its
+last divergence or explicit checkpoint. `--slot-archive-on-shutdown` is an opt-in phase-2 option, not a phase-1
+behavior.
 
 **Security and backups.** Entries are plaintext: the full token history (prompt, system prompt, tools and
 generated tokens) and the KV/recurrent state. Treat the directory as a copy of the conversations: `0700`, files
 `0600`, no HTTP access, and include it in (or deliberately exclude it from) backups and retention. With
-`--api-keys` entries are owner-scoped and a customer key gets `403` on the archive routes; without keys, owner 0 is
-shared by every client. A copied entry still restores only with the same model, `--kv`, YaRN/RoPE flags and split,
-because the fingerprint is checked first.
+`--api-keys` entries are owner-scoped and the archive routes are admin-only: `GET /slots/archive`,
+`DELETE /slots/archive/{id}`, `POST /slots/archive/gc` and `POST /slots/{id}?action=checkpoint` all answer `403`
+for a customer key. Without keys, owner 0 is shared by every client. A copied entry still restores only with the
+same model, `--kv`, YaRN/RoPE flags and split, because the fingerprint is checked first.
 
 **Troubleshooting.**
 
-- `400`: an invalid slot id or action, or `action=checkpoint` on a slot with no token history (the same rule as
-  `action=save`). A corrupt or foreign archive entry is not a `400` for a chat; it falls back to prefill.
+- `400`: an invalid slot id or action, or `action=checkpoint` on a slot that is busy, partial, an image prompt, or
+  has no token history or fewer than `--slot-archive-min-tokens` (the empty-slot rule is the same as `action=save`).
+  A corrupt or foreign archive entry is not a `400` for a chat; it falls back to prefill.
+- `403`: a customer key on any archive route; those routes are admin-only.
 - `409`: automatic restore never returns it. An explicit `POST /slots/{id}?action=restore` through
   `--slot-save-path` keeps its existing `409` when `--kv-unified` would evict a non-empty slot; retry with
   `?force=1` only if that is intended.
@@ -462,8 +472,9 @@ because the fingerprint is checked first.
 - `503`: no model is loaded.
 - Startup: the manifest is validated against the shard files. A missing file drops its entry, an orphan file is
   adopted when its header is valid (or deleted), and a corrupt `manifest.json` is moved aside and rebuilt. If the
-  archive directory is unavailable, the server logs once and keeps serving with the archive disabled; fix the
-  ownership/mount and restart to re-enable it.
+  archive directory cannot be created or opened, the server exits with the path in the error; fix the
+  ownership/mount and start it again. A read or write that fails later is logged and skipped (a lookup is a cache
+  miss), and the chat keeps serving.
 
 ## Docker
 
