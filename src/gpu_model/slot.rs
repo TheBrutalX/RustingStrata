@@ -39,6 +39,20 @@ impl<R: Read> Read for Count<R> {
 impl GpuModel<'_> {
     /// Seconds of a slot's state file. The file contains plaintext KV: prompt, system prompt, tools and reply.
     pub fn save_slot_file(&mut self, slot: usize, path: &Path) -> Result<u64> {
+        self.save_slot_file_as(slot, path, self.owner)
+    }
+
+    /// `save_slot_file` with an explicit conversation owner. The archive uses `slot_owner` here, not the owner of
+    /// the request that triggered the checkpoint: an eviction caused by another key must not re-label the state.
+    pub fn save_slot_file_as(&mut self, slot: usize, path: &Path, owner: u64) -> Result<u64> {
+        let prev = self.owner;
+        self.owner = owner;
+        let r = self.save_slot_file_owned(slot, path);
+        self.owner = prev;
+        r
+    }
+
+    fn save_slot_file_owned(&mut self, slot: usize, path: &Path) -> Result<u64> {
         ensure!(slot < self.slots(), "slot {slot} of {}", self.slots());
         self.use_slot(slot);
         let tokens = self.history.clone();
@@ -240,7 +254,7 @@ impl GpuModel<'_> {
 
     /// The model/layout identity a slot file is tied to. It must not depend on a slot's current KV capacity: under
     /// `--kv-unified` the capacities change as prompts grow, while the bytes per token do not.
-    fn slot_fingerprint(&self) -> u64 {
+    pub fn slot_fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         let c = &self.m.cfg;

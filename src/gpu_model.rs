@@ -1419,6 +1419,19 @@ impl<'a> GpuModel<'a> {
         if s == self.cur { &self.history } else { &self.seqs[s].history }
     }
 
+    /// Owner of slot `s`'s saved conversation (the API key id that produced it), not the current request's owner.
+    pub fn slot_owner(&self, s: usize) -> u64 {
+        if s == self.cur { self.saved_owner } else { self.seqs[s].saved_owner }
+    }
+
+    /// Current KV position of slot `s`.
+    pub fn slot_pos(&self, s: usize) -> usize {
+        if s == self.cur { self.pos } else { self.seqs[s].pos }
+    }
+
+    /// The slot whose buffers are currently selected.
+    pub fn current_slot(&self) -> usize { self.cur }
+
     fn slot_ids_mut(&mut self, s: usize) -> &mut Vec<u32> {
         if s == self.cur { &mut self.history } else { &mut self.seqs[s].history }
     }
@@ -1460,10 +1473,10 @@ impl<'a> GpuModel<'a> {
     /// Whether the slots share one `--ctx` budget (`--kv-unified`).
     pub fn kv_unified(&self) -> bool { self.kv_budget > 0 }
 
-    fn slot_pos(&mut self, s: usize) -> &mut usize { if s == self.cur { &mut self.pos } else { &mut self.seqs[s].pos } }
+    fn slot_pos_mut(&mut self, s: usize) -> &mut usize { if s == self.cur { &mut self.pos } else { &mut self.seqs[s].pos } }
 
     /// `kv_need` for slot `s`'s next token.
-    pub fn kv_step(&mut self, s: usize) -> anyhow::Result<()> { let p = *self.slot_pos(s); self.kv_need(s, p + 1) }
+    pub fn kv_step(&mut self, s: usize) -> anyhow::Result<()> { let p = *self.slot_pos_mut(s); self.kv_need(s, p + 1) }
 
     /// Make slot `s`'s attention KV hold `upto` positions, when the slots' KV grows on demand: it doubles, to at least
     /// `upto` and at most `ctx`, keeping its rows. Past `ctx` it leaves the "context full" error to the caller.
@@ -1515,16 +1528,35 @@ impl<'a> GpuModel<'a> {
         }
     }
 
+    /// Slots `kv_grow_unified(s, new)` would reclaim, in the order it drops them. Pure: reads capacities and
+    /// `active`, changes nothing. The archive uses it to checkpoint the victims before their caches are dropped.
+    pub fn kv_reclaim_plan(&self, s: usize, new: usize) -> Vec<usize> {
+        if self.kv_budget == 0 || s >= self.kv_cap.len() { return Vec::new(); }
+        let caps = self.kv_cap.clone();
+        // The same test as `kv_grow_unified`: total capacity, with `s` at `new`, fits the budget.
+        let fits = |caps: &[usize], s: usize| caps.iter().sum::<usize>() - caps[s] + new <= self.kv_budget;
+        if fits(&caps, s) { return Vec::new(); }
+        let mut caps = caps;
+        let mut order: Vec<usize> = (0..caps.len())
+            .filter(|&i| i != s && !self.active.get(i).copied().unwrap_or(false) && caps[i] > 1)
+            .collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(caps[i]));
+        let mut victims = Vec::new();
+        for i in order {
+            if fits(&caps, s) { break; }
+            victims.push(i);
+            caps[i] = 1;
+        }
+        victims
+    }
+
     /// Grow slot `s` within the total budget, reclaiming the KV of inactive slots (largest first) down to KV_MIN.
     fn kv_grow_unified(&mut self, s: usize, new: usize) -> anyhow::Result<()> {
         let budget = self.kv_budget;
         let fits = |used: usize, cap: usize| used - cap + new <= budget;
         if !fits(self.kv_used(), self.kv_cap[s]) {
-            let mut order: Vec<usize> = (0..self.kv_cap.len())
-                .filter(|&i| i != s && !self.active.get(i).copied().unwrap_or(false) && self.kv_cap[i] > 1)
-                .collect();
-            order.sort_by_key(|&i| std::cmp::Reverse(self.kv_cap[i]));
-            for i in order {
+            let victims = self.kv_reclaim_plan(s, new);
+            for i in victims {
                 self.drop_slot_cache(i);
                 self.kv_resize(i, 1, false)?;
                 if fits(self.kv_used(), self.kv_cap[s]) { break; }
@@ -1609,7 +1641,7 @@ impl<'a> GpuModel<'a> {
     pub fn step_rows(&mut self, rows: &[(usize, u32, bool)]) -> anyhow::Result<Vec<(u32, Vec<f32>)>> {
         let (nt, nvoc) = (rows.len(), self.m.cfg.n_vocab);
         ensure!((1..=STEP_ROWS).contains(&nt) && self.mtp.is_none(), "step_rows: {nt} rows");
-        let pos: Vec<usize> = rows.iter().map(|&(s, ..)| *self.slot_pos(s)).collect();
+        let pos: Vec<usize> = rows.iter().map(|&(s, ..)| *self.slot_pos_mut(s)).collect();
         if pos.iter().any(|&p| p >= self.ctx) { bail!("context full ({} tokens; raise --ctx)", self.ctx); }
         for (&(s, ..), &p) in rows.iter().zip(&pos) { self.kv_need(s, p + 1)?; }
         self.put_embed(&rows.iter().map(|r| r.1).collect::<Vec<_>>())?;
@@ -1632,7 +1664,7 @@ impl<'a> GpuModel<'a> {
         while let Some(q) = p {
             q.rows.clear();
             if res.is_ok() {
-                for &(s, ..) in rows { *q.slot_pos(s) += 1; }
+                for &(s, ..) in rows { *q.slot_pos_mut(s) += 1; }
                 for &(s, tok, _) in rows { q.slot_ids_mut(s).push(tok); }
                 q.row_tokens += nt;
                 q.adapt_every = every;
