@@ -43,3 +43,4 @@ pub mod inkling2;
 pub mod ngram;
 pub mod raon;
 pub mod kv_turbo;
+pub mod slot_file;

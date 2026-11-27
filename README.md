@@ -122,6 +122,7 @@ Inkling 2 open the GPU by themselves.
 - [BENCHMARKS.md](docs/BENCHMARKS.md): every model against llama.cpp; older runs are in the
   [benchmark history](docs/README.md#benchmark-history).
 - [HOSTING.md](docs/HOSTING.md): running a server for other people.
+- [SLOT-SAVE.md](docs/SLOT-SAVE.md): explicit per-slot save/restore over HTTP and the `STRATASLOT` format.
 - [SUPPORTED_GPUS.md](docs/SUPPORTED_GPUS.md) and [AMD.md](docs/AMD.md): the GPUs tried so far and AMD notes.
 - [VISION.md](docs/VISION.md): image input. [LORA.md](docs/LORA.md): LoRA adapters.
 - [ROADMAP.md](ROADMAP.md): what is planned next, by section; ideas from users are welcome.

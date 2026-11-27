@@ -83,8 +83,13 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 - `--kv-unified` (`serve`): with `--parallel N`, `--ctx` is the total KV budget shared by the slots, not per slot.
   Each slot starts at `ctx / N`; a slot that needs more reclaims the KV of idle slots down to one token each, so a
   1M budget gives four 256k slots or lets one slot grow to ~1M. The reclaimed slot loses its VRAM prefix cache and
-  its saved state. One GPU only; a 1M budget needs `--kv q8` on a 32 GB card. The first version does not reuse a
-  saved prompt prefix in unified mode: each request prefills from position 0.
+  its saved state. One GPU only; a 1M budget needs `--kv q8` on a 32 GB card. A slot's saved prefix is reused when
+  the next prompt continues it (also after a restore); a diverging prompt clears the slot instead of parking its KV
+  in RAM.
+- `--slot-save-path DIR` (`serve`): directory of explicit per-slot state files, with llama.cpp's `GET /slots` and
+  `POST /slots/{id}?action=save|restore|erase` routes. The directory must exist at start. Without the flag the POST
+  routes answer `501`. Files hold plaintext KV and the token history, so treat the directory as sensitive. See
+  [Slot state files](#slot-state-files-save-and-restore).
 - `--rope-scaling none|linear|yarn` changes the RoPE plan, not only the KV size. `yarn` and `linear` need
   `--rope-scale FACTOR` (2 doubles the context); `yarn` also needs `--yarn-orig-ctx N` (the context the model was
   trained on) and takes `--yarn-beta-fast`/`--yarn-beta-slow` (32/1, llama.cpp's defaults). A file that carries
@@ -298,6 +303,77 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_API_KEY=secret ANTHROPIC_MODE
 ```
 
 OpenCode and other agents use the OpenAI address.
+
+### Slot state files: save and restore
+
+`serve --slot-save-path DIR` turns on explicit state files for the slots of a GPU model, with the routes of
+llama.cpp's server. A file holds the whole state of one slot: prompt and generated tokens, KV rows, DeltaNet and MTP
+state, the PLE/QSA rings, the owner, and the RoPE offset. After a restart the file restores that state and the next
+prompt continues the conversation without prefilling it again. Save and restore are explicit admin actions; the
+server never writes a slot on its own.
+
+- `GET /slots` answers `{"slots": [...]}`, one entry per slot: `id`, `is_processing` (with `--parallel`, whether a
+  request holds or is prefilling the slot; a single-slot server reports `false`), `n_ctx` (its KV capacity),
+  `n_past` (tokens in its history) and `pinned` (a restored slot that unified KV must not reclaim). It needs a
+  loaded model (`503` otherwise; a CPU model answers `400`) but no `--slot-save-path`.
+- `POST /slots/{id}?action=save` with `{"filename": "qwen3.6-35b-2026-11-27-32k.slot"}` writes the slot and answers
+  `id_slot`, `filename`, `n_saved` (tokens), `n_written` (bytes) and `timings.save_ms`.
+- `POST /slots/{id}?action=restore` takes the same body, plus `&force=1` when unified KV has to reclaim another slot.
+  It answers `id_slot`, `filename`, `n_restored` (tokens), `n_read` (bytes) and `timings.restore_ms`.
+- `POST /slots/{id}?action=erase` clears the slot (KV, history, saved state) and answers
+  `{"id_slot": 0, "n_erased": 1234}`. It takes no filename; the body is ignored, but the request still needs
+  `Content-Type: application/json`.
+
+The POST routes need `Content-Type: application/json` (others get `415`). Examples:
+
+```sh
+# save the 32k-token conversation in slot 0
+curl -s -X POST -H 'Content-Type: application/json' \
+    -d '{"filename":"qwen3.6-35b-2026-11-27-32k.slot"}' \
+    'http://127.0.0.1:8080/slots/0?action=save'
+
+# what the slots hold now
+curl -s http://127.0.0.1:8080/slots
+
+# after a restart, put it back into slot 1
+curl -s -X POST -H 'Content-Type: application/json' \
+    -d '{"filename":"qwen3.6-35b-2026-11-27-32k.slot"}' \
+    'http://127.0.0.1:8080/slots/1?action=restore'
+```
+
+- `filename` is one component inside `--slot-save-path`: no `/` or `\`, not `.` or `..`, at most 255 bytes, no
+  control characters or NUL. Subdirectories are not allowed. A suffix such as `.slot` is a convention, not a
+  requirement. The final path is the directory joined with the name; a save writes a temp file there and renames it
+  over the target.
+- A restore checks the header and the fingerprint before changing the slot: model config and tensor table, KV layout
+  and part split, and the YaRN/RoPE parameters, then the part count and that the token count fits `--ctx`. While
+  reading it checks every buffer count and length and the footer payload length. A truncated, corrupt or foreign
+  file answers `400`; a failure once the read has started resets the target slot rather than leaving a half-restored
+  state.
+- Saving a slot with no token history is a `400`; so is a filename that fails validation.
+- Busy slot: save, restore and erase are deferred, not rejected. The request waits until the slot is idle (under
+  `--parallel`, the control queue is retried after the next forward) and the model thread is blocked for the whole
+  file copy. Other slots keep their state, but their forwards pause while the file streams. Erase of an idle slot
+  clears it at once.
+- With `--api-keys` the routes are admin-only: a customer key gets `403` (its allowed routes are the chat,
+  model-list and tokenizer ones).
+- Without `--slot-save-path`, the POST routes answer `501 Not Implemented` with this message; `GET /slots` still
+  answers without a directory.
+
+  ```
+  This server does not support slots action. Start it with `--slot-save-path`
+  ```
+
+- `--kv-unified`: a restore grows the slot the way a prompt would and reclaims only inactive slots. If the growth
+  needs a non-empty victim, the restore answers `409` unless the request has `&force=1`; with force those idle
+  victims are erased. A restored slot is pinned until a request uses it or `action=erase` clears it, so another
+  slot's growth cannot take the restored KV. The next prompt from the same key that starts with the restored tokens
+  reuses them (`cached_tokens > 0`) instead of prefilling from zero.
+- Privacy: a file is plaintext. It holds the full token history (prompt, system prompt, tools and generated tokens)
+  and the KV/recurrent state, not a compressed transcript. Its size is roughly the slot state (KV plus
+  DeltaNet/MTP/PLE/QSA state plus 4 bytes per token of history); a 1M-token q8 slot is about 10.9 GB with the
+  35B-A3B layout. Files are created `0600`. Keep the directory private and include it in your backup and retention
+  policy, or exclude it deliberately.
 
 ## Prompt caching
 
