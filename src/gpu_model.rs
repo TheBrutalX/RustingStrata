@@ -583,6 +583,8 @@ pub struct GpuModel<'a> {
     rows: Vec<(usize, usize)>,
     /// Tokens `step_rows` ran, for the placement cadence.
     row_tokens: usize,
+    /// Share of a batch step's missed experts that the CPU runs; the rest are staged over PCIe (`prefill_chunk`).
+    cpu_frac: f64,
 }
 
 /// Layer shares of `--split`: one positive number per device, such as `60,40`.
@@ -1124,17 +1126,19 @@ impl<'a> GpuModel<'a> {
         if ns > 1 { for q in &mut seqs { q.saved = alloc_saved(&*gpu, &layers, true)?; } }
         let saved = std::mem::take(&mut seqs[0].saved);
         // `step_batch` covers plain dense attention models in one part; the rest decode `STEP_ROWS` rows a forward.
-        // A model with DeltaNet layers or experts takes the layers of the prefill (`prefill_chunk` in rows mode).
-        let plain = output_norm.is_some() && output.is_some() && range.start == 0 && !mtp && c.hc_n == 0 && c.n_embd_ple == 0 && !qsa_on
-            && c.hadamard.is_none() && layers.iter().enumerate().all(|(il, l)| l.attn_norm.is_some() && l.post_norm.is_some() && l.mhc.is_none() && l.ple.is_none()
-                && c.rope_layer.get(il).copied().unwrap_or(true));
+        // A model with DeltaNet layers or experts takes the layers of the prefill (`prefill_chunk` in rows mode), also
+        // over the parts of a --device split.
         let dense = layers.iter().all(|l| matches!(l.mixer, Mixer::Attn { .. }) && matches!(l.ffn, Ffn::Dense { .. }));
+        let one = range.start == 0 && last;
+        let plain = (one || !dense) && (!last || output_norm.is_some() && output.is_some()) && !mtp && c.hc_n == 0 && c.n_embd_ple == 0 && !qsa_on
+            && c.hadamard.is_none() && layers.iter().enumerate().all(|(il, l)| l.attn_norm.is_some() && l.post_norm.is_some() && l.mhc.is_none() && l.ple.is_none()
+                && c.rope_layer.get(range.start + il).copied().unwrap_or(true));
         let bt = match &pf {
             Some(p) if ns > STEP_ROWS && plain && gpu.kv_rows() => {
                 // ponytail: 128 rows a forward, the size of the CUDA argmax scratch; split the argmax to go past it.
                 let cap = ns.min(p.chunk).min(128);
                 let rows = p.chunk;
-                Some(Batch { dense, cap, rows, step: gpu.zeros::<i32>(2 * rows)?, kvt: gpu.zeros::<u64>(layers.len() * 2 * rows)?, logits: gpu.zeros::<f32>(cap * c.n_vocab)?,
+                Some(Batch { dense, cap, rows, step: gpu.zeros::<i32>(2 * rows)?, kvt: gpu.zeros::<u64>(layers.len() * 2 * rows)?, logits: gpu.zeros::<f32>(if last { cap * c.n_vocab } else { 1 })?,
                              amax: gpu.zeros::<i32>(cap)?, attp: gpu.zeros::<f32>(cap * c.n_head * ATT_SPLITS * (c.head_dim + 2))? })
             }
             _ => None,
@@ -1223,7 +1227,7 @@ impl<'a> GpuModel<'a> {
         let _ = &mut ext_draft;
         crate::weights::trim_working_set();
         Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], ple_undo: ([-1, -1], vec![]), bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, hada, mrope: false, mrope_buf: gpu_mrope, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every, adapt_swaps, reset_counts_after_prefill, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, nsnap, short: 32, pf, prompt_cache_path: None, bt, mtp, dflash, ext_draft, ext_draft_pend: Vec::new(), mhc_ones, graph_tag: 0, ngram: None, first: range.start, next: None,
-                      cur: 0, seqs, kv_cap: if grow { vec![kv0; ns] } else { vec![] }, kv0, kv_budget: if unified { ctx } else { 0 }, active: vec![false; ns], rows: vec![], row_tokens: 0, kv_stage })
+                      cur: 0, seqs, kv_cap: if grow { vec![kv0; ns] } else { vec![] }, kv0, kv_budget: if unified { ctx } else { 0 }, active: vec![false; ns], rows: vec![], row_tokens: 0, cpu_frac: 0.5, kv_stage })
     }
 
     /// Clear KV and recurrent state (and forget the `prefill_cached` prefix, whose KV this zeroes).
@@ -1401,7 +1405,7 @@ impl<'a> GpuModel<'a> {
     /// Most tokens of one `verify` forward on this backend (4 on CUDA, `TMAX` on Vulkan).
     pub fn tmax(&self) -> usize { self.gpu.verify_rows() }
 
-    pub fn batch_cap(&self) -> usize { self.bt.as_ref().map_or(0, |b| b.cap) }
+    pub fn batch_cap(&self) -> usize { if self.parts().all(|p| p.bt.is_some()) { self.bt.as_ref().map_or(0, |b| b.cap) } else { 0 } }
 
     pub fn is_moe(&self) -> bool { self.m.cfg.is_moe() }
 
