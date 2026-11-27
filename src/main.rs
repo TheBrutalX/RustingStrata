@@ -10,7 +10,7 @@ use rusting_strata::model::{Model, State};
 use rusting_strata::{backend, gpu_model::GpuModel};
 use rusting_strata::{config::ModelConfig, gguf::Gguf, hf, ops, ops::Sampler, quant::GgmlType, serve, tokenizer::Tokenizer};
 use rusting_strata::chat::{Hold, Msg, Template, Think};
-use rusting_strata::slot_archive::{self, Archive, ArchiveConfig, ArchiveEntry, Lease, SaveSlot};
+use rusting_strata::slot_archive::{self, Archive, ArchiveConfig, ArchiveEntry, Lease};
 use rusting_strata::vision::{self, VisionProjector};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -3443,8 +3443,9 @@ struct Serving {
     slot_save_path: Option<PathBuf>,
     /// `--slot-archive-dir`: the automatic conversation archive; the archive routes answer 501 without it.
     archive: Option<ArchiveHandle>,
-    /// Automatic archive commits still writing their file or manifest. Shared across model loads and joined when a
-    /// serving loop ends (bounded: a wedged disk must not hold shutdown).
+    /// v1 async archive commits still writing their file or manifest. Automatic checkpoints are v2 and synchronous
+    /// now, so this is normally empty; it is still drained when a serving loop ends (bounded: a wedged disk must not
+    /// hold shutdown).
     pending: PendingSaves,
     /// The model `--auto-unload` freed (while another loads for a chat request: the model to go back to if that load
     /// fails), and the chat request that waits for a load (answered once the model has loaded).
@@ -3576,15 +3577,16 @@ impl Serving {
 /// The archive handle shared by the serving loop, the scheduler and the explicit routes.
 type ArchiveHandle = std::sync::Arc<std::sync::Mutex<Archive>>;
 
-/// Background archive commits started by automatic checkpoints, shared by the serving loop, the scheduler and the
-/// single-slot path (docs/SLOT-ARCHIVE-PHASE2.md §5.2).
+/// Background archive commits started by the v1 async save path, shared by the serving loop, the scheduler and the
+/// single-slot path (docs/SLOT-ARCHIVE-PHASE2.md §5.2). Automatic archive checkpoints are v2 segmented saves and
+/// run synchronously in this wave, so this list is normally empty; the drain stays for the async API and its tests.
 type PendingSaves = std::sync::Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>>;
 
 /// How long shutdown waits for in-flight automatic commits. The writer may still be copying a multi-GB file to a
 /// slow disk; a restart must not hang on it, so the rest are logged and left to finish (or die) with the process.
 const PENDING_SAVE_JOIN: Duration = Duration::from_secs(10);
 
-/// Wait for the background commits taken by [`checkpoint_slot`], but never longer than `timeout`.
+/// Wait for the background commits taken by the v1 async save path, but never longer than `timeout`.
 fn drain_pending_saves_within(pending: &PendingSaves, timeout: Duration) {
     let handles: Vec<_> = std::mem::take(&mut *pending.lock().unwrap_or_else(|p| p.into_inner()));
     let n = handles.len();
@@ -3627,123 +3629,61 @@ fn parse_ttl(s: &str) -> anyhow::Result<u64> {
 /// One successful checkpoint's metadata, for the explicit `action=checkpoint` answer.
 struct CheckpointInfo { id: String, n_saved: usize, n_written: u64, save_ms: f64 }
 
-/// How `checkpoint_slot` writes the file (docs/SLOT-ARCHIVE-PHASE2.md §5.2 and §15). Automatic triggers stream on
-/// the async writer; an explicit admin action waits for the file and the manifest commit, because its caller
-/// expects both in the answer.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SaveMode {
-    Sync,
-    Async,
-}
-
-/// Record a background save failure: metrics and the log, without an archive lock held by the caller.
-fn note_save_failure(archive: &ArchiveHandle, path: &Path, e: &anyhow::Error, reason: &str) {
-    if let Ok(mut a) = archive.lock() { a.note_failure(); }
-    let _ = std::fs::remove_file(path);
-    say!("archive: async save reason={reason} failed: {e:#}");
+/// Whether a continuation is too short to archive under `--slot-archive-min-delta`. `longest` is the token count
+/// of the longest archived prefix. An exact duplicate (`longest == n_tokens`) is never "small": it is touched by
+/// `save_segmented` and never rewritten, even when `min_delta` is larger than zero.
+fn below_min_delta(n_tokens: usize, longest: Option<usize>, min_delta: usize) -> bool {
+    longest.is_some_and(|n| n < n_tokens && n_tokens - n < min_delta)
 }
 
 /// Save the idle slot `slot` to the archive, if policy allows it. One place for the divergence, eviction and
 /// explicit triggers (docs/SLOT-ARCHIVE.md §9). `target` is the slot the caller is about to use: the model cursor is
 /// left there, never on a victim. A failure is returned for the caller to log or surface; it never fails a chat.
 ///
-/// The archive lock covers only the manifest work (prefix check, `prepare_save`, `touch`, `commit_save`). The GPU
-/// copy and the disk write run outside it. In [`SaveMode::Async`] the model thread hands the bytes to the writer
-/// and the join + commit continue on a background thread pushed to `pending`; the slot is free to be reused because
-/// the async save captured an immutable stream and set `saved_ids`/`saved_owner` at hand-off.
-#[allow(clippy::too_many_arguments)]
-fn checkpoint_slot(archive: &ArchiveHandle, g: &mut GpuModel, slot: usize, target: usize, reason: &str, busy: bool,
-                   mode: SaveMode, pending: &PendingSaves) -> anyhow::Result<Option<CheckpointInfo>> {
+/// New entries are v2 format-2 segmented entries ([`Archive::save_segmented`]): content-addressed KV segments plus
+/// one state file holding the token list and the recurrent snapshot. This is synchronous in this wave because the
+/// core API borrows `&mut Archive` and its segment/state I/O is not chunked yet, so an automatic checkpoint blocks
+/// the model thread. The archive lock is taken only after the cheap slot checks and is held for the whole call, as
+/// the API requires `&mut Archive` for the GPU copies and the manifest commit; the slot is marked reusable by the
+/// core ([`GpuModel::mark_slot_saved`]) once the entry is persisted.
+fn checkpoint_slot(archive: &ArchiveHandle, g: &mut GpuModel, slot: usize, target: usize, reason: &str,
+                   busy: bool) -> anyhow::Result<Option<CheckpointInfo>> {
     if busy || slot >= g.slots() { return Ok(None); }
     let tokens = g.slot_tokens(slot).to_vec();
     if tokens.is_empty() { return Ok(None); }
-    // The manifest work is short; the lock is dropped before any GPU copy or disk I/O.
-    let (id, path) = {
-        let mut a = match archive.lock() { Ok(a) => a, Err(_) => anyhow::bail!("slot archive lock poisoned") };
-        if tokens.len() < a.config().min_tokens { return Ok(None); }
-        // A partial state (mid-prefill/decode) or an image prompt (M-RoPE offset) is not a plain text prefix.
-        if g.slot_pos(slot) != tokens.len() || g.slot_shifted(slot) { return Ok(None); }
-        // The conversation's owner, not the request that triggered the eviction.
-        let owner = g.slot_owner(slot);
-        let fp = g.slot_fingerprint();
-        let small = a.longest_prefix(owner, &tokens, fp).is_some_and(|e| tokens.len().saturating_sub(e.n_tokens) < a.config().min_delta);
-        match a.prepare_save(owner, &tokens, fp, reason) {
-            // The same state is already archived: only its LRU position changes, even below `min_delta`.
-            Ok(SaveSlot::Existing(e)) => {
-                a.touch(&e.id);
-                if g.current_slot() != target { g.use_slot(target); }
-                return Ok(Some(CheckpointInfo { id: e.id, n_saved: tokens.len(), n_written: 0, save_ms: 0.0 }));
-            }
-            Ok(SaveSlot::New { .. }) if small => {
-                if g.current_slot() != target { g.use_slot(target); }
-                return Ok(None);
-            }
-            Ok(SaveSlot::New { id, path }) => (id, path),
-            Err(e) => { a.note_failure(); return Err(e); }
-        }
-    };
-    let (owner, fp) = (g.slot_owner(slot), g.slot_fingerprint());
+    // A partial state (mid-prefill/decode) or an image prompt (M-RoPE offset) is not a plain text prefix.
+    if g.slot_pos(slot) != tokens.len() || g.slot_shifted(slot) { return Ok(None); }
+    // The conversation's owner, not the request that triggered the eviction.
+    let owner = g.slot_owner(slot);
+    let fp = g.slot_fingerprint();
+    // The v2 save writes the segments and the state file through `&mut Archive`; the lock covers that work.
+    let mut a = match archive.lock() { Ok(a) => a, Err(_) => anyhow::bail!("slot archive lock poisoned") };
+    if tokens.len() < a.config().min_tokens {
+        drop(a);
+        return Ok(None);
+    }
+    // A continuation that grew less than `min_delta` past the longest archived prefix is not worth a new entry.
+    // An exact duplicate is still touched (not rewritten) by `save_segmented`, so it bypasses this check.
+    let longest = a.longest_prefix(owner, &tokens, fp).map(|e| e.n_tokens);
+    if below_min_delta(tokens.len(), longest, a.config().min_delta) {
+        drop(a);
+        if g.current_slot() != target { g.use_slot(target); }
+        return Ok(None);
+    }
+    let exact = longest == Some(tokens.len());
     let t = Instant::now();
-    match mode {
-        SaveMode::Sync => {
-            let written = match g.save_slot_file_as(slot, &path, owner) {
-                Ok(n) => n,
-                Err(e) => {
-                    if let Ok(mut a) = archive.lock() { a.note_failure(); }
-                    let _ = std::fs::remove_file(&path);
-                    if g.current_slot() != target { g.use_slot(target); }
-                    return Err(e);
-                }
-            };
-            if g.current_slot() != target { g.use_slot(target); }
-            let saved = match archive.lock() { Ok(mut a) => a.commit_save(&id, &path, owner, &tokens, fp, reason), Err(_) => Err(anyhow::anyhow!("slot archive lock poisoned")) };
-            match saved {
-                Ok(e) => {
-                    let save_ms = t.elapsed().as_secs_f64() * 1e3;
-                    say!("archive: saved slot {slot} reason={reason} n={} bytes={written} ms={save_ms:.1}", tokens.len());
-                    Ok(Some(CheckpointInfo { id: e.id, n_saved: tokens.len(), n_written: written, save_ms }))
-                }
-                Err(e) => {
-                    if let Ok(mut a) = archive.lock() { a.note_failure(); }
-                    let _ = std::fs::remove_file(&path);
-                    Err(e)
-                }
-            }
+    let saved = a.save_segmented(g, slot, owner, reason);
+    if g.current_slot() != target { g.use_slot(target); }
+    match saved {
+        Ok(e) => {
+            let save_ms = t.elapsed().as_secs_f64() * 1e3;
+            // An exact duplicate is touched, not rewritten, so it wrote no bytes. A stale exact row, or an exact v1
+            // row upgraded to v2, which the core repaired (rare) is the exception; its bytes are not counted here.
+            let n_written = if exact { 0 } else { e.bytes };
+            say!("archive: saved slot {slot} reason={reason} n={} bytes={n_written} ms={save_ms:.1} format=2", tokens.len());
+            Ok(Some(CheckpointInfo { id: e.id, n_saved: tokens.len(), n_written, save_ms }))
         }
-        SaveMode::Async => {
-            // Returns once every byte is in the writer's ring; from here the stream is immutable and the slot may
-            // be reused (the model thread also has its owner and the saved-state marker restored).
-            let save = match g.save_slot_file_async_as(slot, &path, owner) {
-                Ok(s) => s,
-                Err(e) => {
-                    if let Ok(mut a) = archive.lock() { a.note_failure(); }
-                    let _ = std::fs::remove_file(&path);
-                    if g.current_slot() != target { g.use_slot(target); }
-                    return Err(e);
-                }
-            };
-            if g.current_slot() != target { g.use_slot(target); }
-            let n_saved = tokens.len();
-            let (bg_archive, bg_id, bg_path, bg_reason) = (archive.clone(), id.clone(), path.clone(), reason.to_string());
-            let handle = std::thread::spawn(move || {
-                let save_ms = t.elapsed().as_secs_f64() * 1e3;
-                let written = match save.join() {
-                    Ok(n) => n,
-                    Err(e) => { note_save_failure(&bg_archive, &bg_path, &e, &bg_reason); return; }
-                };
-                // The archive lock is taken only for the manifest commit, after the file is complete.
-                let saved = match bg_archive.lock() {
-                    Ok(mut a) => a.commit_save(&bg_id, &bg_path, owner, &tokens, fp, &bg_reason),
-                    Err(_) => Err(anyhow::anyhow!("slot archive lock poisoned")),
-                };
-                match saved {
-                    Ok(_) => say!("archive: saved slot {slot} reason={bg_reason} n={n_saved} bytes={written} ms={save_ms:.1} async=1"),
-                    Err(e) => note_save_failure(&bg_archive, &bg_path, &e, &bg_reason),
-                }
-            });
-            pending.lock().unwrap_or_else(|p| p.into_inner()).push(handle);
-            Ok(Some(CheckpointInfo { id, n_saved, n_written: 0, save_ms: t.elapsed().as_secs_f64() * 1e3 }))
-        }
+        Err(e) => { a.note_failure(); Err(e) }
     }
 }
 
@@ -3758,27 +3698,52 @@ fn archive_lookup(archive: &ArchiveHandle, owner: u64, ids: &[u32], keep: usize,
     }
 }
 
-/// Restore `entry` into an idle slot with the validated async reader. Records the outcome in the metrics; the
-/// caller decides whether to fall back to the normal prefill. The caller's entry lease is held through the call.
-fn archive_restore(archive: &ArchiveHandle, g: &mut GpuModel, slot: usize, entry: &ArchiveEntry) -> anyhow::Result<usize> {
+/// Restore `entry` into an idle slot. Format 2 entries go through the segmented reader; the archive lock is held
+/// for that call because the core API borrows `&mut Archive` for the segment reads and the state file, and the core
+/// clears the slot if it fails. Format 1 entries keep the v1 async reader outside the archive lock. `_lease` is the
+/// caller's [`Lease`], kept alive (so the entry cannot be deleted or GC'd) until the restore returns. The outcome is
+/// recorded in the metrics; the caller decides whether to fall back to the normal prefill.
+fn archive_restore(archive: &ArchiveHandle, g: &mut GpuModel, slot: usize, entry: &ArchiveEntry,
+                   _lease: &Lease) -> anyhow::Result<usize> {
     let t = Instant::now();
-    // The disk read runs on the reader thread; the model thread still performs the H2D copies and install.
-    let r = g.restore_slot_file_async(slot, &entry.file, false);
-    let mut a = match archive.lock() { Ok(a) => a, Err(_) => anyhow::bail!("slot archive lock poisoned") };
-    match r {
-        Ok(_) => {
-            a.note_restore();
-            say!("archive: restored slot {slot} n={} ms={:.1}", entry.n_tokens, t.elapsed().as_secs_f64() * 1e3);
-            Ok(entry.n_tokens)
+    match entry.format {
+        2 => {
+            let mut a = match archive.lock() { Ok(a) => a, Err(_) => anyhow::bail!("slot archive lock poisoned") };
+            // `restore_segmented` calls `prepare_segmented_restore(..., false)`: an automatic restore never evicts
+            // a non-empty slot under a unified budget. A failure leaves the slot erased for the prefill fallback.
+            match a.restore_segmented(g, slot, entry) {
+                Ok(n) => {
+                    a.note_restore();
+                    say!("archive: restored slot {slot} n={n} ms={:.1} format=2", t.elapsed().as_secs_f64() * 1e3);
+                    Ok(n)
+                }
+                Err(e) => { a.note_failure(); Err(e) }
+            }
         }
-        Err(e) => { a.note_failure(); Err(e) }
+        1 => {
+            // The disk read runs on the reader thread; the model thread still performs the H2D copies and install.
+            let r = g.restore_slot_file_async(slot, &entry.file, false);
+            let mut a = match archive.lock() { Ok(a) => a, Err(_) => anyhow::bail!("slot archive lock poisoned") };
+            match r {
+                Ok(_) => {
+                    a.note_restore();
+                    say!("archive: restored slot {slot} n={} ms={:.1}", entry.n_tokens, t.elapsed().as_secs_f64() * 1e3);
+                    Ok(entry.n_tokens)
+                }
+                Err(e) => { a.note_failure(); Err(e) }
+            }
+        }
+        other => {
+            if let Ok(mut a) = archive.lock() { a.note_failure(); }
+            Err(anyhow::anyhow!("slot archive: entry {} has unknown format {other}", entry.id))
+        }
     }
 }
 
 /// Single-slot archive policy: restore a matching entry into slot 0 before the prefill, else checkpoint a slot whose
 /// conversation the prompt diverges from. Everything is best-effort: a failure only logs and leaves the normal
 /// prefill path in place (docs/SLOT-ARCHIVE.md §13).
-fn archive_before_single(archive: &ArchiveHandle, g: &mut GpuModel, owner: u64, ids: &[u32], keep: usize, pending: &PendingSaves) {
+fn archive_before_single(archive: &ArchiveHandle, g: &mut GpuModel, owner: u64, ids: &[u32], keep: usize) {
     let hit = archive_lookup(archive, owner, ids, keep, g.slot_fingerprint(), g.ctx());
     // The lease lives until the restore finishes (or the block is left without one). It cannot outlive this
     // function, and no queue wait happens while it is held.
@@ -3790,10 +3755,10 @@ fn archive_before_single(archive: &ArchiveHandle, g: &mut GpuModel, owner: u64, 
             let blocked = g.kv_reclaim_plan(0, hit.n_tokens).iter().any(|&v| v != 0 && !g.slot_tokens(v).is_empty());
             if !blocked {
                 if !g.slot_tokens(0).is_empty()
-                    && let Err(e) = checkpoint_slot(archive, g, 0, 0, "evict", false, SaveMode::Async, pending) {
+                    && let Err(e) = checkpoint_slot(archive, g, 0, 0, "evict", false) {
                     say!("archive: checkpoint slot 0 before restore: {e:#}");
                 }
-                match archive_restore(archive, g, 0, &hit) {
+                match archive_restore(archive, g, 0, &hit, &_lease) {
                     Ok(_) => { g.use_slot(0); return; }
                     Err(e) => say!("archive: restore into slot 0 (falling back to prefill): {e:#}"),
                 }
@@ -3805,13 +3770,13 @@ fn archive_before_single(archive: &ArchiveHandle, g: &mut GpuModel, owner: u64, 
     // The prompt diverges from the slot's history (switch or compact): save it before `prefill_cached` resets it.
     let h = g.slot_tokens(0).to_vec();
     if !h.is_empty() && !(keep >= h.len() && ids[..keep].starts_with(&h))
-        && let Err(e) = checkpoint_slot(archive, g, 0, 0, "divergence", false, SaveMode::Async, pending) {
+        && let Err(e) = checkpoint_slot(archive, g, 0, 0, "divergence", false) {
         say!("archive: checkpoint slot 0 (divergence): {e:#}");
     }
     // The reclaim plan is empty with a single slot outside a unified budget, but keep the trigger in one place.
     for v in g.kv_reclaim_plan(0, ids.len()) {
         if v != 0 && !g.slot_tokens(v).is_empty()
-            && let Err(e) = checkpoint_slot(archive, g, v, 0, "evict", false, SaveMode::Async, pending) {
+            && let Err(e) = checkpoint_slot(archive, g, v, 0, "evict", false) {
             say!("archive: checkpoint unified victim slot {v}: {e:#}");
         }
     }
@@ -3966,8 +3931,6 @@ struct Sched {
     pinned: Vec<bool>,
     /// `--slot-archive-dir`: shared with the serving loop (None: the archive is off).
     archive: Option<ArchiveHandle>,
-    /// Background automatic commits, joined when this serving loop ends.
-    pending: PendingSaves,
 }
 
 enum Control { Action(SlotAction, std::sync::mpsc::Sender<anyhow::Result<Value>>), Info(std::sync::mpsc::Sender<anyhow::Result<Value>>) }
@@ -4095,7 +4058,7 @@ impl Sched {
                             g.set_active(&self.active());
                             let target = g.current_slot();
                             let busy = self.held.get(slot).copied().unwrap_or(false) || self.prefill.get(slot).copied().unwrap_or(false);
-                            match checkpoint_slot(archive, g, slot, target, "checkpoint", busy, SaveMode::Sync, &self.pending)? {
+                            match checkpoint_slot(archive, g, slot, target, "checkpoint", busy)? {
                                 Some(cp) => Ok(json!({
                                     "id_slot": slot,
                                     "id": cp.id,
@@ -4172,7 +4135,7 @@ impl Serving {
             // Owned here, so that a panic drops the queued jobs' reply channels and the request threads end (the
             // scope then joins them and the panic goes on).
             let (jobs, mut s) = (jobs, Sched { held: vec![false; n], prefill: vec![false; n], freed: vec![0; n], who: vec![0; n],
-                pinned: vec![false; n], archive: self.archive.clone(), pending: self.pending.clone(), ..Default::default() });
+                pinned: vec![false; n], archive: self.archive.clone(), ..Default::default() });
             let mut open = true;
             loop {
                 while open && wake.is_none() && next.lock().unwrap().is_none() {
@@ -4254,14 +4217,14 @@ impl Serving {
                                 // The target's old conversation is lost by the restore: checkpoint it first.
                                 if !g.slot_tokens(rs).is_empty() {
                                     let busy = s.held[rs] || s.prefill[rs];
-                                    if let Err(e) = checkpoint_slot(archive, g, rs, rs, "evict", busy, SaveMode::Async, &self.pending) {
+                                    if let Err(e) = checkpoint_slot(archive, g, rs, rs, "evict", busy) {
                                         say!("archive: checkpoint slot {rs} before restore: {e:#}");
                                     }
                                     saved.insert(rs);
                                 }
                                 s.pinned[rs] = true;
                                 g.set_active(&s.active());
-                                match archive_restore(archive, g, rs, &hit) {
+                                match archive_restore(archive, g, rs, &hit, &_lease) {
                                     Ok(_) => { sl = rs; }
                                     Err(e) => {
                                         say!("archive: restore into slot {rs} (falling back to prefill): {e:#}");
@@ -4287,13 +4250,13 @@ impl Serving {
                         let Job::Chat { ids, keep, .. } = job else { continue };
                         let h = g.slot_tokens(*sl);
                         if !h.is_empty() && !(*keep >= h.len() && ids[..*keep].starts_with(h)) && saved.insert(*sl) {
-                            if let Err(e) = checkpoint_slot(archive, g, *sl, *sl, "divergence", false, SaveMode::Async, &self.pending) {
+                            if let Err(e) = checkpoint_slot(archive, g, *sl, *sl, "divergence", false) {
                                 say!("archive: checkpoint slot {sl} (divergence): {e:#}");
                             }
                         }
                         for v in g.kv_reclaim_plan(*sl, ids.len()) {
                             if v != *sl && !g.slot_tokens(v).is_empty() && saved.insert(v) {
-                                if let Err(e) = checkpoint_slot(archive, g, v, *sl, "evict", false, SaveMode::Async, &self.pending) {
+                                if let Err(e) = checkpoint_slot(archive, g, v, *sl, "evict", false) {
                                     say!("archive: checkpoint unified victim slot {v}: {e:#}");
                                 }
                             }
@@ -4680,6 +4643,9 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, mut l: Option<&mu
                 "restoring": leased > 0,
                 "reason": e.reason,
                 "fingerprint": format!("{:016x}", e.fingerprint),
+                // Additive: 1 = a v1 `STRATASLOT` file, 2 = a segmented entry (state file + KV segments). The
+                // segment ids and paths stay internal; operators only need to tell the two formats apart.
+                "format": e.format,
             })).collect();
             send(&mut w, "200 OK", json!({"dir": dir, "budget_bytes": budget, "used_bytes": used, "pinned_bytes": pinned_bytes, "entries": entries}))
         }
@@ -4801,7 +4767,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, mut l: Option<&mu
                             return send(&mut w, "400 Bad Request", json!({"error": {"message": "Invalid slot ID", "type": "invalid_request_error"}}));
                         }
                         let target = g.current_slot();
-                        checkpoint_slot(&archive, g, id, target, "checkpoint", false, SaveMode::Sync, &s.pending).and_then(|cp| {
+                        checkpoint_slot(&archive, g, id, target, "checkpoint", false).and_then(|cp| {
                             cp.map(|cp| json!({
                                 "id_slot": id,
                                 "id": cp.id,
@@ -5092,7 +5058,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, mut l: Option<&mu
             } else { 0 };
             if let Some(archive) = &s.archive && vision_prompt.is_none()
                 && let Runner::Gpu(g) = &mut *r && g.slots() == 1 {
-                archive_before_single(archive, g, who.id, &ids, chat_keep, &s.pending);
+                archive_before_single(archive, g, who.id, &ids, chat_keep);
             }
             let id = format!("chatcmpl-{i}");
             let chunk = |delta: serde_json::Value, finish: Option<&str>| json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": name,
@@ -5922,6 +5888,24 @@ mod pending_save_tests {
         assert!(t.elapsed() < Duration::from_secs(2), "the bounded join waited {:?}", t.elapsed());
         // Release the worker so the helper thread that joined it can end too.
         let _ = tx.send(());
+    }
+}
+
+#[cfg(test)]
+mod archive_delta_tests {
+    use super::below_min_delta;
+
+    #[test]
+    fn exact_duplicates_are_never_below_min_delta() {
+        // The default --slot-archive-min-delta is 1024: an exact duplicate (delta 0) is still touched, not skipped.
+        assert!(!below_min_delta(4096, Some(4096), 1024));
+        // No archived prefix at all: always worth a new entry (min_tokens is checked separately).
+        assert!(!below_min_delta(4096, None, 1024));
+        // A short continuation past an older prefix is skipped.
+        assert!(below_min_delta(5000, Some(4096), 1024));
+        // Exactly min_delta is enough, and min_delta 0 disables the heuristic.
+        assert!(!below_min_delta(5120, Some(4096), 1024));
+        assert!(!below_min_delta(4097, Some(4096), 0));
     }
 }
 
