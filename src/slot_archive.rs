@@ -14,30 +14,49 @@ use crate::gpu_model::GpuModel;
 use crate::slot_segments::{self, SegmentStore};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// File name of the manifest inside [`ArchiveConfig::dir`].
+/// File name of the compacted manifest inside [`ArchiveConfig::dir`].
 pub const MANIFEST: &str = "manifest.json";
+/// File name of the append-only journal holding manifest mutations since the last compaction.
+pub const JOURNAL: &str = "manifest.log";
 /// Headroom kept free below the logical budget, so a save can always write a temp file and the manifest.
 pub const RESERVE_BYTES: u64 = 1 << 30;
 /// Manifest schema version written and understood by this module.
 const MANIFEST_VERSION: u32 = 1;
+/// Journal record schema version.
+const JOURNAL_VERSION: u32 = 1;
+/// Maximum number of pending LRU touches before they are appended to the journal.
+const TOUCH_FLUSH_MAX: usize = 256;
+/// Maximum interval between two forced touch flushes (60 s).
+const TOUCH_FLUSH_INTERVAL_MS: u64 = 60_000;
+/// Compact after this many journal records even when the journal is smaller than the snapshot.
+const JOURNAL_COMPACT_RECORDS: usize = 4096;
+/// Small archives compact on every structural write, so the compacted JSON stays useful to operators and
+/// external tooling. Larger archives amortize the snapshot write through the journal.
+const EAGER_COMPACT_ENTRIES: usize = 256;
 
 /// Tokens per content-addressed KV segment (docs/SLOT-ARCHIVE-PHASE2.md §2.3 and §15).
 pub const SEGMENT_TOKENS: usize = 1024;
-/// Magic of a v2 entry state file (`STRSTATE`): the token list plus the entry's recurrent snapshot.
+/// Magic of a v2 entry state file (`STRSTATE`): the token list, segment refs and the recurrent snapshot.
 pub const STATE_MAGIC: [u8; 8] = *b"STRSTATE";
-/// Version of the `STRSTATE` format understood here.
-pub const STATE_VERSION: u32 = 1;
-/// Fixed `STRSTATE` header length: magic, version, fingerprint, owner, rope offset, token count.
-const STATE_HEADER_LEN: u64 = 8 + 4 + 8 + 8 + 4 + 4;
+/// Version of the `STRSTATE` format written by this module. Version 1 files (no segment refs) stay readable.
+pub const STATE_VERSION: u32 = 2;
+/// Fixed v1 `STRSTATE` header length: magic, version, fingerprint, owner, rope offset, token count.
+const STATE_V1_HEADER_LEN: u64 = 8 + 4 + 8 + 8 + 4 + 4;
+/// Fixed v2 `STRSTATE` header length: the v1 fields plus the segment-ref count.
+const STATE_HEADER_LEN: u64 = STATE_V1_HEADER_LEN + 4;
+/// Wire length of one ordered segment reference: 16-byte id, start u64, end u64.
+const STATE_SEGMENT_REF_LEN: u64 = 16 + 8 + 8;
 /// Sanity bound on the token list in a `STRSTATE` file (16M ids, 64 MiB), far above any `--ctx`.
 const MAX_STATE_TOKENS: usize = 1 << 24;
+/// Sanity bound on the segment-ref list (1M refs, 32 MiB). Real 1024-token histories use far fewer.
+const MAX_STATE_SEGMENTS: usize = 1 << 20;
 
 /// Archive policy and location. Built from the `--slot-archive-*` flags.
 #[derive(Clone, Debug)]
@@ -141,6 +160,16 @@ pub struct Archive {
     ttl_ms: u64,
     per_key_bytes: u64,
     pin_bytes: u64,
+    /// LRU touches not yet appended to the journal. `touch` only updates memory and this map; the update is
+    /// durable after [`Archive::flush`] (also called from `gc`, the next compaction and `Drop`).
+    pending_touches: BTreeMap<String, u64>,
+    /// Bytes and records currently in `manifest.log`, used to decide when to compact.
+    journal_bytes: u64,
+    journal_records: usize,
+    /// Size of the last compacted snapshot, the amortization target for journal compaction.
+    manifest_bytes: u64,
+    /// When the pending touches were last flushed.
+    last_touch_flush_ms: u64,
 }
 
 /// A transient reference to an archive entry, held while a restore or save is in flight.
@@ -181,8 +210,16 @@ impl Drop for Lease {
 }
 
 impl Archive {
-    /// Open (or create) `cfg.dir`, load `manifest.json`, and rebuild it from the shard files when it is missing or
-    /// corrupt. Creates the directory with mode 0700 on Unix when it does not exist.
+    /// Open (or create) `cfg.dir`, load `manifest.json`, replay `manifest.log`, and rebuild the index from the
+    /// shard files when the compacted manifest is missing or corrupt. Creates the directory with mode 0700 on Unix
+    /// when it does not exist.
+    ///
+    /// Recovery order:
+    /// 1. a valid compacted manifest is loaded, then the journal is replayed over it (a truncated last record is
+    ///    ignored and the journal is compacted);
+    /// 2. a missing/corrupt manifest is rebuilt from the surviving v1 `.slot` files and v2 `.state` files, using
+    ///    `segments.json` (itself rebuilt from `.seg` files) to validate every v2 segment reference. The journal is
+    ///    discarded in this case because the files, not the lost snapshot, are the source of truth.
     pub fn open(cfg: ArchiveConfig) -> Result<Self> {
         let mut cfg = cfg;
         if !cfg.dir.is_absolute() {
@@ -193,9 +230,29 @@ impl Archive {
         ensure_dir(&cfg.dir)?;
         remove_stale_temps(&cfg.dir);
 
+        // The segment store is needed to validate rebuilt v2 entries, so open it first. Its own manifest is
+        // likewise loaded or rebuilt from the `.seg` files.
+        let mut segments = SegmentStore::open(cfg.dir.clone())?;
+
         let manifest = cfg.dir.join(MANIFEST);
+        let mut journal_bytes = 0u64;
+        let mut journal_records = 0usize;
+        let mut journal_repaired = false;
         let (mut entries, rebuilt) = match load_manifest(&cfg.dir) {
-            Ok(entries) => (entries, false),
+            Ok(entries) => {
+                let (records, repaired, bytes, count) = load_journal(&cfg.dir);
+                journal_bytes = bytes;
+                journal_records = count;
+                journal_repaired = repaired;
+                let mut entries = entries;
+                for record in records {
+                    if let Err(err) = apply_journal(&cfg.dir, &mut entries, record) {
+                        crate::say!("slot archive: ignoring a bad manifest journal record: {err:#}");
+                        journal_repaired = true;
+                    }
+                }
+                (entries, false)
+            }
             Err(err) => {
                 if manifest.exists() {
                     let bad = cfg.dir.join(format!("{MANIFEST}.bad.{}", now_ms()));
@@ -209,20 +266,19 @@ impl Archive {
                         ),
                     }
                 } else {
-                    crate::say!("slot archive: {err:#}; rebuilding the manifest from the shard files");
+                    crate::say!("slot archive: {err:#}; rebuilding the manifest from the archive files");
                 }
-                (rebuild_manifest(&cfg.dir)?, true)
+                // The compacted manifest is the base of the journal; without it the journal cannot be replayed
+                // safely, and the surviving files are authoritative.
+                discard_journal(&cfg.dir, "the compacted manifest is unusable");
+                (rebuild_manifest(&cfg.dir, &segments)?, true)
             }
         };
-
-        // The segment store lives in the same directory (`segments.json`, `segments/`). Missing state is created
-        // lazily; a v1-only archive opens with an empty store and behaves exactly as before.
-        let mut segments = SegmentStore::open(cfg.dir.clone())?;
 
         // Startup validation: stat every file and compare the header with the manifest row. Missing or
         // inconsistent entries are dropped (the file, if any, stays on disk for a later rebuild). A v2 entry is
         // dropped when its state file or any referenced segment is missing/inconsistent.
-        let mut changed = rebuilt;
+        let mut changed = rebuilt || journal_repaired;
         let ids: Vec<String> = entries.keys().cloned().collect();
         for id in ids {
             let entry = entries[&id].clone();
@@ -250,7 +306,8 @@ impl Archive {
             crate::say!("slot archive: segment cleanup at open failed: {err:#}");
         }
 
-        let archive = Archive {
+        let manifest_bytes = fs::metadata(&manifest).map(|meta| meta.len()).unwrap_or(0);
+        let mut archive = Archive {
             cfg,
             entries,
             segments,
@@ -259,9 +316,14 @@ impl Archive {
             ttl_ms: 0,
             per_key_bytes: 0,
             pin_bytes: 0,
+            pending_touches: BTreeMap::new(),
+            journal_bytes,
+            journal_records,
+            manifest_bytes,
+            last_touch_flush_ms: now_ms(),
         };
         if changed {
-            archive.persist()?;
+            archive.compact()?;
         }
         Ok(archive)
     }
@@ -311,7 +373,16 @@ impl Archive {
         }
         let entry = self.entries.get_mut(id).context("entry disappeared while pinning")?;
         entry.pinned = pinned;
-        self.persist()?;
+        let record = JournalOp::Pin { v: JOURNAL_VERSION, id: id.to_string(), pinned };
+        if let Err(err) = self.append_journal(&record) {
+            // Revert the in-memory change when it could not be journaled; the compacted snapshot still has the old
+            // value, so the archive stays consistent.
+            if let Some(entry) = self.entries.get_mut(id) {
+                entry.pinned = !pinned;
+            }
+            return Err(err);
+        }
+        self.maybe_compact();
         Ok(())
     }
 
@@ -360,8 +431,12 @@ impl Archive {
             if entry.file.exists() {
                 // Dedupe: the same content is already on disk. Update the in-memory LRU position; `touch`
                 // (or the next manifest write) persists it.
-                entry.last_used_ms = now_ms();
-                return Ok(SaveSlot::Existing(entry.clone()));
+                let used = now_ms();
+                entry.last_used_ms = used;
+                self.note_touch(&id, used);
+                return self.entries.get(&id).cloned().map(SaveSlot::Existing).ok_or_else(|| {
+                    anyhow::anyhow!("slot archive entry disappeared while preparing a save")
+                });
             }
             // A stale row whose file disappeared: forget it (releasing v2 segment references) and let the caller
             // write a new file.
@@ -468,7 +543,13 @@ impl Archive {
             format: crate::slot_file::VERSION,
         };
         self.entries.insert(id.to_string(), entry.clone());
-        self.persist()?;
+        let record = JournalOp::Add { v: JOURNAL_VERSION, entry: self.manifest_row(&entry) };
+        if let Err(err) = self.append_journal(&record) {
+            self.entries.remove(id);
+            let _ = fs::remove_file(path);
+            return Err(err);
+        }
+        self.maybe_compact();
         Ok(entry)
     }
 
@@ -692,6 +773,7 @@ impl Archive {
                     rope_offset: g.slot_rope_offset(slot),
                     n_tokens: tokens.len(),
                 },
+                &refs,
                 &tokens,
                 &state_payload,
             )?;
@@ -748,12 +830,14 @@ impl Archive {
             format: 2,
         };
         self.entries.insert(id.clone(), entry.clone());
-        if let Err(err) = self.persist() {
+        let record = JournalOp::Add { v: JOURNAL_VERSION, entry: self.manifest_row(&entry) };
+        if let Err(err) = self.append_journal(&record) {
             self.entries.remove(&id);
             let _ = fs::remove_file(&state_path);
             self.release_segments(&taken);
             return Err(err);
         }
+        self.maybe_compact();
         // The slot is reusable at this history, exactly as after a v1 synchronous save (`save_state` cleared the
         // marker while writing the recurrent payload).
         g.mark_slot_saved(slot, &tokens, owner);
@@ -818,7 +902,7 @@ impl Archive {
             .state_file
             .as_deref()
             .context("segmented entry has no state file")?;
-        let (header, tokens, state_payload) = read_state_file(state_file)?;
+        let (header, state_segments, tokens, state_payload) = read_state_file(state_file)?;
         if header.fingerprint != entry.fingerprint {
             bail!(
                 "slot archive: {} header fingerprint {:016x} does not match the entry {:016x}",
@@ -843,9 +927,18 @@ impl Archive {
                 entry.n_tokens
             );
         }
+        // A v2 state file carries the ordered refs; a legacy v1 state file does not, so the manifest row is used.
+        if !state_segments.is_empty() && state_segments != entry.segments {
+            bail!(
+                "slot archive: {} segment refs do not match the manifest row",
+                state_file.display()
+            );
+        }
         if !segments_cover(&entry.segments, entry.n_tokens) {
             bail!("slot archive: entry {} segment ranges are not a contiguous cover of its history", entry.id);
         }
+        validate_segment_chain(entry.fingerprint, &entry.segments, &tokens)
+            .with_context(|| format!("validating the segment chain of {}", entry.id))?;
 
         // Capacity/unified growth first; never evicts (automatic restore). This does not touch the file.
         g.prepare_segmented_restore(slot, tokens.len(), false)?;
@@ -966,7 +1059,9 @@ impl Archive {
             let used = now_ms();
             if let Some(entry) = self.entries.get_mut(&id) {
                 entry.last_used_ms = used;
-                return Ok(Some(entry.clone()));
+                let cloned = entry.clone();
+                self.note_touch(&id, used);
+                return Ok(Some(cloned));
             }
         }
 
@@ -996,12 +1091,15 @@ impl Archive {
     }
 
     /// Mark an entry as used now (LRU). No-op when it disappeared.
+    ///
+    /// This is cheap: it updates memory and a bounded pending-touch map; the journal is written only when the
+    /// batch fills, the flush interval elapses, or [`Archive::flush`]/[`Archive::compact`]/GC runs. A crash can
+    /// therefore lose recent LRU hints, never an entry.
     pub fn touch(&mut self, id: &str) {
+        let used = now_ms();
         let Some(entry) = self.entries.get_mut(id) else { return };
-        entry.last_used_ms = now_ms();
-        if let Err(err) = self.persist() {
-            crate::say!("slot archive: manifest write after touch failed: {err:#}");
-        }
+        entry.last_used_ms = used;
+        self.note_touch(id, used);
     }
 
     /// Delete an entry, its state/slot file and (for v2) its segment references. Returns the freed logical bytes.
@@ -1018,8 +1116,13 @@ impl Archive {
             );
         }
         self.remove_entry_data(&entry, true)?;
+        let record = JournalOp::Delete { v: JOURNAL_VERSION, id: id.to_string() };
+        if let Err(err) = self.append_journal(&record) {
+            // The data is already gone; a stale journal row is harmless because startup validation drops it.
+            crate::say!("slot archive: journaling the deletion of {id}: {err:#}");
+        }
         self.entries.remove(id);
-        self.persist()?;
+        self.maybe_compact();
         Ok(entry.bytes)
     }
 
@@ -1095,8 +1198,9 @@ impl Archive {
             }
         }
 
-        if changed {
-            self.persist()?;
+        if changed || !self.pending_touches.is_empty() || self.journal_records > 0 {
+            // GC is a natural compaction point: it settles the LRU touches and folds the journal into the snapshot.
+            self.compact()?;
         }
         // Entry references are gone; drop the zero-ref segment files in the same pass. Rows still referenced by a
         // v2 entry stay, so a shared segment survives until its last entry goes.
@@ -1241,37 +1345,187 @@ impl Archive {
         (evicted, freed)
     }
 
-    fn persist(&self) -> Result<()> {
+    /// Build one manifest row from an in-memory entry.
+    fn manifest_row(&self, e: &ArchiveEntry) -> ManifestEntry {
+        ManifestEntry {
+            id: e.id.clone(),
+            file: relative_string(&self.cfg.dir, &e.file),
+            state_file: e
+                .state_file
+                .as_deref()
+                .map(|path| relative_string(&self.cfg.dir, path)),
+            segments: e.segments.clone(),
+            bytes: e.bytes,
+            n_tokens: e.n_tokens,
+            owner: e.owner,
+            fingerprint: format!("{:016x}", e.fingerprint),
+            prefix_hash: format!("{:016x}", e.prefix_hash),
+            created_ms: e.created_ms,
+            last_used_ms: e.last_used_ms,
+            parent: e.parent.clone(),
+            pinned: e.pinned,
+            reason: e.reason.clone(),
+            format: e.format,
+        }
+    }
+
+    /// Append one record to `manifest.log` and fsync it. A partial write is truncated back to the previous
+    /// length, so a reader never sees a malformed record in the middle of the journal.
+    fn append_journal(&mut self, op: &JournalOp) -> Result<()> {
+        ensure_dir(&self.cfg.dir)?;
+        let path = self.cfg.dir.join(JOURNAL);
+        let mut line = serde_json::to_vec(op).context("serializing the archive journal record")?;
+        line.push(b'\n');
+        let existed = path.exists();
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        let before = file
+            .metadata()
+            .with_context(|| format!("stat {}", path.display()))?
+            .len();
+        let write = (|| -> Result<()> {
+            file.write_all(&line).context("writing the archive journal")?;
+            file.sync_data().context("syncing the archive journal")?;
+            Ok(())
+        })();
+        if let Err(err) = write {
+            let _ = file.set_len(before);
+            return Err(err);
+        }
+        drop(file);
+        if !existed {
+            fsync_dir(&self.cfg.dir);
+        }
+        self.journal_bytes = before.saturating_add(line.len() as u64);
+        self.journal_records += 1;
+        Ok(())
+    }
+
+    /// Truncate `manifest.log` after its records have been folded into `manifest.json`. Best effort: a failure
+    /// leaves an idempotent journal behind, which a later open replays onto the new snapshot.
+    fn clear_journal(&mut self) {
+        let path = self.cfg.dir.join(JOURNAL);
+        match fs::OpenOptions::new().write(true).truncate(true).open(&path) {
+            Ok(file) => {
+                if let Err(err) = file.sync_all() {
+                    crate::say!("slot archive: syncing the cleared journal: {err:#}");
+                }
+                fsync_dir(&self.cfg.dir);
+                self.journal_bytes = 0;
+                self.journal_records = 0;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                self.journal_bytes = 0;
+                self.journal_records = 0;
+            }
+            Err(err) => {
+                crate::say!("slot archive: clearing the journal {}: {err:#}", path.display());
+            }
+        }
+    }
+
+    /// Compact when the journal has grown to the size of the snapshot, at a record cap, or eagerly for a small
+    /// archive so operators and external tools see a current `manifest.json`. Errors are logged: the mutation is
+    /// already durable in the journal, so a failed compaction must not fail the caller.
+    fn maybe_compact(&mut self) {
+        if self.entries.len() <= EAGER_COMPACT_ENTRIES || self.journal_is_large() {
+            if let Err(err) = self.compact() {
+                crate::say!("slot archive: manifest compaction failed: {err:#}");
+            }
+        }
+    }
+
+    /// True when the journal has grown to the snapshot size or the record cap. Used by the touch path, which
+    /// must not rewrite the snapshot just because the archive is small.
+    fn journal_is_large(&self) -> bool {
+        self.journal_bytes >= self.manifest_bytes || self.journal_records >= JOURNAL_COMPACT_RECORDS
+    }
+
+    /// Make pending LRU touches durable by appending them to the journal. This does not rewrite `manifest.json`;
+    /// the next structural compaction folds them into the snapshot.
+    pub fn flush(&mut self) -> Result<()> {
+        self.flush_touches(true)
+    }
+
+    /// Write the full compacted snapshot and clear the journal. This is the explicit "compact now" operation; it
+    /// is also used by GC and by the adaptive policy in [`Archive::maybe_compact`].
+    pub fn compact(&mut self) -> Result<()> {
         ensure_dir(&self.cfg.dir)?;
         let manifest = ManifestFile {
             version: MANIFEST_VERSION,
             entries: self
                 .entries
                 .values()
-                .map(|e| ManifestEntry {
-                    id: e.id.clone(),
-                    file: relative_string(&self.cfg.dir, &e.file),
-                    state_file: e
-                        .state_file
-                        .as_deref()
-                        .map(|path| relative_string(&self.cfg.dir, path)),
-                    segments: e.segments.clone(),
-                    bytes: e.bytes,
-                    n_tokens: e.n_tokens,
-                    owner: e.owner,
-                    fingerprint: format!("{:016x}", e.fingerprint),
-                    prefix_hash: format!("{:016x}", e.prefix_hash),
-                    created_ms: e.created_ms,
-                    last_used_ms: e.last_used_ms,
-                    parent: e.parent.clone(),
-                    pinned: e.pinned,
-                    reason: e.reason.clone(),
-                    format: e.format,
-                })
+                .map(|entry| self.manifest_row(entry))
                 .collect(),
         };
         let data = serde_json::to_vec(&manifest).context("serializing the archive manifest")?;
-        write_atomic(&self.cfg.dir, &data)
+        write_atomic(&self.cfg.dir, &data)?;
+        self.manifest_bytes = data.len() as u64;
+        self.pending_touches.clear();
+        self.last_touch_flush_ms = now_ms();
+        self.clear_journal();
+        // Keep the second manifest in step when the archive is compacted, so a direct reader sees recent segment
+        // rows too. A failure here is logged: the segment journal is still replayable.
+        if let Err(err) = self.segments.compact() {
+            crate::say!("slot archive: segment manifest compaction failed: {err:#}");
+        }
+        Ok(())
+    }
+
+    /// Append the pending touch batch. `force` ignores the interval/count thresholds (used by `flush`, GC and
+    /// `Drop`).
+    fn flush_touches(&mut self, force: bool) -> Result<()> {
+        if self.pending_touches.is_empty() {
+            return Ok(());
+        }
+        let now = now_ms();
+        if !force
+            && self.pending_touches.len() < TOUCH_FLUSH_MAX
+            && now.saturating_sub(self.last_touch_flush_ms) < TOUCH_FLUSH_INTERVAL_MS
+        {
+            return Ok(());
+        }
+        let touches: Vec<TouchRow> = self
+            .pending_touches
+            .iter()
+            .map(|(id, last_used_ms)| TouchRow { id: id.clone(), last_used_ms: *last_used_ms })
+            .collect();
+        let op = JournalOp::Touch { v: JOURNAL_VERSION, touches };
+        self.append_journal(&op)?;
+        self.pending_touches.clear();
+        self.last_touch_flush_ms = now;
+        // A pure-touch workload must also have a bound: fold the journal in when it reaches the snapshot size.
+        if self.journal_is_large() {
+            if let Err(err) = self.compact() {
+                crate::say!("slot archive: manifest compaction after touch flush failed: {err:#}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Cheap in-memory LRU update plus the bounded batch policy.
+    fn note_touch(&mut self, id: &str, used: u64) {
+        self.pending_touches.insert(id.to_string(), used);
+        let due = self.pending_touches.len() >= TOUCH_FLUSH_MAX
+            || used.saturating_sub(self.last_touch_flush_ms) >= TOUCH_FLUSH_INTERVAL_MS;
+        if due {
+            if let Err(err) = self.flush_touches(true) {
+                crate::say!("slot archive: flushing LRU touches: {err:#}");
+            }
+        }
+    }
+}
+
+impl Drop for Archive {
+    fn drop(&mut self) {
+        // A clean shutdown should not lose recent LRU hints. Entries themselves are already durable.
+        if let Err(err) = self.flush_touches(true) {
+            crate::say!("slot archive: flushing LRU touches at shutdown: {err:#}");
+        }
     }
 }
 
@@ -1314,23 +1568,31 @@ pub(crate) fn read_entry_tokens(entry: &ArchiveEntry) -> Result<Vec<u32>> {
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// STRSTATE v1: the v2 entry's token list and recurrent snapshot
+// STRSTATE: the v2 entry's token list, segment refs and recurrent snapshot
 // ---------------------------------------------------------------------------------------------------------
 //
+// Version 2 (written here):
 // ```text
 // magic[8]  = "STRSTATE"
-// version: u32 = 1
+// version: u32 = 2
 // fingerprint: u64
 // owner: u64
 // rope_offset: i32
 // n_tokens: u32
+// n_segments: u32
+// segments: n_segments × { id[16], start u64, end u64 }
 // tokens: n_tokens × u32
 // state_len: u64
 // state: state_len bytes (the `STRRSEG` payload from GpuModel::save_recurrent_to)
 // ```
 //
-// There is no footer: the exact file length (header + tokens + length + payload) is checked, so a truncated or
-// extended file is rejected. KV rows are not in this file; they are the content-addressed segments.
+// Version 1 (read-only compatibility) has the same header through `n_tokens`, then `tokens` and the payload; it
+// carries no segment refs. A v1 state file is still restorable while its manifest row supplies the refs, but it
+// cannot be reconstructed after manifest loss (the refs would have to be invented).
+//
+// There is no footer: the exact file length is checked, so a truncated or extended file is rejected. The segment
+// refs are validated against the content-addressed chain over `tokens`, which lets `open` rebuild v2 entries from
+// the state file alone.
 
 /// The parsed `STRSTATE` header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1341,7 +1603,9 @@ pub(crate) struct StateHeader {
     pub n_tokens: usize,
 }
 
-fn read_state_preamble<R: Read>(r: &mut R) -> Result<(StateHeader, Vec<u32>, u64)> {
+fn read_state_preamble<R: Read>(
+    r: &mut R,
+) -> Result<(u32, StateHeader, Vec<SegmentRef>, Vec<u32>, u64)> {
     let mut magic = [0u8; 8];
     r.read_exact(&mut magic).context("reading the state file magic")?;
     if magic != STATE_MAGIC {
@@ -1350,8 +1614,8 @@ fn read_state_preamble<R: Read>(r: &mut R) -> Result<(StateHeader, Vec<u32>, u64
         );
     }
     let version = crate::slot_file::read_u32(r).context("reading the state file version")?;
-    if version != STATE_VERSION {
-        bail!("unsupported state file version {version}, expected {STATE_VERSION}");
+    if version != 1 && version != STATE_VERSION {
+        bail!("unsupported state file version {version}, expected 1 or {STATE_VERSION}");
     }
     let fingerprint = crate::slot_file::read_u64(r).context("reading the state file fingerprint")?;
     let owner = crate::slot_file::read_u64(r).context("reading the state file owner")?;
@@ -1362,6 +1626,39 @@ fn read_state_preamble<R: Read>(r: &mut R) -> Result<(StateHeader, Vec<u32>, u64
     if n_tokens == 0 || n_tokens > MAX_STATE_TOKENS {
         bail!("state file has {n_tokens} tokens, the expected range is 1..={MAX_STATE_TOKENS}");
     }
+
+    let mut segments = Vec::new();
+    if version >= 2 {
+        let n_segments =
+            crate::slot_file::read_u32(r).context("reading the state segment count")? as usize;
+        // Each segment covers at least one token, so the count cannot exceed the token count. The cap also
+        // bounds the allocation for a malicious header.
+        if n_segments == 0 || n_segments > n_tokens || n_segments > MAX_STATE_SEGMENTS {
+            bail!(
+                "state file has {n_segments} segment refs for {n_tokens} tokens, the expected range is 1..={}",
+                n_tokens.min(MAX_STATE_SEGMENTS)
+            );
+        }
+        segments.reserve(n_segments);
+        for index in 0..n_segments {
+            let mut id = [0u8; 16];
+            r.read_exact(&mut id)
+                .with_context(|| format!("reading state segment id {index} of {n_segments}"))?;
+            let id = String::from_utf8(id.to_vec())
+                .with_context(|| format!("state segment id {index} is not UTF-8"))?;
+            if !valid_segment_id(&id) {
+                bail!("invalid segment id {id:?} in the state file");
+            }
+            let start = crate::slot_file::read_u64(r)
+                .with_context(|| format!("reading state segment {index} start"))?;
+            let end = crate::slot_file::read_u64(r)
+                .with_context(|| format!("reading state segment {index} end"))?;
+            let start = usize::try_from(start).context("state segment start does not fit usize")?;
+            let end = usize::try_from(end).context("state segment end does not fit usize")?;
+            segments.push(SegmentRef { id, start, end });
+        }
+    }
+
     let mut tokens = Vec::with_capacity(n_tokens);
     for index in 0..n_tokens {
         tokens.push(
@@ -1370,20 +1667,30 @@ fn read_state_preamble<R: Read>(r: &mut R) -> Result<(StateHeader, Vec<u32>, u64
         );
     }
     let payload_len = crate::slot_file::read_u64(r).context("reading the state payload length")?;
-    Ok((
-        StateHeader { fingerprint, owner, rope_offset, n_tokens },
-        tokens,
-        payload_len,
-    ))
+    let header = StateHeader { fingerprint, owner, rope_offset, n_tokens };
+    if version >= 2 {
+        validate_segment_chain(fingerprint, &segments, &tokens)
+            .context("validating the segment chain in the state file")?;
+    }
+    Ok((version, header, segments, tokens, payload_len))
 }
 
 /// Validate the file length against the header and return the expected total size.
-fn state_expected_len(n_tokens: usize, payload_len: u64) -> Result<u64> {
+fn state_expected_len(
+    version: u32,
+    n_tokens: usize,
+    n_segments: usize,
+    payload_len: u64,
+) -> Result<u64> {
     let tokens = (n_tokens as u64)
         .checked_mul(4)
         .context("state file token list length overflow")?;
-    STATE_HEADER_LEN
-        .checked_add(tokens)
+    let refs = (n_segments as u64)
+        .checked_mul(STATE_SEGMENT_REF_LEN)
+        .context("state segment ref list length overflow")?;
+    let base = if version >= 2 { STATE_HEADER_LEN } else { STATE_V1_HEADER_LEN };
+    base.checked_add(refs)
+        .and_then(|n| n.checked_add(tokens))
         .and_then(|n| n.checked_add(8))
         .and_then(|n| n.checked_add(payload_len))
         .context("state file length overflow")
@@ -1391,20 +1698,26 @@ fn state_expected_len(n_tokens: usize, payload_len: u64) -> Result<u64> {
 
 /// Read and validate a `STRSTATE` header plus token list, without reading the recurrent payload.
 pub(crate) fn read_state_tokens(path: &Path) -> Result<Vec<u32>> {
-    Ok(read_state_header(path)?.1)
+    Ok(read_state_manifest(path)?.2)
 }
 
 /// Read and validate a `STRSTATE` header plus token list. This is the startup/lookup path: it never reads the
 /// (potentially tens of MB) recurrent payload.
 pub(crate) fn read_state_header(path: &Path) -> Result<(StateHeader, Vec<u32>)> {
+    let (header, _, tokens) = read_state_manifest(path)?;
+    Ok((header, tokens))
+}
+
+/// Read and validate a `STRSTATE` header, its ordered segment refs and its token list.
+pub(crate) fn read_state_manifest(path: &Path) -> Result<(StateHeader, Vec<SegmentRef>, Vec<u32>)> {
     let f = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let meta = f.metadata().with_context(|| format!("stat {}", path.display()))?;
     ensure_regular(&meta, path)?;
-    let (header, tokens, payload_len) = {
+    let (version, header, segments, tokens, payload_len) = {
         let mut r = BufReader::new(f);
         read_state_preamble(&mut r).with_context(|| format!("reading {}", path.display()))?
     };
-    let expected = state_expected_len(header.n_tokens, payload_len)?;
+    let expected = state_expected_len(version, header.n_tokens, segments.len(), payload_len)?;
     if meta.len() != expected {
         bail!(
             "state file {} is {} bytes, the header describes {expected}",
@@ -1412,18 +1725,18 @@ pub(crate) fn read_state_header(path: &Path) -> Result<(StateHeader, Vec<u32>)> 
             meta.len()
         );
     }
-    Ok((header, tokens))
+    Ok((header, segments, tokens))
 }
 
 /// Read and validate a whole `STRSTATE` file.
-pub(crate) fn read_state_file(path: &Path) -> Result<(StateHeader, Vec<u32>, Vec<u8>)> {
+pub(crate) fn read_state_file(path: &Path) -> Result<(StateHeader, Vec<SegmentRef>, Vec<u32>, Vec<u8>)> {
     let f = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let meta = f.metadata().with_context(|| format!("stat {}", path.display()))?;
     ensure_regular(&meta, path)?;
     let mut r = BufReader::new(f);
-    let (header, tokens, payload_len) = read_state_preamble(&mut r)
+    let (version, header, segments, tokens, payload_len) = read_state_preamble(&mut r)
         .with_context(|| format!("reading {}", path.display()))?;
-    let expected = state_expected_len(header.n_tokens, payload_len)?;
+    let expected = state_expected_len(version, header.n_tokens, segments.len(), payload_len)?;
     if meta.len() != expected {
         bail!(
             "state file {} is {} bytes, the header describes {expected}",
@@ -1435,7 +1748,7 @@ pub(crate) fn read_state_file(path: &Path) -> Result<(StateHeader, Vec<u32>, Vec
     let mut payload = vec![0u8; payload_len];
     r.read_exact(&mut payload)
         .with_context(|| format!("reading the state payload of {}", path.display()))?;
-    Ok((header, tokens, payload))
+    Ok((header, segments, tokens, payload))
 }
 
 fn ensure_regular(meta: &fs::Metadata, path: &Path) -> Result<()> {
@@ -1451,10 +1764,11 @@ fn state_path(dir: &Path, id: &str) -> Result<PathBuf> {
     Ok(dir.join(shard).join(format!("{id}.state")))
 }
 
-/// Write a `STRSTATE` file via a temp file + fsync + rename (0600), returning its length.
+/// Write a `STRSTATE` v2 file via a temp file + fsync + rename (0600), returning its length.
 fn write_state_file_atomic(
     path: &Path,
     header: &StateHeader,
+    segments: &[SegmentRef],
     tokens: &[u32],
     payload: &[u8],
 ) -> Result<u64> {
@@ -1468,7 +1782,10 @@ fn write_state_file_atomic(
             tokens.len()
         );
     }
+    validate_segment_chain(header.fingerprint, segments, tokens)
+        .context("refusing to write an inconsistent segment chain")?;
     let n_tokens = u32::try_from(tokens.len()).context("state token count does not fit in u32")?;
+    let n_segments = u32::try_from(segments.len()).context("segment count does not fit in u32")?;
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     ensure_dir(dir)?;
     let (tmp, mut file) = create_temp(dir, "state")?;
@@ -1481,6 +1798,16 @@ fn write_state_file_atomic(
         file.write_all(&header.rope_offset.to_le_bytes())
             .context("writing the state rope offset")?;
         crate::slot_file::write_u32(&mut file, n_tokens)?;
+        crate::slot_file::write_u32(&mut file, n_segments)?;
+        for segment in segments {
+            if segment.id.len() != 16 {
+                bail!("segment id {:?} is not 16 bytes", segment.id);
+            }
+            file.write_all(segment.id.as_bytes())
+                .context("writing the state segment id")?;
+            crate::slot_file::write_u64(&mut file, segment.start as u64)?;
+            crate::slot_file::write_u64(&mut file, segment.end as u64)?;
+        }
         for &token in tokens {
             crate::slot_file::write_u32(&mut file, token)?;
         }
@@ -1505,6 +1832,7 @@ fn write_state_file_atomic(
     fsync_dir(dir);
     Ok(bytes)
 }
+
 
 /// Create a uniquely named 0600 temp file in `dir`, returning its path and handle.
 fn create_temp(dir: &Path, tag: &str) -> Result<(PathBuf, fs::File)> {
@@ -1574,6 +1902,45 @@ fn segments_cover(segments: &[SegmentRef], n_tokens: usize) -> bool {
     next == n_tokens
 }
 
+/// Prove that the ordered refs are exactly the content-addressed chain for `tokens`: every id is the 16-hex
+/// segment id of `(fingerprint, previous id, tokens[start..end])`. This is what makes a ref list reconstructible
+/// from a state file without inventing segments.
+fn validate_segment_chain(fingerprint: u64, segments: &[SegmentRef], tokens: &[u32]) -> Result<()> {
+    if !segments_cover(segments, tokens.len()) {
+        bail!("segment ranges are not a contiguous cover of the history");
+    }
+    let mut parent: Option<String> = None;
+    for segment in segments {
+        if !valid_segment_id(&segment.id) {
+            bail!("invalid segment id {:?}", segment.id);
+        }
+        let expected = slot_segments::segment_id(
+            fingerprint,
+            parent.as_deref(),
+            &tokens[segment.start..segment.end],
+        );
+        if expected != segment.id {
+            bail!(
+                "segment {} at [{}, {}) is not the content-addressed chain id {expected}",
+                segment.id,
+                segment.start,
+                segment.end
+            );
+        }
+        parent = Some(segment.id.clone());
+    }
+    Ok(())
+}
+
+/// A segment id is 16 lowercase hex characters (the same rule as [`slot_segments`]).
+fn valid_segment_id(id: &str) -> bool {
+    id.len() == 16
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+
 /// Stable 64-bit FNV-1a hash of a token history.
 ///
 /// The algorithm is FNV-1a with the 64-bit offset basis `0xcbf29ce484222325` and prime
@@ -1612,7 +1979,7 @@ struct ManifestFile {
     entries: Vec<ManifestEntry>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct ManifestEntry {
     id: String,
     file: String,
@@ -1640,6 +2007,33 @@ fn parse_hex(value: &str, field: &str) -> Result<u64> {
         .with_context(|| format!("invalid {field} {value:?} in the archive manifest"))
 }
 
+/// Convert one JSON manifest row into an in-memory entry, rejecting unsafe paths.
+fn archive_entry_from_manifest(dir: &Path, row: ManifestEntry) -> Result<ArchiveEntry> {
+    let file = entry_path(dir, &row.file)?;
+    let state_file = row
+        .state_file
+        .as_deref()
+        .map(|state| entry_path(dir, state))
+        .transpose()?;
+    Ok(ArchiveEntry {
+        id: row.id,
+        file,
+        state_file,
+        segments: row.segments,
+        bytes: row.bytes,
+        n_tokens: row.n_tokens,
+        owner: row.owner,
+        fingerprint: parse_hex(&row.fingerprint, "fingerprint")?,
+        prefix_hash: parse_hex(&row.prefix_hash, "prefix_hash")?,
+        created_ms: row.created_ms,
+        last_used_ms: row.last_used_ms,
+        parent: row.parent,
+        pinned: row.pinned,
+        reason: row.reason,
+        format: row.format,
+    })
+}
+
 /// Parse `manifest.json`. Any error (missing file, bad JSON, bad version, unsafe path) is handled by
 /// [`Archive::open`] as a corrupt manifest: it is moved aside and the index is rebuilt from the shards.
 fn load_manifest(dir: &Path) -> Result<BTreeMap<String, ArchiveEntry>> {
@@ -1656,33 +2050,135 @@ fn load_manifest(dir: &Path) -> Result<BTreeMap<String, ArchiveEntry>> {
 
     let mut entries = BTreeMap::new();
     for row in manifest.entries {
-        let file = entry_path(dir, &row.file)?;
-        let state_file = row
-            .state_file
-            .as_deref()
-            .map(|state| entry_path(dir, state))
-            .transpose()?;
-        let entry = ArchiveEntry {
-            id: row.id,
-            file,
-            state_file,
-            segments: row.segments,
-            bytes: row.bytes,
-            n_tokens: row.n_tokens,
-            owner: row.owner,
-            fingerprint: parse_hex(&row.fingerprint, "fingerprint")?,
-            prefix_hash: parse_hex(&row.prefix_hash, "prefix_hash")?,
-            created_ms: row.created_ms,
-            last_used_ms: row.last_used_ms,
-            parent: row.parent,
-            pinned: row.pinned,
-            reason: row.reason,
-            format: row.format,
-        };
+        let entry = archive_entry_from_manifest(dir, row)?;
         entries.insert(entry.id.clone(), entry);
     }
     Ok(entries)
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// Manifest journal
+// ---------------------------------------------------------------------------------------------------------
+//
+// `manifest.log` is newline-delimited JSON, one record per mutation since the last compaction. Records are
+// `add` (a full manifest row, so an entry written just before a crash is replayable), `delete`, `pin` and a
+// batched `touch` list. A record is appended together with its trailing newline and fsynced; a crash can leave
+// at most a partial final line, which is ignored. A complete but malformed line is treated as corruption: the
+// valid prefix is applied and the journal is compacted.
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "op", rename_all = "lowercase")]
+enum JournalOp {
+    Add { v: u32, entry: ManifestEntry },
+    Delete { v: u32, id: String },
+    Pin { v: u32, id: String, pinned: bool },
+    Touch { v: u32, touches: Vec<TouchRow> },
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct TouchRow {
+    id: String,
+    last_used_ms: u64,
+}
+
+/// Read `manifest.log`, returning the complete records, whether a truncated/corrupt tail was found, the byte
+/// length and the number of complete records. A missing journal is empty.
+fn load_journal(dir: &Path) -> (Vec<JournalOp>, bool, u64, usize) {
+    let path = dir.join(JOURNAL);
+    let data = match fs::read(&path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), false, 0, 0),
+        Err(err) => {
+            crate::say!("slot archive: cannot read the journal {}: {err:#}", path.display());
+            return (Vec::new(), true, 0, 0);
+        }
+    };
+    let bytes = data.len() as u64;
+    let mut records = Vec::new();
+    let mut repaired = false;
+    for line in data.split_inclusive(|byte| *byte == b'\n') {
+        // Only newline-terminated lines are complete. The final fragment after a crash is ignored.
+        if !line.ends_with(b"\n") {
+            repaired = true;
+            break;
+        }
+        match serde_json::from_slice::<JournalOp>(line) {
+            Ok(op) => {
+                let version = match &op {
+                    JournalOp::Add { v, .. }
+                    | JournalOp::Delete { v, .. }
+                    | JournalOp::Pin { v, .. }
+                    | JournalOp::Touch { v, .. } => *v,
+                };
+                if version != JOURNAL_VERSION {
+                    crate::say!(
+                        "slot archive: journal record version {version}, expected {JOURNAL_VERSION}; ignoring the rest"
+                    );
+                    repaired = true;
+                    break;
+                }
+                records.push(op);
+            }
+            Err(err) => {
+                crate::say!("slot archive: corrupt journal record in {}: {err}", path.display());
+                repaired = true;
+                break;
+            }
+        }
+    }
+    (records, repaired, bytes, data.iter().filter(|byte| **byte == b'\n').count())
+}
+
+/// Apply one journal record over a loaded snapshot.
+fn apply_journal(dir: &Path, entries: &mut BTreeMap<String, ArchiveEntry>, op: JournalOp) -> Result<()> {
+    match op {
+        JournalOp::Add { entry, .. } => {
+            let mut entry = archive_entry_from_manifest(dir, entry)?;
+            if let Some(existing) = entries.get(&entry.id) {
+                // A touch may have been compacted into the snapshot but not journaled (touches are batched);
+                // never move the LRU clock backwards on replay.
+                entry.last_used_ms = entry.last_used_ms.max(existing.last_used_ms);
+            }
+            entries.insert(entry.id.clone(), entry);
+        }
+        JournalOp::Delete { id, .. } => {
+            entries.remove(&id);
+        }
+        JournalOp::Pin { id, pinned, .. } => {
+            if let Some(entry) = entries.get_mut(&id) {
+                entry.pinned = pinned;
+            }
+        }
+        JournalOp::Touch { touches, .. } => {
+            for touch in touches {
+                if let Some(entry) = entries.get_mut(&touch.id) {
+                    // A replayed touch may be older than the compacted snapshot after a crash between the
+                    // snapshot rename and the journal truncate; never move the LRU clock backwards.
+                    entry.last_used_ms = entry.last_used_ms.max(touch.last_used_ms);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Discard a journal that cannot be replayed (its base snapshot is gone or corrupt), preserving it for
+/// diagnostics under a `.bad.<ts>` name so it is never replayed again.
+fn discard_journal(dir: &Path, reason: &str) {
+    let path = dir.join(JOURNAL);
+    if !path.exists() {
+        return;
+    }
+    let bad = dir.join(format!("{JOURNAL}.bad.{}", now_ms()));
+    match fs::rename(&path, &bad) {
+        Ok(()) => crate::say!("slot archive: {reason}; moved the journal to {}", bad.display()),
+        Err(err) => {
+            crate::say!("slot archive: {reason}; removing the unreadable journal: {err:#}");
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
 
 /// Stat the file(s) and compare the on-disk header with the manifest row. Format 1 is a `STRATASLOT` file; format 2
 /// is a `STRSTATE` file plus a contiguous segment chain. An unsupported format is invalid, never silently accepted.
@@ -1720,7 +2216,7 @@ fn validate_entry(entry: &ArchiveEntry, segments: &SegmentStore) -> Result<()> {
                 .state_file
                 .as_deref()
                 .context("segmented entry has no state file")?;
-            let (header, tokens) = read_state_header(path)?;
+            let (header, state_segments, tokens) = read_state_manifest(path)?;
             if header.fingerprint != entry.fingerprint {
                 bail!(
                     "state file fingerprint {:016x} does not match the manifest {:016x}",
@@ -1742,9 +2238,13 @@ fn validate_entry(entry: &ArchiveEntry, segments: &SegmentStore) -> Result<()> {
                     entry.n_tokens
                 );
             }
+            if !state_segments.is_empty() && state_segments != entry.segments {
+                bail!("state file segment refs do not match the manifest row");
+            }
             if !segments_cover(&entry.segments, entry.n_tokens) {
                 bail!("segment ranges are not a contiguous cover of the history");
             }
+            validate_segment_chain(entry.fingerprint, &entry.segments, &tokens)?;
             for segment in &entry.segments {
                 let row = segments
                     .segment(&segment.id)
@@ -1769,15 +2269,24 @@ fn validate_entry(entry: &ArchiveEntry, segments: &SegmentStore) -> Result<()> {
     Ok(())
 }
 
-/// Scan `<dir>/*/*.slot`, adopt every valid file as a recovered entry, and return them keyed by id.
-fn rebuild_manifest(dir: &Path) -> Result<BTreeMap<String, ArchiveEntry>> {
-    let mut entries = BTreeMap::new();
+/// Rebuild the entry index after `manifest.json` loss from the surviving files:
+/// * v1 `*.slot` files are adopted with their header/token list;
+/// * v2 `*.state` files carry the ordered segment refs, so their entries can be reconstructed. Every ref is
+///   validated against the token list (content-addressed chain) and against the segment store; invalid data is
+///   dropped, never invented.
+///
+/// Segment bytes are charged to the first (by id) entry that references them, so the reconstructed logical total
+/// counts each segment once. Pin/lineage state is not recoverable from the files and defaults to unpinned/no
+/// parent, as with the v1 rebuild.
+fn rebuild_manifest(dir: &Path, segments: &SegmentStore) -> Result<BTreeMap<String, ArchiveEntry>> {
+    let mut candidates: Vec<ArchiveEntry> = Vec::new();
     let root = fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?;
     for shard in root.flatten() {
         let shard_path = shard.path();
         if !shard.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
+        let shard_name = shard.file_name().to_string_lossy().into_owned();
         let files = match fs::read_dir(&shard_path) {
             Ok(files) => files,
             Err(err) => {
@@ -1788,7 +2297,7 @@ fn rebuild_manifest(dir: &Path) -> Result<BTreeMap<String, ArchiveEntry>> {
         for file in files.flatten() {
             let path = file.path();
             let name = file.file_name().to_string_lossy().into_owned();
-            if !name.ends_with(".slot") || !file.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            if !file.file_type().map(|t| t.is_file()).unwrap_or(false) {
                 continue;
             }
             let meta = match fs::metadata(&path) {
@@ -1798,22 +2307,18 @@ fn rebuild_manifest(dir: &Path) -> Result<BTreeMap<String, ArchiveEntry>> {
                     continue;
                 }
             };
-            let (header, tokens) = match read_slot(&path) {
-                Ok(parsed) => parsed,
-                Err(err) => {
-                    crate::say!("slot archive: cannot recover {}: {err:#}", path.display());
-                    continue;
-                }
-            };
-            let id = id_for(header.fingerprint, header.owner, tokens.len(), prefix_hash(&tokens));
-            if entries.contains_key(&id) {
-                crate::say!("slot archive: duplicate entry {id} at {}; keeping the first", path.display());
-                continue;
-            }
             let used = mtime_ms(&meta);
-            entries.insert(
-                id.clone(),
-                ArchiveEntry {
+
+            if name.ends_with(".slot") {
+                let (header, tokens) = match read_slot(&path) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        crate::say!("slot archive: cannot recover {}: {err:#}", path.display());
+                        continue;
+                    }
+                };
+                let id = id_for(header.fingerprint, header.owner, tokens.len(), prefix_hash(&tokens));
+                candidates.push(ArchiveEntry {
                     id,
                     file: path,
                     state_file: None,
@@ -1829,9 +2334,90 @@ fn rebuild_manifest(dir: &Path) -> Result<BTreeMap<String, ArchiveEntry>> {
                     pinned: false,
                     reason: "recovered".to_string(),
                     format: crate::slot_file::VERSION,
-                },
-            );
+                });
+                continue;
+            }
+
+            let Some(id) = name.strip_suffix(".state") else { continue };
+            let id = id.to_string();
+            if id.len() < 2 || &id[..2] != shard_name {
+                crate::say!(
+                    "slot archive: ignoring state file {} in the wrong shard",
+                    path.display()
+                );
+                continue;
+            }
+            let (header, state_segments, tokens) = match read_state_manifest(&path) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    crate::say!("slot archive: cannot recover {}: {err:#}", path.display());
+                    continue;
+                }
+            };
+            if state_segments.is_empty() {
+                // A legacy v1 `STRSTATE` file has no refs and the manifest that held them is gone. Reconstructing
+                // it would invent segment references, so it is left on disk and reported instead.
+                crate::say!(
+                    "slot archive: {} is a v1 state file without segment refs and cannot be rebuilt",
+                    path.display()
+                );
+                continue;
+            }
+            let expected = id_for(header.fingerprint, header.owner, tokens.len(), prefix_hash(&tokens));
+            if id != expected {
+                crate::say!(
+                    "slot archive: state file {} names entry {id}, content says {expected}; skipping",
+                    path.display()
+                );
+                continue;
+            }
+            let entry = ArchiveEntry {
+                id,
+                file: path.clone(),
+                state_file: Some(path.clone()),
+                segments: state_segments,
+                bytes: meta.len(),
+                n_tokens: tokens.len(),
+                owner: header.owner,
+                fingerprint: header.fingerprint,
+                prefix_hash: prefix_hash(&tokens),
+                created_ms: used,
+                last_used_ms: used,
+                parent: None,
+                pinned: false,
+                reason: "recovered".to_string(),
+                format: 2,
+            };
+            if let Err(err) = validate_entry(&entry, segments) {
+                crate::say!("slot archive: dropping rebuilt v2 entry {}: {err:#}", entry.id);
+                continue;
+            }
+            candidates.push(entry);
         }
+    }
+
+    // Deterministic order; a v2 row wins over a v1 row with the same content id (it is the richer format).
+    candidates.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| b.format.cmp(&a.format)));
+    let mut claimed: BTreeSet<String> = BTreeSet::new();
+    let mut entries: BTreeMap<String, ArchiveEntry> = BTreeMap::new();
+    for mut entry in candidates {
+        if entries.contains_key(&entry.id) {
+            crate::say!(
+                "slot archive: duplicate recovered entry {}; keeping the first",
+                entry.id
+            );
+            continue;
+        }
+        if entry.format == 2 {
+            for segment in &entry.segments {
+                if claimed.insert(segment.id.clone()) {
+                    if let Some(row) = segments.segment(&segment.id) {
+                        entry.bytes = entry.bytes.saturating_add(row.bytes);
+                    }
+                }
+            }
+        }
+        entries.insert(entry.id.clone(), entry);
     }
     Ok(entries)
 }
@@ -2964,6 +3550,7 @@ mod tests {
         let state_bytes = write_state_file_atomic(
             &path,
             &StateHeader { fingerprint: FP, owner, rope_offset: 0, n_tokens: tokens.len() },
+            &refs,
             tokens,
             b"test-recurrent-payload",
         )
@@ -2987,8 +3574,21 @@ mod tests {
             format: 2,
         };
         archive.entries.insert(id, entry.clone());
-        archive.persist().unwrap();
+        archive.compact().unwrap();
         entry
+    }
+
+    /// A synthetic valid 4-token segment chain for state-file tests (no segment files needed).
+    fn state_refs(tokens: &[u32]) -> Vec<SegmentRef> {
+        let mut refs = Vec::new();
+        let mut parent: Option<String> = None;
+        for (index, chunk) in tokens.chunks(4).enumerate() {
+            let start = index * 4;
+            let id = slot_segments::segment_id(FP, parent.as_deref(), chunk);
+            refs.push(SegmentRef { id: id.clone(), start, end: start + chunk.len() });
+            parent = Some(id);
+        }
+        refs
     }
 
     #[test]
@@ -2999,17 +3599,19 @@ mod tests {
         let tokens: Vec<u32> = (1..=17).collect();
         let payload = b"opaque recurrent payload".to_vec();
         let header = StateHeader { fingerprint: FP, owner: 0x1234, rope_offset: -7, n_tokens: tokens.len() };
-        let bytes = write_state_file_atomic(&path, &header, &tokens, &payload).unwrap();
+        let refs = state_refs(&tokens);
+        let bytes = write_state_file_atomic(&path, &header, &refs, &tokens, &payload).unwrap();
         assert_eq!(bytes, fs::metadata(&path).unwrap().len());
         assert_eq!(read_state_tokens(&path).unwrap(), tokens);
-        let (got, got_tokens, got_payload) = read_state_file(&path).unwrap();
+        let (got, got_refs, got_tokens, got_payload) = read_state_file(&path).unwrap();
         assert_eq!(got, header);
+        assert_eq!(got_refs, refs);
         assert_eq!(got_tokens, tokens);
         assert_eq!(got_payload, payload);
 
         // A wrong token count in the header is refused before anything is written.
         let bad = StateHeader { n_tokens: tokens.len() + 1, ..header };
-        assert!(write_state_file_atomic(&dir.join("bad.state"), &bad, &tokens, &payload).is_err());
+        assert!(write_state_file_atomic(&dir.join("bad.state"), &bad, &refs, &tokens, &payload).is_err());
         assert!(!dir.join("bad.state").exists());
 
         let raw = fs::read(&path).unwrap();
@@ -3023,7 +3625,7 @@ mod tests {
         let path = dir.join("entry.state");
         let tokens: Vec<u32> = (1..=9).collect();
         let header = StateHeader { fingerprint: FP, owner: 1, rope_offset: 0, n_tokens: tokens.len() };
-        write_state_file_atomic(&path, &header, &tokens, b"payload").unwrap();
+        write_state_file_atomic(&path, &header, &state_refs(&tokens), &tokens, b"payload").unwrap();
         let good = fs::read(&path).unwrap();
 
         let mut bad = good.clone();
@@ -3272,5 +3874,279 @@ mod tests {
         broken[1].start += 1;
         assert!(!segments_cover(&broken, entry.n_tokens));
         assert!(segments_cover(&entry.segments, entry.n_tokens));
+    }
+
+    /// Write a legacy v1 `STRSTATE` file (no segment refs) for compatibility tests.
+    fn write_state_v1(path: &Path, header: &StateHeader, tokens: &[u32], payload: &[u8]) -> u64 {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let mut file = fs::File::create(path).unwrap();
+        file.write_all(&STATE_MAGIC).unwrap();
+        crate::slot_file::write_u32(&mut file, 1).unwrap();
+        crate::slot_file::write_u64(&mut file, header.fingerprint).unwrap();
+        crate::slot_file::write_u64(&mut file, header.owner).unwrap();
+        file.write_all(&header.rope_offset.to_le_bytes()).unwrap();
+        crate::slot_file::write_u32(&mut file, tokens.len() as u32).unwrap();
+        for &token in tokens {
+            crate::slot_file::write_u32(&mut file, token).unwrap();
+        }
+        crate::slot_file::write_u64(&mut file, payload.len() as u64).unwrap();
+        file.write_all(payload).unwrap();
+        file.sync_all().unwrap();
+        fs::metadata(path).unwrap().len()
+    }
+
+    /// Build a v1 entry on disk without adding it to the manifest (for journal `add` tests).
+    fn orphan_v1_entry(dir: &Path, owner: u64, tokens: &[u32], reason: &str) -> ArchiveEntry {
+        let id = entry_id(FP, owner, tokens);
+        let path = dir.join(&id[..2]).join(format!("{id}.slot"));
+        let bytes = write_slot(&path, owner, FP, tokens);
+        let now = now_ms();
+        ArchiveEntry {
+            id,
+            file: path,
+            state_file: None,
+            segments: Vec::new(),
+            bytes,
+            n_tokens: tokens.len(),
+            owner,
+            fingerprint: FP,
+            prefix_hash: prefix_hash(tokens),
+            created_ms: now,
+            last_used_ms: now,
+            parent: None,
+            pinned: false,
+            reason: reason.to_string(),
+            format: 1,
+        }
+    }
+
+    #[test]
+    fn journal_replays_add_touch_pin_and_delete() {
+        let tmp = TempDir::new("journal-replay");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let a = save(&mut archive, 1, &(1..=6).collect::<Vec<_>>());
+        let b = save(&mut archive, 1, &(20..=26).collect::<Vec<_>>());
+        let c = save(&mut archive, 1, &(40..=46).collect::<Vec<_>>());
+        assert_eq!(archive.stats().entries, 3);
+
+        let added = orphan_v1_entry(dir, 9, &(80..=86).collect::<Vec<_>>(), "journal-add");
+        archive
+            .append_journal(&JournalOp::Add {
+                v: JOURNAL_VERSION,
+                entry: archive.manifest_row(&added),
+            })
+            .unwrap();
+        archive
+            .append_journal(&JournalOp::Touch {
+                v: JOURNAL_VERSION,
+                touches: vec![TouchRow { id: a.id.clone(), last_used_ms: a.last_used_ms + 10_000 }],
+            })
+            .unwrap();
+        archive
+            .append_journal(&JournalOp::Pin { v: JOURNAL_VERSION, id: b.id.clone(), pinned: true })
+            .unwrap();
+        archive
+            .append_journal(&JournalOp::Delete { v: JOURNAL_VERSION, id: c.id.clone() })
+            .unwrap();
+        assert!(dir.join(JOURNAL).exists());
+        // The compacted snapshot is unchanged until a compaction; the journal is the delta.
+        assert_eq!(manifest_json(dir)["entries"].as_array().unwrap().len(), 3);
+        drop(archive);
+
+        let archive = Archive::open(config(dir)).unwrap();
+        let entries = archive.list(None, 0);
+        assert_eq!(entries.len(), 3, "{entries:?}");
+        assert!(entries.iter().any(|e| e.id == added.id));
+        assert!(!entries.iter().any(|e| e.id == c.id));
+        assert!(entries.iter().find(|e| e.id == b.id).unwrap().pinned);
+        assert!(
+            entries.iter().find(|e| e.id == a.id).unwrap().last_used_ms >= a.last_used_ms + 10_000
+        );
+    }
+
+    #[test]
+    fn truncated_journal_tail_is_ignored_and_compacted() {
+        let tmp = TempDir::new("journal-truncated");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let a = save(&mut archive, 1, &(1..=6).collect::<Vec<_>>());
+        let b = save(&mut archive, 1, &(20..=26).collect::<Vec<_>>());
+        let touched = a.last_used_ms + 20_000;
+        archive
+            .append_journal(&JournalOp::Touch {
+                v: JOURNAL_VERSION,
+                touches: vec![TouchRow { id: a.id.clone(), last_used_ms: touched }],
+            })
+            .unwrap();
+        drop(archive);
+
+        // A crash in the middle of the last record leaves no trailing newline. It must not be applied.
+        let mut file = fs::OpenOptions::new().append(true).open(dir.join(JOURNAL)).unwrap();
+        file.write_all(br#"{"op":"touch","v":1,"touches":[{"id":"#).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let archive = Archive::open(config(dir)).unwrap();
+        let entries = archive.list(None, 0);
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|e| e.id == b.id));
+        assert!(entries.iter().find(|e| e.id == a.id).unwrap().last_used_ms >= touched);
+        // A repaired journal is folded into the snapshot and truncated.
+        assert_eq!(fs::metadata(dir.join(JOURNAL)).unwrap().len(), 0);
+        assert_eq!(manifest_json(dir)["entries"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn batched_touches_do_not_rewrite_the_snapshot_until_flush() {
+        let tmp = TempDir::new("touch-batch");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let a = save(&mut archive, 1, &(1..=6).collect::<Vec<_>>());
+        let b = save(&mut archive, 1, &(20..=26).collect::<Vec<_>>());
+        let c = save(&mut archive, 1, &(40..=46).collect::<Vec<_>>());
+        let before = fs::read(dir.join(MANIFEST)).unwrap();
+
+        std::thread::sleep(Duration::from_millis(3));
+        archive.touch(&a.id);
+        std::thread::sleep(Duration::from_millis(3));
+        archive.touch(&b.id);
+        std::thread::sleep(Duration::from_millis(3));
+        archive.touch(&c.id);
+        // Touches are in memory only: no snapshot rewrite and no journal record yet.
+        assert_eq!(fs::read(dir.join(MANIFEST)).unwrap(), before);
+        assert_eq!(
+            fs::metadata(dir.join(JOURNAL)).map(|m| m.len()).unwrap_or(0),
+            0,
+            "touch must be cheap until a flush is due"
+        );
+        assert_eq!(archive.list(None, 0)[0].id, c.id);
+
+        archive.flush().unwrap();
+        assert_eq!(fs::read(dir.join(MANIFEST)).unwrap(), before, "flush only appends the journal");
+        assert!(fs::metadata(dir.join(JOURNAL)).unwrap().len() > 0);
+        let touched_at = archive.list(None, 0)[0].last_used_ms;
+        drop(archive);
+
+        let archive = Archive::open(config(dir)).unwrap();
+        assert_eq!(archive.list(None, 0)[0].id, c.id);
+        assert!(archive.list(None, 0)[0].last_used_ms >= touched_at);
+    }
+
+    #[test]
+    fn v2_rebuilds_from_state_refs_and_segment_files() {
+        let tmp = TempDir::new("v2-rebuild-state");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let tokens: Vec<u32> = (1..=20).collect();
+        let entry = v2_entry(&mut archive, 3, &tokens, "segmented");
+        let expected_bytes = entry.bytes;
+        drop(archive);
+
+        // Both manifests are lost; the state file carries the refs and the `.seg` files are the data.
+        fs::remove_file(dir.join(MANIFEST)).unwrap();
+        fs::remove_file(dir.join(slot_segments::MANIFEST)).unwrap();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let entries = archive.list(None, 0);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let rebuilt = &entries[0];
+        assert_eq!(rebuilt.id, entry.id);
+        assert_eq!(rebuilt.format, 2);
+        assert_eq!(rebuilt.segments, entry.segments);
+        assert_eq!(rebuilt.n_tokens, tokens.len());
+        assert_eq!(rebuilt.bytes, expected_bytes);
+        assert_eq!(read_entry_tokens(rebuilt).unwrap(), tokens);
+        for segment in &rebuilt.segments {
+            assert_eq!(archive.segments().segment(&segment.id).unwrap().refs, 1);
+        }
+        // The rebuilt index is compacted, and it is usable for lookups.
+        assert_eq!(manifest_json(dir)["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            archive.lookup(3, &tokens, 20, FP, 100).unwrap().unwrap().id,
+            entry.id
+        );
+    }
+
+    #[test]
+    fn v2_rebuild_reconciles_shared_segment_refs() {
+        let tmp = TempDir::new("v2-rebuild-shared");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let tokens: Vec<u32> = (1..=20).collect();
+        let first = v2_entry(&mut archive, 1, &tokens[..12], "segmented");
+        let _second = v2_entry(&mut archive, 1, &tokens[..20], "segmented");
+        let shared = first.segments[0].id.clone();
+        drop(archive);
+
+        fs::remove_file(dir.join(MANIFEST)).unwrap();
+        fs::remove_file(dir.join(slot_segments::MANIFEST)).unwrap();
+        let archive = Archive::open(config(dir)).unwrap();
+        assert_eq!(archive.stats().entries, 2);
+        assert_eq!(archive.segments().segment(&shared).unwrap().refs, 2);
+        assert!(archive.segments().segment(&shared).unwrap().file.exists());
+    }
+
+    #[test]
+    fn v2_rebuild_drops_an_entry_with_a_missing_segment_and_orphans_are_cleaned() {
+        let tmp = TempDir::new("v2-rebuild-invalid");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let entry = v2_entry(&mut archive, 4, &(1..=12).collect::<Vec<_>>(), "segmented");
+        let missing = archive.segments.segment(&entry.segments[1].id).unwrap().file.clone();
+        drop(archive);
+        fs::remove_file(&missing).unwrap();
+        fs::remove_file(dir.join(MANIFEST)).unwrap();
+
+        let archive = Archive::open(config(dir)).unwrap();
+        assert_eq!(archive.stats().entries, 0, "an entry cannot be rebuilt without its segments");
+        assert!(
+            archive.segments().list().is_empty(),
+            "unreferenced segments are removed at startup: {:?}",
+            archive.segments().list()
+        );
+        assert!(manifest_json(dir)["entries"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn segments_without_a_state_file_are_orphans_not_entries() {
+        let tmp = TempDir::new("segments-orphan");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let tokens: Vec<u32> = (1..=6).collect();
+        archive
+            .segments
+            .put(FP, None, &tokens, b"orphan-payload")
+            .unwrap();
+        drop(archive);
+        fs::remove_file(dir.join(MANIFEST)).unwrap();
+
+        let archive = Archive::open(config(dir)).unwrap();
+        assert_eq!(archive.stats().entries, 0);
+        assert!(archive.segments().list().is_empty());
+    }
+
+    #[test]
+    fn v1_state_file_is_readable_but_not_rebuilt_without_refs() {
+        let tmp = TempDir::new("v1-state");
+        let dir = tmp.path();
+        let tokens: Vec<u32> = (1..=9).collect();
+        let header = StateHeader { fingerprint: FP, owner: 7, rope_offset: 0, n_tokens: tokens.len() };
+        let id = id_for(FP, 7, tokens.len(), prefix_hash(&tokens));
+        let path = state_path(dir, &id).unwrap();
+        write_state_v1(&path, &header, &tokens, b"legacy-payload");
+        let (got, refs, got_tokens) = read_state_manifest(&path).unwrap();
+        assert_eq!(got, header);
+        assert!(refs.is_empty());
+        assert_eq!(got_tokens, tokens);
+        let (_, _, full_tokens, payload) = read_state_file(&path).unwrap();
+        assert_eq!(full_tokens, tokens);
+        assert_eq!(payload, b"legacy-payload");
+
+        // With no manifest, a v1 state file has no refs to reconstruct from and is skipped, not invented.
+        let archive = Archive::open(config(dir)).unwrap();
+        assert_eq!(archive.stats().entries, 0);
+        assert!(path.exists(), "the legacy state file is left for the operator");
     }
 }

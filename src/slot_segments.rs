@@ -13,16 +13,19 @@
 //! Layout under [`SegmentStore::open`]'s directory:
 //!
 //! ```text
-//! <dir>/segments.json                  atomic manifest, one row per segment
+//! <dir>/segments.json                  compacted manifest, one row per segment
+//! <dir>/segments.log                   append-only journal since the last compaction
 //! <dir>/segments.json.tmp.<pid>.<n>    write temp, removed at startup
 //! <dir>/segments/<2 hex>/<id>.seg      one `STRATSEG` v1 file per segment
 //! <dir>/segments/<2 hex>/.<id>.*.tmp   write temp, removed at startup
 //! ```
 //!
-//! The manifest is a cache of the directory contents: when it is missing or corrupt it is moved aside and
-//! rebuilt from the `.seg` files. A manifest row whose file is missing or corrupt is dropped (the corrupt file is
-//! removed); orphan segment files are re-adopted with `refs = 1`, because the reference counts live in the
-//! archive entries and cannot be reconstructed from the segment files alone.
+//! `segments.json` is a cache of the directory contents and the base of the journal: when it is missing or
+//! corrupt it is moved aside and rebuilt from the `.seg` files, and the journal is discarded. A journal whose
+//! final record is truncated by a crash is replayed up to the last complete line and then compacted. Reference
+//! changes (`put` dedupe, `unref`) are journaled and fsynced before the in-memory update, so a compacted manifest
+//! plus a truncated journal cannot silently lose a reference count. Orphan segment files are re-adopted with
+//! `refs = 1`, and the archive reconciles the true counts from the surviving entries at startup.
 
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -34,6 +37,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// File name of the segment manifest inside the store directory.
 pub const MANIFEST: &str = "segments.json";
+/// File name of the append-only segment journal, holding mutations since the last compaction.
+pub const JOURNAL: &str = "segments.log";
 /// Subdirectory holding the content-addressed segment files.
 pub const SEGMENTS_DIR: &str = "segments";
 /// Header magic: first 8 bytes of every segment file.
@@ -47,6 +52,10 @@ pub const VERSION: u32 = 1;
 pub const MAX_PAYLOAD_BYTES: usize = 1 << 30;
 /// Largest accepted token count (1M ids, 4 MiB). Real segments are 256-2048 tokens.
 pub const MAX_TOKENS: usize = 1 << 20;
+/// Journal record schema version.
+const JOURNAL_VERSION: u32 = 1;
+/// Compact after this many journal records even when the journal is smaller than the snapshot.
+const JOURNAL_COMPACT_RECORDS: usize = 4096;
 
 /// Fixed header length: magic, version, flags, fingerprint, n_tokens, parent length, payload length.
 const HEADER_LEN: u64 = 40;
@@ -91,12 +100,15 @@ pub struct GcReport {
 pub struct SegmentStore {
     dir: PathBuf,
     segments: BTreeMap<String, Segment>,
+    journal_bytes: u64,
+    journal_records: usize,
+    manifest_bytes: u64,
 }
 
 impl SegmentStore {
-    /// Open (or create) `dir`, load `segments.json`, and rebuild it from `segments/<2 hex>/<id>.seg` when the
-    /// manifest is missing or corrupt. Missing/corrupt rows are dropped, stale temp files are removed, and the
-    /// directory and manifest are created `0700`/`0600` on Unix.
+    /// Open (or create) `dir`, load `segments.json`, replay `segments.log`, and rebuild the manifest from
+    /// `segments/<2 hex>/<id>.seg` when the compacted manifest is missing or corrupt. Missing/corrupt rows are
+    /// dropped, stale temp files are removed, and the directory and manifest are created `0700`/`0600` on Unix.
     pub fn open(dir: PathBuf) -> Result<Self> {
         let dir = if dir.is_absolute() {
             dir
@@ -110,8 +122,18 @@ impl SegmentStore {
         remove_stale_temps(&dir);
 
         let manifest = dir.join(MANIFEST);
-        let (segments, changed) = match load_manifest(&dir) {
-            Ok((segments, changed)) => (segments, changed),
+        let (segments, changed, journal_bytes, journal_records) = match load_manifest(&dir) {
+            Ok((segments, mut changed)) => {
+                let (records, repaired, bytes, count) = load_journal(&dir);
+                let mut segments = segments;
+                for op in records {
+                    if let Err(err) = apply_journal(&dir, &mut segments, op) {
+                        crate::say!("segment store: ignoring a bad journal record: {err:#}");
+                        changed = true;
+                    }
+                }
+                (segments, changed || repaired, bytes, count)
+            }
             Err(err) => {
                 if manifest.exists() {
                     let bad = dir.join(format!("{MANIFEST}.bad.{}", now_ms()));
@@ -127,13 +149,15 @@ impl SegmentStore {
                 } else {
                     crate::say!("segment store: {err:#}; rebuilding the manifest from the segment files");
                 }
-                (rebuild_manifest(&dir)?, true)
+                discard_journal(&dir, "the compacted segment manifest is unusable");
+                (rebuild_manifest(&dir)?, true, 0, 0)
             }
         };
 
-        let store = SegmentStore { dir, segments };
+        let manifest_bytes = fs::metadata(&manifest).map(|meta| meta.len()).unwrap_or(0);
+        let mut store = SegmentStore { dir, segments, journal_bytes, journal_records, manifest_bytes };
         if changed {
-            store.persist()?;
+            store.compact()?;
         }
         Ok(store)
     }
@@ -153,11 +177,21 @@ impl SegmentStore {
         if self.segments.contains_key(&id) {
             match self.get(&id) {
                 Ok(stored) if stored == payload => {
+                    let existing = self.segments.get(&id).expect("checked above").clone();
+                    let refs = existing.refs.saturating_add(1);
+                    let used = now_ms();
+                    let op = SegmentJournalOp::Refs {
+                        v: JOURNAL_VERSION,
+                        id: id.clone(),
+                        refs,
+                        last_used_ms: used,
+                    };
+                    self.append_journal(&op)?;
                     let segment = self.segments.get_mut(&id).expect("checked above");
-                    segment.refs = segment.refs.saturating_add(1);
-                    segment.last_used_ms = now_ms();
+                    segment.refs = refs;
+                    segment.last_used_ms = used;
                     let segment = segment.clone();
-                    self.persist()?;
+                    self.maybe_compact();
                     return Ok(segment);
                 }
                 Ok(_) => bail!(
@@ -212,12 +246,14 @@ impl SegmentStore {
             last_used_ms: now,
         };
         self.segments.insert(id.clone(), segment.clone());
-        if let Err(err) = self.persist() {
+        let op = SegmentJournalOp::Put { v: JOURNAL_VERSION, row: segment_row(&segment) };
+        if let Err(err) = self.append_journal(&op) {
             // Keep memory consistent with the manifest on disk; the file stays as an orphan and is adopted by
             // the next rebuild.
             self.segments.remove(&id);
             return Err(err);
         }
+        self.maybe_compact();
         Ok(segment)
     }
 
@@ -285,10 +321,19 @@ impl SegmentStore {
         ensure!(valid_id(id), "invalid segment id {id:?}");
         let Some(segment) = self.segments.get(id) else { return Ok(()) };
         if segment.refs > 1 {
+            let refs = segment.refs - 1;
+            let used = now_ms();
+            let op = SegmentJournalOp::Refs {
+                v: JOURNAL_VERSION,
+                id: id.to_string(),
+                refs,
+                last_used_ms: used,
+            };
+            self.append_journal(&op)?;
             let segment = self.segments.get_mut(id).expect("checked above");
-            segment.refs -= 1;
-            segment.last_used_ms = now_ms();
-            self.persist()?;
+            segment.refs = refs;
+            segment.last_used_ms = used;
+            self.maybe_compact();
             return Ok(());
         }
 
@@ -305,12 +350,24 @@ impl SegmentStore {
                     "segment store: cannot remove {}: {err:#}; leaving it for GC",
                     file.display()
                 );
-                self.persist()?;
+                let op = SegmentJournalOp::Refs {
+                    v: JOURNAL_VERSION,
+                    id: id.to_string(),
+                    refs: 0,
+                    last_used_ms: now_ms(),
+                };
+                self.append_journal(&op)?;
+                self.maybe_compact();
                 return Ok(());
             }
         }
+        let op = SegmentJournalOp::Remove { v: JOURNAL_VERSION, id: id.to_string() };
+        if let Err(err) = self.append_journal(&op) {
+            // The file is already gone; a stale row is dropped by the next open/GC validation.
+            crate::say!("segment store: journaling the removal of {id}: {err:#}");
+        }
         self.segments.remove(id);
-        self.persist()?;
+        self.maybe_compact();
         Ok(())
     }
 
@@ -348,8 +405,8 @@ impl SegmentStore {
             }
             changed = true;
         }
-        if changed {
-            self.persist()?;
+        if changed || self.journal_records > 0 {
+            self.compact()?;
         }
         Ok(report)
     }
@@ -376,36 +433,95 @@ impl SegmentStore {
                 }
             }
         }
-        if changed {
-            self.persist()?;
+        if changed || self.journal_records > 0 {
+            self.compact()?;
         }
         Ok(())
     }
 
-    fn persist(&self) -> Result<()> {
+    /// Append one journal record and fsync it. A failed write is truncated back to the previous length so the
+    /// journal never contains a malformed record in its middle.
+    fn append_journal(&mut self, op: &SegmentJournalOp) -> Result<()> {
+        ensure_dir(&self.dir)?;
+        let path = self.dir.join(JOURNAL);
+        let mut line = serde_json::to_vec(op).context("serializing the segment journal record")?;
+        line.push(b'\n');
+        let existed = path.exists();
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        let before = file
+            .metadata()
+            .with_context(|| format!("stat {}", path.display()))?
+            .len();
+        let write = (|| -> Result<()> {
+            file.write_all(&line).context("writing the segment journal")?;
+            file.sync_data().context("syncing the segment journal")?;
+            Ok(())
+        })();
+        if let Err(err) = write {
+            let _ = file.set_len(before);
+            return Err(err);
+        }
+        drop(file);
+        if !existed {
+            fsync_dir(&self.dir);
+        }
+        self.journal_bytes = before.saturating_add(line.len() as u64);
+        self.journal_records += 1;
+        Ok(())
+    }
+
+    fn clear_journal(&mut self) {
+        let path = self.dir.join(JOURNAL);
+        match fs::OpenOptions::new().write(true).truncate(true).open(&path) {
+            Ok(file) => {
+                if let Err(err) = file.sync_all() {
+                    crate::say!("segment store: syncing the cleared journal: {err:#}");
+                }
+                fsync_dir(&self.dir);
+                self.journal_bytes = 0;
+                self.journal_records = 0;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                self.journal_bytes = 0;
+                self.journal_records = 0;
+            }
+            Err(err) => {
+                crate::say!("segment store: clearing the journal {}: {err:#}", path.display());
+            }
+        }
+    }
+
+    /// Write the compacted `segments.json` and clear the journal. Also called by the archive when it compacts,
+    /// so a direct reader normally sees both manifests in step.
+    pub(crate) fn compact(&mut self) -> Result<()> {
         ensure_dir(&self.dir)?;
         ensure_dir(&self.dir.join(SEGMENTS_DIR))?;
         let manifest = SegmentsFile {
             version: MANIFEST_VERSION,
-            segments: self
-                .segments
-                .values()
-                .map(|segment| SegmentRow {
-                    id: segment.id.clone(),
-                    bytes: segment.bytes,
-                    n_tokens: segment.n_tokens,
-                    parent: segment.parent.clone(),
-                    refs: segment.refs,
-                    format: segment.format,
-                    created_ms: segment.created_ms,
-                    last_used_ms: segment.last_used_ms,
-                })
-                .collect(),
+            segments: self.segments.values().map(segment_row).collect(),
         };
         let data = serde_json::to_vec(&manifest).context("serializing the segment manifest")?;
-        write_atomic(&self.dir, &data)
+        write_atomic(&self.dir, &data)?;
+        self.manifest_bytes = data.len() as u64;
+        self.clear_journal();
+        Ok(())
+    }
+
+    /// Compact when the journal reaches the size of the snapshot or the record cap. Errors are logged because the
+    /// mutation is already durable in the journal.
+    fn maybe_compact(&mut self) {
+        if self.journal_bytes >= self.manifest_bytes || self.journal_records >= JOURNAL_COMPACT_RECORDS {
+            if let Err(err) = self.compact() {
+                crate::say!("segment store: manifest compaction failed: {err:#}");
+            }
+        }
     }
 }
+
 
 /// The stable segment id: FNV-1a over a domain tag, the fingerprint, the parent id (length-prefixed) and the
 /// token ids (length-prefixed). `start` is implied by the parent chain and `end - start` by the token count, so
@@ -667,7 +783,7 @@ struct SegmentsFile {
     segments: Vec<SegmentRow>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct SegmentRow {
     id: String,
     bytes: u64,
@@ -678,6 +794,131 @@ struct SegmentRow {
     created_ms: u64,
     last_used_ms: u64,
 }
+
+fn segment_row(segment: &Segment) -> SegmentRow {
+    SegmentRow {
+        id: segment.id.clone(),
+        bytes: segment.bytes,
+        n_tokens: segment.n_tokens,
+        parent: segment.parent.clone(),
+        refs: segment.refs,
+        format: segment.format,
+        created_ms: segment.created_ms,
+        last_used_ms: segment.last_used_ms,
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Segment journal
+// ---------------------------------------------------------------------------------------------------------
+//
+// `segments.log` is newline-delimited JSON, one record per mutation since the last `segments.json`
+// compaction. A `put` carries the full row so a crash right after a segment file write is replayable; `refs`
+// updates an existing row; `remove` drops it. Truncated final lines are ignored. The journal never carries the
+// archive's entry refs, but every `refs` record is replayable onto the compacted snapshot, so a compacted
+// manifest + truncated journal cannot lose a reference count (the archive reconciles the counts from surviving
+// entries at startup as the final authority).
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "op", rename_all = "lowercase")]
+enum SegmentJournalOp {
+    Put { v: u32, row: SegmentRow },
+    Refs { v: u32, id: String, refs: u64, last_used_ms: u64 },
+    Remove { v: u32, id: String },
+}
+
+fn load_journal(dir: &Path) -> (Vec<SegmentJournalOp>, bool, u64, usize) {
+    let path = dir.join(JOURNAL);
+    let data = match fs::read(&path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), false, 0, 0),
+        Err(err) => {
+            crate::say!("segment store: cannot read the journal {}: {err:#}", path.display());
+            return (Vec::new(), true, 0, 0);
+        }
+    };
+    let bytes = data.len() as u64;
+    let mut records = Vec::new();
+    let mut repaired = false;
+    for line in data.split_inclusive(|byte| *byte == b'\n') {
+        if !line.ends_with(b"\n") {
+            repaired = true;
+            break;
+        }
+        match serde_json::from_slice::<SegmentJournalOp>(line) {
+            Ok(op) => {
+                let version = match &op {
+                    SegmentJournalOp::Put { v, .. }
+                    | SegmentJournalOp::Refs { v, .. }
+                    | SegmentJournalOp::Remove { v, .. } => *v,
+                };
+                if version != JOURNAL_VERSION {
+                    crate::say!(
+                        "segment store: journal record version {version}, expected {JOURNAL_VERSION}; ignoring the rest"
+                    );
+                    repaired = true;
+                    break;
+                }
+                records.push(op);
+            }
+            Err(err) => {
+                crate::say!("segment store: corrupt journal record in {}: {err}", path.display());
+                repaired = true;
+                break;
+            }
+        }
+    }
+    (records, repaired, bytes, data.iter().filter(|byte| **byte == b'\n').count())
+}
+
+/// Apply one segment journal record. A `put` row is revalidated against its file; a row whose file disappeared
+/// or is corrupt is dropped rather than re-adopted.
+fn apply_journal(
+    dir: &Path,
+    segments: &mut BTreeMap<String, Segment>,
+    op: SegmentJournalOp,
+) -> Result<()> {
+    match op {
+        SegmentJournalOp::Put { row, .. } => match validate_row(dir, &row) {
+            Ok(mut segment) => {
+                if let Some(existing) = segments.get(&segment.id) {
+                    segment.last_used_ms = segment.last_used_ms.max(existing.last_used_ms);
+                }
+                segments.insert(segment.id.clone(), segment);
+            }
+            Err(err) => {
+                crate::say!("segment store: dropping journal segment {}: {err:#}", row.id);
+                return Err(err);
+            }
+        },
+        SegmentJournalOp::Refs { id, refs, last_used_ms, .. } => {
+            if let Some(segment) = segments.get_mut(&id) {
+                segment.refs = refs;
+                segment.last_used_ms = segment.last_used_ms.max(last_used_ms);
+            }
+        }
+        SegmentJournalOp::Remove { id, .. } => {
+            segments.remove(&id);
+        }
+    }
+    Ok(())
+}
+
+fn discard_journal(dir: &Path, reason: &str) {
+    let path = dir.join(JOURNAL);
+    if !path.exists() {
+        return;
+    }
+    let bad = dir.join(format!("{JOURNAL}.bad.{}", now_ms()));
+    match fs::rename(&path, &bad) {
+        Ok(()) => crate::say!("segment store: {reason}; moved the journal to {}", bad.display()),
+        Err(err) => {
+            crate::say!("segment store: {reason}; removing the unreadable journal: {err:#}");
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
 
 /// Parse `segments.json` and validate every row against its file. Returns the rows and whether anything was
 /// dropped or corrected (so [`SegmentStore::open`] can rewrite the manifest).
@@ -1401,6 +1642,7 @@ mod tests {
 
         // A second structural write replaces the manifest atomically and stays parseable.
         store.unref(&segment.id).unwrap();
+        store.compact().unwrap();
         let value: serde_json::Value =
             serde_json::from_slice(&fs::read(dir.join(MANIFEST)).unwrap()).unwrap();
         assert_eq!(value["segments"].as_array().unwrap().len(), 0);
@@ -1426,5 +1668,102 @@ mod tests {
         assert!(check_bounds(1, MAX_PAYLOAD_BYTES + 1).is_err());
         assert!(check_bounds(1, 1).is_ok());
         assert!(store.list().is_empty());
+    }
+
+    #[test]
+    fn journal_replays_refs_and_remove() {
+        let tmp = TempDir::new("journal-replay");
+        let dir = tmp.path();
+        let mut store = open(dir);
+        let segment = store
+            .put(FP, None, &tokens(1, 8), &payload(2, 64))
+            .unwrap();
+        store
+            .append_journal(&SegmentJournalOp::Refs {
+                v: JOURNAL_VERSION,
+                id: segment.id.clone(),
+                refs: 5,
+                last_used_ms: segment.last_used_ms + 1000,
+            })
+            .unwrap();
+        drop(store);
+
+        let mut store = open(dir);
+        assert_eq!(store.segment(&segment.id).unwrap().refs, 5);
+        assert!(store.segment(&segment.id).unwrap().last_used_ms >= segment.last_used_ms + 1000);
+        store
+            .append_journal(&SegmentJournalOp::Remove { v: JOURNAL_VERSION, id: segment.id.clone() })
+            .unwrap();
+        drop(store);
+
+        let store = open(dir);
+        assert!(store.list().is_empty());
+        assert!(!store.contains(&segment.id));
+    }
+
+    #[test]
+    fn truncated_journal_tail_is_ignored_and_compacted() {
+        let tmp = TempDir::new("journal-truncated");
+        let dir = tmp.path();
+        let mut store = open(dir);
+        let segment = store
+            .put(FP, None, &tokens(1, 8), &payload(3, 80))
+            .unwrap();
+        store
+            .append_journal(&SegmentJournalOp::Refs {
+                v: JOURNAL_VERSION,
+                id: segment.id.clone(),
+                refs: 7,
+                last_used_ms: segment.last_used_ms,
+            })
+            .unwrap();
+        drop(store);
+
+        let mut file = fs::OpenOptions::new().append(true).open(dir.join(JOURNAL)).unwrap();
+        file.write_all(br#"{"op":"refs","v":1,"id":"#).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let store = open(dir);
+        assert_eq!(store.segment(&segment.id).unwrap().refs, 7);
+        assert_eq!(fs::metadata(dir.join(JOURNAL)).unwrap().len(), 0);
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join(MANIFEST)).unwrap()).unwrap();
+        assert_eq!(value["segments"][0]["refs"], 7);
+    }
+
+    #[test]
+    fn compacted_manifest_plus_truncated_journal_keeps_refs() {
+        let tmp = TempDir::new("journal-compacted");
+        let dir = tmp.path();
+        let mut store = open(dir);
+        let segment = store
+            .put(FP, None, &tokens(1, 8), &payload(4, 96))
+            .unwrap();
+        store.compact().unwrap();
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join(MANIFEST)).unwrap()).unwrap();
+        assert_eq!(snapshot["segments"][0]["refs"], 1);
+
+        store
+            .append_journal(&SegmentJournalOp::Refs {
+                v: JOURNAL_VERSION,
+                id: segment.id.clone(),
+                refs: 2,
+                last_used_ms: segment.last_used_ms,
+            })
+            .unwrap();
+        drop(store);
+        let mut file = fs::OpenOptions::new().append(true).open(dir.join(JOURNAL)).unwrap();
+        file.write_all(br#"{"op":"put","v":1,"row":{"id":"#).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let store = open(dir);
+        assert_eq!(store.segment(&segment.id).unwrap().refs, 2);
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join(MANIFEST)).unwrap()).unwrap();
+        assert_eq!(value["segments"][0]["refs"], 2);
+        assert_eq!(fs::metadata(dir.join(JOURNAL)).unwrap().len(), 0);
     }
 }
