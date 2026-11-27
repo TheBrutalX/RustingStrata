@@ -1224,3 +1224,50 @@ fn slot_async_io_matches_sync() {
         let _ = std::fs::remove_file(&afile);
     }
 }
+
+/// `save_slot_file_async_as` puts the explicit conversation owner in the header and the saved state, and restores
+/// the caller's request owner on both the hand-off and a failure. The async restore installs the header owner while
+/// leaving the caller's owner alone. (GPU integration test; not part of the CPU-only pass.)
+#[test]
+fn slot_async_save_as_records_explicit_owner() {
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let ids = tok.encode("The capital of France is").unwrap();
+    for (bk, gpu) in common::backends() {
+        eprintln!("backend {bk}");
+        let mut gm = GpuModel::load(&m, gpu, 256, 0, 512 << 20, 0).unwrap();
+        gm.owner = 7;
+        gm.prefill(&ids).unwrap();
+        let path = std::env::temp_dir().join(format!("strata-slot-async-as-{}-{bk}.bin", std::process::id()));
+        let pending = gm.save_slot_file_async_as(0, &path, 0x1234).unwrap();
+        assert_eq!(gm.owner, 7, "{bk}: caller owner after hand-off");
+        assert_eq!(gm.slot_owner(0), 0x1234, "{bk}: saved owner after hand-off");
+        pending.join().unwrap();
+        assert_eq!(gm.owner, 7, "{bk}: caller owner after join");
+        let mut f = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let (h, tokens) = rusting_strata::slot_file::read_header(&mut f).unwrap();
+        assert_eq!(h.owner, 0x1234, "{bk}: async header owner");
+        assert_eq!(h.fingerprint, gm.slot_fingerprint(), "{bk}: async header fingerprint");
+        assert_eq!(tokens, ids, "{bk}: async header tokens");
+
+        // Async restore: the saved owner comes from the header, the request owner is the caller's.
+        gm.owner = 9;
+        gm.reset().unwrap();
+        gm.restore_slot_file_async(0, &path, false).unwrap();
+        assert_eq!(gm.owner, 9, "{bk}: caller owner after async restore");
+        assert_eq!(gm.slot_owner(0), 0x1234, "{bk}: restored saved owner");
+        assert_eq!(gm.slot_tokens(0), &ids[..], "{bk}: restored history");
+
+        // A failed save (empty history) restores the caller's owner and leaves the committed file alone.
+        gm.reset().unwrap();
+        assert!(gm.save_slot_file_async_as(0, &path, 0x5678).is_err(), "{bk}: empty slot saved");
+        assert_eq!(gm.owner, 9, "{bk}: caller owner after failed async save");
+        let mut f = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let (h, _) = rusting_strata::slot_file::read_header(&mut f).unwrap();
+        assert_eq!(h.owner, 0x1234, "{bk}: failed save replaced the previous file");
+        let _ = std::fs::remove_file(&path);
+    }
+}
