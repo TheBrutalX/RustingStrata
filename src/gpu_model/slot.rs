@@ -588,24 +588,8 @@ impl GpuModel<'_> {
         ensure!(!tokens.is_empty(), "slot file has no tokens");
         ensure!(tokens.len() <= self.ctx, "slot file has {} tokens, --ctx is {}", tokens.len(), self.ctx);
         ensure!(header.n_parts as usize == self.parts().count(), "slot file has {} parts, this model has {}", header.n_parts, self.parts().count());
-        self.use_slot(slot);
         let n = tokens.len();
-        let cap = self.kv_cap.get(slot).copied().unwrap_or(self.ctx);
-        if self.kv_budget > 0 && n > cap {
-            let max = self.kv_budget.saturating_sub(self.kv_cap.len().saturating_sub(1));
-            ensure!(n <= max, "restored state has {n} tokens; with the other slots reserved the budget holds {max}");
-            let new = n.next_multiple_of(1024).min(self.ctx).min(max);
-            let victims = self.restore_victims(slot, new);
-            if !victims.is_empty() && !allow_evict {
-                bail!("restore needs to evict non-empty slot(s) {:?}; pass force=1 to allow it", victims);
-            }
-            // The target is not a victim of its own growth.
-            let mut active = self.active.clone();
-            active.resize(self.kv_cap.len(), false);
-            if slot < active.len() { active[slot] = true; }
-            self.set_active(&active);
-        }
-        self.kv_need(slot, n)?;
+        self.prepare_segmented_restore(slot, n, allow_evict)?;
         self.save_state()?;
         let r = (|| -> Result<u64> {
             let mut q = Some(&mut *self);
@@ -1206,6 +1190,58 @@ impl GpuModel<'_> {
             q = p.next.as_deref_mut();
         }
         Ok(n)
+    }
+
+    /// Make `slot` able to hold `n` tokens: validate the context/budget, grow a unified slot when needed, and refuse
+    /// (or reclaim empty victims, when `allow_evict`) exactly like [`Self::restore_slot_from`].
+    ///
+    /// This is the capacity half of a restore without reading a file: a segmented restore calls it before
+    /// [`Self::restore_kv_segment`], which needs the rows `[0, n)` to exist. An automatic restore passes
+    /// `allow_evict = false` and never touches a non-empty victim.
+    pub fn prepare_segmented_restore(&mut self, slot: usize, n: usize, allow_evict: bool) -> Result<()> {
+        ensure!(slot < self.slots(), "slot {slot} of {}", self.slots());
+        ensure!(n > 0, "restored state has no tokens");
+        ensure!(n <= self.ctx, "restored state has {n} tokens, --ctx is {}", self.ctx);
+        self.use_slot(slot);
+        let cap = self.kv_cap.get(slot).copied().unwrap_or(self.ctx);
+        if self.kv_budget > 0 && n > cap {
+            let max = self.kv_budget.saturating_sub(self.kv_cap.len().saturating_sub(1));
+            ensure!(n <= max, "restored state has {n} tokens; with the other slots reserved the budget holds {max}");
+            let new = n.next_multiple_of(1024).min(self.ctx).min(max);
+            let victims = self.restore_victims(slot, new);
+            if !victims.is_empty() && !allow_evict {
+                bail!("restore needs to evict non-empty slot(s) {:?}; pass force=1 to allow it", victims);
+            }
+            // The target is not a victim of its own growth.
+            let mut active = self.active.clone();
+            active.resize(self.kv_cap.len(), false);
+            if slot < active.len() { active[slot] = true; }
+            self.set_active(&active);
+        }
+        self.kv_need(slot, n)?;
+        Ok(())
+    }
+
+    /// The M-RoPE offset of slot `s` (0 for a plain text slot), read without switching slots.
+    pub fn slot_rope_offset(&self, s: usize) -> i32 {
+        if s == self.cur { self.rope_offset } else { self.seqs[s].rope }
+    }
+
+    /// Mark `slot` reusable at `tokens` for `owner` without installing a snapshot. A v1 synchronous save does this
+    /// after the rename; the segmented save calls it after the state file and the manifest are committed.
+    pub fn mark_slot_saved(&mut self, slot: usize, tokens: &[u32], owner: u64) {
+        if slot >= self.slots() { return; }
+        let prev = self.current_slot();
+        self.use_slot(slot);
+        let mut q = Some(&mut *self);
+        while let Some(p) = q {
+            p.saved_pos = tokens.len();
+            p.saved_ids = tokens.to_vec();
+            p.history = tokens.to_vec();
+            p.saved_owner = owner;
+            q = p.next.as_deref_mut();
+        }
+        self.use_slot(prev);
     }
 
     /// The caps a unified restore of `new` tokens would have to reclaim, only the ones that are not empty.

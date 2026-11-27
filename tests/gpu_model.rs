@@ -1442,3 +1442,233 @@ fn slot_segment_rejects_bad_header_before_install() {
         assert_eq!(gm.slot_tokens(0), &ids[..], "{bk}: history after rejected segments");
     }
 }
+
+/// A conversation archived as a v2 segmented entry restores into another slot with the same tokens, owner and
+/// position, and the next-token logits of the uninterrupted run and of a v1 full save/restore. (GPU integration
+/// test; not part of the CPU-only pass.)
+#[test]
+fn slot_archive_segmented_round_trip() {
+    use rusting_strata::slot_archive::{Archive, ArchiveConfig};
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let mut ids = tok
+        .encode(&"The quick brown fox jumps over the lazy dog. ".repeat(400))
+        .unwrap();
+    assert!(ids.len() > 2048, "{} tokens, need more than 2048", ids.len());
+    ids.truncate(3072);
+    let owner = 0x5151_0000_0000_0002u64;
+    let base = std::env::temp_dir().join(format!("strata-archive-v2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).fold(0f32, |x, (p, q)| x.max((p - q).abs()));
+
+    for (bk, gpu) in common::backends() {
+        eprintln!("backend {bk}");
+        let dir = base.join(format!("roundtrip-{bk}"));
+        let mut archive = Archive::open(ArchiveConfig {
+            dir,
+            budget_bytes: 64 << 30,
+            min_tokens: 1,
+            min_delta: 0,
+            versions: 1,
+        })
+        .unwrap();
+        let mut gm = GpuModel::load_slots(&m, gpu, 4096, 256, 512 << 20, 2).unwrap();
+        gm.adapt_every = 0;
+        gm.owner = owner;
+        gm.use_slot(0);
+        gm.prefill(&ids).unwrap();
+        assert_eq!(gm.slot_tokens(0), &ids[..], "{bk}: prefill history");
+
+        // Both snapshots are taken at the same 3072-token history, before the comparison step.
+        let full = base.join(format!("{bk}-full.bin"));
+        gm.save_slot_file_as(0, &full, owner).unwrap();
+        let entry = archive.save_segmented(&mut gm, 0, owner, "test").unwrap();
+        assert_eq!(entry.format, 2, "{bk}: entry format");
+        assert_eq!(entry.n_tokens, ids.len(), "{bk}: entry tokens");
+        assert_eq!(entry.owner, owner, "{bk}: entry owner");
+        assert_eq!(entry.segments.len(), ids.len().div_ceil(1024), "{bk}: segment count");
+        assert_eq!(entry.segments.iter().map(|s| s.end - s.start).sum::<usize>(), ids.len());
+        assert_eq!(entry.state_file.as_ref().map(|p| p.exists()), Some(true));
+        let want = gm.step(43).unwrap();
+
+        // Reference: the v1 full file restores into the second slot.
+        gm.restore_slot_file(1, &full, false).unwrap();
+        assert_eq!(gm.slot_tokens(1), &ids[..], "{bk}: full restore history");
+        gm.use_slot(1);
+        let full_next = gm.step(43).unwrap();
+        gm.erase_slot(1).unwrap();
+
+        // The v2 entry restores into the same second slot.
+        let n = archive.restore_segmented(&mut gm, 1, &entry).unwrap();
+        assert_eq!(n, ids.len(), "{bk}: restored token count");
+        assert_eq!(gm.slot_tokens(1), &ids[..], "{bk}: segmented restore history");
+        assert_eq!(gm.slot_owner(1), owner, "{bk}: segmented restore owner");
+        assert_eq!(gm.slot_pos(1), ids.len(), "{bk}: segmented restore position");
+        let segmented_next = gm.step(43).unwrap();
+        for (what, a, b) in [
+            ("full vs uninterrupted", &want, &full_next),
+            ("segmented vs uninterrupted", &want, &segmented_next),
+            ("segmented vs full", &full_next, &segmented_next),
+        ] {
+            let d = diff(a, b);
+            eprintln!("{bk} {what}: argmax {} vs {}, max |dlogit| {d:.3e}", ops::argmax(a), ops::argmax(b));
+            assert_eq!(ops::argmax(a), ops::argmax(b), "{bk}: {what}");
+            assert!(d <= 1e-4, "{bk}: {what} differs by {d}");
+        }
+        let _ = std::fs::remove_file(&full);
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Two v2 entries sharing a 1k/2k prefix reuse the same segment ids and refcounts; deleting one entry leaves every
+/// segment the other still needs, and deleting the last entry removes them. (GPU integration test; not run by the
+/// CPU-only pass.)
+#[test]
+fn slot_archive_segments_are_shared_and_unref_only_on_the_last_entry() {
+    use rusting_strata::slot_archive::{Archive, ArchiveConfig};
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let mut ids = tok
+        .encode(&"The quick brown fox jumps over the lazy dog. ".repeat(400))
+        .unwrap();
+    assert!(ids.len() > 3072, "{} tokens, need more than 3072", ids.len());
+    ids.truncate(3072);
+    let owner = 0x5151_0000_0000_0003u64;
+    let base = std::env::temp_dir().join(format!("strata-archive-share-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    for (bk, gpu) in common::backends() {
+        eprintln!("backend {bk}");
+        let dir = base.join(format!("share-{bk}"));
+        let mut archive = Archive::open(ArchiveConfig {
+            dir,
+            budget_bytes: 64 << 30,
+            min_tokens: 1,
+            min_delta: 0,
+            versions: 1,
+        })
+        .unwrap();
+        let mut gm = GpuModel::load(&m, gpu, 4096, 256, 512 << 20, 0).unwrap();
+        gm.adapt_every = 0;
+        gm.owner = owner;
+
+        gm.prefill(&ids[..1024]).unwrap();
+        let first = archive.save_segmented(&mut gm, 0, owner, "first").unwrap();
+        assert_eq!(first.segments.len(), 1, "{bk}: 1k entry segments");
+
+        gm.reset().unwrap();
+        gm.prefill(&ids[..2048]).unwrap();
+        let second = archive.save_segmented(&mut gm, 0, owner, "second").unwrap();
+        assert_eq!(second.segments.len(), 2, "{bk}: 2k entry segments");
+        assert_eq!(first.segments[0].id, second.segments[0].id, "{bk}: shared prefix segment id");
+        let shared = second.segments[0].id.clone();
+        assert_eq!(
+            archive.segments().segment(&shared).unwrap().refs,
+            2,
+            "{bk}: the shared segment is referenced twice"
+        );
+        let shared_file = archive.segments().segment(&shared).unwrap().file.clone();
+        assert!(shared_file.exists());
+
+        archive.delete(&first.id).unwrap();
+        assert!(shared_file.exists(), "{bk}: deleting the first entry removed a shared segment");
+        assert_eq!(archive.segments().segment(&shared).unwrap().refs, 1, "{bk}: refcount after delete");
+        assert_eq!(archive.stats().entries, 1);
+
+        // The surviving entry is still openable and its segment still readable.
+        drop(archive);
+        let mut archive = Archive::open(ArchiveConfig {
+            dir: base.join(format!("share-{bk}")),
+            budget_bytes: 64 << 30,
+            min_tokens: 1,
+            min_delta: 0,
+            versions: 1,
+        })
+        .unwrap();
+        assert_eq!(archive.stats().entries, 1);
+        assert!(archive.segments().contains(&shared));
+        assert_eq!(archive.delete(&second.id).unwrap(), second.bytes);
+        assert!(archive.segments().list().is_empty(), "{bk}: last delete must release every segment");
+        assert!(!shared_file.exists());
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A corrupt state file or KV segment makes the segmented restore fail before it is usable, and the target slot is
+/// cleared so the server prefills instead of continuing from a half-installed state. (GPU integration test; not run
+/// by the CPU-only pass.)
+#[test]
+fn slot_archive_corrupt_v2_data_is_rejected_and_clears_the_slot() {
+    use rusting_strata::slot_archive::{Archive, ArchiveConfig};
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let ids = tok
+        .encode("The quick brown fox jumps over the lazy dog. The capital of France is")
+        .unwrap();
+    let owner = 0x5151_0000_0000_0004u64;
+    let base = std::env::temp_dir().join(format!("strata-archive-corrupt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    for (bk, gpu) in common::backends() {
+        eprintln!("backend {bk}");
+        let dir = base.join(format!("corrupt-{bk}"));
+        let mut archive = Archive::open(ArchiveConfig {
+            dir,
+            budget_bytes: 64 << 30,
+            min_tokens: 1,
+            min_delta: 0,
+            versions: 1,
+        })
+        .unwrap();
+        let mut gm = GpuModel::load_slots(&m, gpu, 512, 0, 512 << 20, 2).unwrap();
+        gm.adapt_every = 0;
+        gm.owner = owner;
+        gm.prefill(&ids).unwrap();
+        let state_entry = archive.save_segmented(&mut gm, 0, owner, "state").unwrap();
+
+        // A different token history, so the second entry has its own segment chain.
+        let other: Vec<u32> = ids.iter().map(|t| t.wrapping_add(17)).collect();
+        gm.reset().unwrap();
+        gm.prefill(&other).unwrap();
+        let segment_entry = archive.save_segmented(&mut gm, 0, owner, "segment").unwrap();
+
+        // A target slot with a live history proves that a failed restore clears it.
+        gm.use_slot(1);
+        gm.prefill(&ids[..8]).unwrap();
+
+        let state_file = state_entry.state_file.clone().unwrap();
+        let mut raw = std::fs::read(&state_file).unwrap();
+        raw[0] ^= 0xff;
+        std::fs::write(&state_file, &raw).unwrap();
+        let err = archive.restore_segmented(&mut gm, 1, &state_entry).unwrap_err();
+        eprintln!("{bk}: corrupt state rejected: {err:#}");
+        assert!(gm.slot_tokens(1).is_empty(), "{bk}: a failed state restore must clear the slot");
+        assert_eq!(gm.slot_pos(1), 0, "{bk}: cleared position");
+
+        // Prefill the target again, then corrupt the first KV segment of the other entry.
+        gm.use_slot(1);
+        gm.prefill(&other[..8]).unwrap();
+        let segment_file = archive.segments().segment(&segment_entry.segments[0].id).unwrap().file.clone();
+        let mut raw = std::fs::read(&segment_file).unwrap();
+        let last = raw.len() - 1;
+        raw[last] ^= 0xff;
+        std::fs::write(&segment_file, &raw).unwrap();
+        let err = archive.restore_segmented(&mut gm, 1, &segment_entry).unwrap_err();
+        eprintln!("{bk}: corrupt segment rejected: {err:#}");
+        assert!(gm.slot_tokens(1).is_empty(), "{bk}: a failed segment restore must clear the slot");
+        assert_eq!(gm.slot_pos(1), 0, "{bk}: cleared position after a bad segment");
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
