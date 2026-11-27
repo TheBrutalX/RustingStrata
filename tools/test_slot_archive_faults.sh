@@ -846,14 +846,13 @@ def run_verify(base, state_path, copy_dir, log_path, kind, timeout):
 
     if kind == "manifest":
         report.check(
-            "manifest: unrebuildable v2 entries are dropped",
-            isinstance(first_id, str) and first_id not in listed
-            and (not isinstance(second_id, str) or second_id not in listed),
+            "manifest: v2 entries rebuild from STRSTATE and segments",
+            isinstance(first_id, str) and first_id in listed
+            and (not isinstance(second_id, str) or second_id in listed),
             "listed=%s first=%r second=%r" % (brief(listed), first_id, second_id),
         )
         print(
-            "NOTE manifest: v2 rows are not rebuilt from STRSTATE in this wave; "
-            "the entries were dropped and the chat falls back to prefill",
+            "NOTE manifest: v2 entries were rebuilt from the v2 STRSTATE refs and segment chain",
             flush=True,
         )
     elif kind == "segments":
