@@ -75,6 +75,8 @@ pub struct ArchiveStats {
     pub misses: u64,
     pub restores: u64,
     pub evictions: u64,
+    /// Entries removed by the TTL policy (also counted in `evictions`).
+    pub expired: u64,
     pub failures: u64,
 }
 
@@ -82,6 +84,8 @@ pub struct ArchiveStats {
 #[derive(Clone, Debug, Default)]
 pub struct GcReport {
     pub evicted: usize,
+    /// Entries removed by the TTL policy (a subset of `evicted`).
+    pub expired: usize,
     pub freed_bytes: u64,
 }
 
@@ -101,6 +105,10 @@ pub struct Archive {
     /// Transient in-flight references, keyed by entry id. Shared with [`Lease`] guards so a guard can release
     /// the lease after the `Archive` borrow has ended.
     leases: Arc<Mutex<BTreeMap<String, usize>>>,
+    /// Lifecycle policy; all zero means off. Set with [`Archive::set_policy`], not persisted in the manifest.
+    ttl_ms: u64,
+    per_key_bytes: u64,
+    pin_bytes: u64,
 }
 
 /// A transient reference to an archive entry, held while a restore or save is in flight.
@@ -193,6 +201,9 @@ impl Archive {
             entries,
             stats: ArchiveStats::default(),
             leases: Arc::new(Mutex::new(BTreeMap::new())),
+            ttl_ms: 0,
+            per_key_bytes: 0,
+            pin_bytes: 0,
         };
         if changed {
             archive.persist()?;
@@ -202,6 +213,51 @@ impl Archive {
 
     pub fn config(&self) -> &ArchiveConfig {
         &self.cfg
+    }
+
+    /// Set the lifecycle policy; zero disables each limit. Not persisted: the server re-applies its flags on
+    /// startup. `(ttl_ms, per_key_bytes, pin_bytes)`.
+    pub fn set_policy(&mut self, ttl_ms: u64, per_key_bytes: u64, pin_bytes: u64) {
+        self.ttl_ms = ttl_ms;
+        self.per_key_bytes = per_key_bytes;
+        self.pin_bytes = pin_bytes;
+    }
+
+    /// The current `(ttl_ms, per_key_bytes, pin_bytes)` policy.
+    pub fn policy(&self) -> (u64, u64, u64) {
+        (self.ttl_ms, self.per_key_bytes, self.pin_bytes)
+    }
+
+    /// Pin or unpin an entry for GC/TTL protection and persist the manifest.
+    ///
+    /// When `pin_bytes > 0`, pinning is refused if the pinned total would exceed the cap; unpinning always
+    /// works. Pinning an already-pinned (or unpinning a non-pinned) entry is a no-op that still succeeds.
+    pub fn set_pinned(&mut self, id: &str, pinned: bool) -> Result<()> {
+        let entry = self
+            .entries
+            .get(id)
+            .with_context(|| format!("slot archive: no entry {id} to pin"))?;
+        if entry.pinned == pinned {
+            return Ok(());
+        }
+        if pinned && self.pin_bytes > 0 {
+            let after = self.pinned_bytes().saturating_add(entry.bytes);
+            if after > self.pin_bytes {
+                bail!(
+                    "slot archive: pinning {id} would use {after} pinned bytes, over the {}-byte pin cap",
+                    self.pin_bytes
+                );
+            }
+        }
+        let entry = self.entries.get_mut(id).context("entry disappeared while pinning")?;
+        entry.pinned = pinned;
+        self.persist()?;
+        Ok(())
+    }
+
+    /// Logical bytes held by pinned entries.
+    pub fn pinned_bytes(&self) -> u64 {
+        self.entries.values().filter(|e| e.pinned).map(|e| e.bytes).sum()
     }
 
     pub fn stats(&self) -> ArchiveStats {
@@ -321,29 +377,86 @@ impl Archive {
             );
         }
 
-        // Budget: evict foreign (unusable for this fingerprint) files first, then the oldest unpinned entries.
+        // Per-key quota: evict this owner's own LRU entries first so one conversation cannot crowd every
+        // other owner out. Pinned and leased entries are protected, and another owner is never touched here.
+        if self.per_key_bytes > 0 {
+            if bytes > self.per_key_bytes {
+                let _ = fs::remove_file(path);
+                bail!(
+                    "slot archive: a {bytes}-byte entry exceeds the {}-byte per-owner quota",
+                    self.per_key_bytes
+                );
+            }
+            let mut owner_used: u64 = self
+                .entries
+                .values()
+                .filter(|e| e.owner == owner && e.id != id)
+                .map(|e| e.bytes)
+                .sum();
+            if owner_used.saturating_add(bytes) > self.per_key_bytes {
+                let mut candidates: Vec<(u64, String)> = self
+                    .entries
+                    .values()
+                    .filter(|e| e.owner == owner && e.id != id && !e.pinned)
+                    .map(|e| (e.last_used_ms, e.id.clone()))
+                    .collect();
+                candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                for (_, candidate) in candidates {
+                    if owner_used.saturating_add(bytes) <= self.per_key_bytes {
+                        break;
+                    }
+                    if let Some(freed) = self.evict_entry(&candidate) {
+                        owner_used = owner_used.saturating_sub(freed);
+                    }
+                }
+                if owner_used.saturating_add(bytes) > self.per_key_bytes {
+                    let _ = fs::remove_file(path);
+                    bail!(
+                        "slot archive: owner {owner} is over its {}-byte quota and only pinned or leased \
+                         entries remain to evict",
+                        self.per_key_bytes
+                    );
+                }
+            }
+        }
+
+        // Global budget: evict foreign (unusable for this fingerprint) files first, then expired entries,
+        // then the oldest unpinned entries.
         let mut used = self.used_bytes();
         if used.saturating_add(bytes) > limit {
             // Only under pressure: apply the `versions` policy before the LRU pass.
             self.prune_all_lineages();
+            let now = now_ms();
             used = self.used_bytes();
-            let mut candidates: Vec<(bool, u64, String)> = self
+            let mut candidates: Vec<(u8, u64, String)> = self
                 .entries
                 .values()
                 .filter(|e| !e.pinned && e.id != id)
-                .map(|e| (e.fingerprint != fingerprint, e.last_used_ms, e.id.clone()))
+                .map(|e| {
+                    let rank = if e.fingerprint != fingerprint {
+                        0
+                    } else if self.ttl_expired(e, now) {
+                        1
+                    } else {
+                        2
+                    };
+                    (rank, e.last_used_ms, e.id.clone())
+                })
                 .collect();
             candidates.sort_by(|a, b| {
-                b.0.cmp(&a.0)
+                a.0.cmp(&b.0)
                     .then_with(|| a.1.cmp(&b.1))
                     .then_with(|| a.2.cmp(&b.2))
             });
-            for (_, _, candidate) in candidates {
+            for (rank, _, candidate) in candidates {
                 if used.saturating_add(bytes) <= limit {
                     break;
                 }
                 if let Some(freed) = self.evict_entry(&candidate) {
                     used = used.saturating_sub(freed);
+                    if rank == 1 {
+                        self.stats.expired = self.stats.expired.saturating_add(1);
+                    }
                 }
             }
             if used.saturating_add(bytes) > limit {
@@ -545,6 +658,27 @@ impl Archive {
         let mut report = GcReport::default();
         let mut changed = false;
 
+        // TTL: remove unpinned idle entries before any budget work. Leased entries are skipped by
+        // `evict_entry`; a future `last_used_ms` saturates to a zero age.
+        if self.ttl_ms > 0 {
+            let now = now_ms();
+            let expired: Vec<String> = self
+                .entries
+                .values()
+                .filter(|e| self.ttl_expired(e, now))
+                .map(|e| e.id.clone())
+                .collect();
+            for id in expired {
+                if let Some(freed) = self.evict_entry(&id) {
+                    report.evicted += 1;
+                    report.expired += 1;
+                    report.freed_bytes = report.freed_bytes.saturating_add(freed);
+                    self.stats.expired = self.stats.expired.saturating_add(1);
+                    changed = true;
+                }
+            }
+        }
+
         // Unusable: the manifest row points at a missing file. (Foreign fingerprints are not identifiable
         // without a current fingerprint argument, so they are only evicted by the LRU pass.)
         let ids: Vec<String> = self.entries.keys().cloned().collect();
@@ -608,6 +742,14 @@ impl Archive {
 
     fn used_bytes(&self) -> u64 {
         self.entries.values().map(|e| e.bytes).sum()
+    }
+
+    /// True when `entry` is subject to an enabled TTL and has been idle longer than it. Pinned entries never
+    /// expire; a `last_used_ms` in the future (clock skew) is treated as just used.
+    fn ttl_expired(&self, entry: &ArchiveEntry, now: u64) -> bool {
+        self.ttl_ms > 0
+            && !entry.pinned
+            && now.saturating_sub(entry.last_used_ms) > self.ttl_ms
     }
 
     /// Remove an entry and its file. `None` when the file could not be unlinked (the entry is kept) or when the
@@ -1149,6 +1291,10 @@ mod tests {
 
     fn write_manifest_json(dir: &Path, value: &serde_json::Value) {
         fs::write(dir.join(MANIFEST), serde_json::to_vec(value).unwrap()).unwrap();
+    }
+
+    fn set_last_used(archive: &mut Archive, id: &str, used: u64) {
+        archive.entries.get_mut(id).unwrap().last_used_ms = used;
     }
 
     #[test]
@@ -1753,5 +1899,277 @@ mod tests {
         assert_eq!(archive.leases(&entry.id), 0);
         assert_eq!(archive.delete(&entry.id).unwrap(), entry.bytes);
         assert!(archive.list(None, 0).is_empty());
+    }
+
+    #[test]
+    fn policy_is_off_by_default_and_round_trips() {
+        let tmp = TempDir::new("policy");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        assert_eq!(archive.policy(), (0, 0, 0));
+        archive.set_policy(86_400_000, 1 << 30, 1 << 28);
+        assert_eq!(archive.policy(), (86_400_000, 1 << 30, 1 << 28));
+        archive.set_policy(0, 0, 0);
+        assert_eq!(archive.policy(), (0, 0, 0));
+    }
+
+    #[test]
+    fn ttl_evicts_expired_and_keeps_fresh() {
+        let tmp = TempDir::new("ttl");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let old = save(&mut archive, 1, &(1..=6).collect::<Vec<_>>());
+        let fresh = save(&mut archive, 1, &(20..=25).collect::<Vec<_>>());
+        archive.set_policy(1_000, 0, 0);
+        let now = now_ms();
+        set_last_used(&mut archive, &old.id, now.saturating_sub(10_000));
+        set_last_used(&mut archive, &fresh.id, now.saturating_sub(100));
+
+        let report = archive.gc().unwrap();
+        assert_eq!((report.evicted, report.expired), (1, 1), "{report:?}");
+        assert!(report.freed_bytes >= old.bytes);
+        assert!(!old.file.exists(), "the expired file must be removed");
+        assert!(fresh.file.exists(), "the fresh entry must survive");
+        assert_eq!(archive.stats().expired, 1);
+        assert_eq!(archive.list(None, 0).len(), 1);
+
+        // A `last_used_ms` in the future (clock skew) must not expire or panic.
+        set_last_used(&mut archive, &fresh.id, now.saturating_add(1_000_000));
+        let report = archive.gc().unwrap();
+        assert_eq!((report.evicted, report.expired), (0, 0));
+        assert!(fresh.file.exists());
+    }
+
+    #[test]
+    fn ttl_zero_is_off() {
+        let tmp = TempDir::new("ttl-off");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let entry = save(&mut archive, 1, &(1..=6).collect::<Vec<_>>());
+        set_last_used(&mut archive, &entry.id, 0);
+        let report = archive.gc().unwrap();
+        assert_eq!((report.evicted, report.expired), (0, 0));
+        assert_eq!(archive.stats().expired, 0);
+        assert!(entry.file.exists());
+        assert_eq!(archive.stats().entries, 1);
+    }
+
+    #[test]
+    fn per_key_quota_evicts_only_that_owner() {
+        let tmp = TempDir::new("perkey");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let a1 = save(&mut archive, 1, &(1..=10).collect::<Vec<_>>());
+        std::thread::sleep(Duration::from_millis(2));
+        let a2 = save(&mut archive, 1, &(21..=30).collect::<Vec<_>>());
+        // Owner 0 is a normal bucket, not a special case.
+        let b1 = save(&mut archive, 0, &(41..=50).collect::<Vec<_>>());
+        assert_eq!(a1.bytes, a2.bytes);
+
+        // Room for two entries per owner: the third owner-1 save evicts owner 1's oldest entry only.
+        archive.set_policy(0, a1.bytes * 2 + 26, 0);
+        std::thread::sleep(Duration::from_millis(2));
+        let a3 = save(&mut archive, 1, &(61..=70).collect::<Vec<_>>());
+
+        let ids: Vec<String> = archive.list(None, 0).into_iter().map(|e| e.id).collect();
+        assert!(ids.contains(&a2.id), "{ids:?}");
+        assert!(ids.contains(&a3.id), "{ids:?}");
+        assert!(ids.contains(&b1.id), "owner 0 must be untouched: {ids:?}");
+        assert!(!ids.contains(&a1.id), "the oldest owner-1 entry must go: {ids:?}");
+        assert!(!a1.file.exists());
+        assert!(a2.file.exists() && b1.file.exists());
+        assert_eq!(archive.list(Some(0), 0).len(), 1);
+    }
+
+    #[test]
+    fn per_key_quota_boundary_and_oversize_entry() {
+        let tmp = TempDir::new("perkey-boundary");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let a1 = save(&mut archive, 1, &(1..=10).collect::<Vec<_>>());
+        std::thread::sleep(Duration::from_millis(2));
+        let a2 = save(&mut archive, 1, &(21..=30).collect::<Vec<_>>());
+        let size = a1.bytes;
+        assert_eq!(a2.bytes, size);
+
+        // Exactly at the quota: both entries fit (`>` not `>=`).
+        archive.set_policy(0, size * 2, 0);
+        assert_eq!(archive.stats().entries, 2);
+        assert!(a1.file.exists() && a2.file.exists());
+
+        // The new entry makes the owner exceed the quota by exactly one entry; evicting the oldest brings
+        // the bucket back to exactly the quota, which is allowed.
+        std::thread::sleep(Duration::from_millis(2));
+        let a3 = save(&mut archive, 1, &(41..=50).collect::<Vec<_>>());
+        assert!(!a1.file.exists(), "the oldest entry must be evicted");
+        assert!(a2.file.exists() && a3.file.exists());
+
+        // One byte under two entries: the owner cannot keep two, so both older entries go.
+        archive.set_policy(0, size * 2 - 1, 0);
+        std::thread::sleep(Duration::from_millis(2));
+        let a4 = save(&mut archive, 1, &(51..=60).collect::<Vec<_>>());
+        let owner_entries = archive.list(Some(1), 0);
+        assert_eq!(owner_entries.len(), 1, "{owner_entries:?}");
+        assert_eq!(owner_entries[0].id, a4.id);
+        assert!(!a2.file.exists() && !a3.file.exists());
+
+        // An entry that alone exceeds the quota is rejected and its file deleted.
+        archive.set_policy(0, size - 1, 0);
+        let tokens: Vec<u32> = (61..=70).collect();
+        let (id, path) = match archive.prepare_save(9, &tokens, FP, "test").unwrap() {
+            SaveSlot::New { id, path } => (id, path),
+            SaveSlot::Existing(_) => panic!("expected New"),
+        };
+        write_slot(&path, 9, FP, &tokens);
+        let err = archive
+            .commit_save(&id, &path, 9, &tokens, FP, "test")
+            .unwrap_err();
+        assert!(err.to_string().contains("per-owner quota"), "{err}");
+        assert!(!path.exists(), "the rejected file must be deleted");
+        assert!(archive.list(Some(9), 0).is_empty());
+    }
+
+    #[test]
+    fn per_key_quota_protects_pinned_and_leased() {
+        let tmp = TempDir::new("perkey-protected");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let a1 = save(&mut archive, 1, &(1..=10).collect::<Vec<_>>());
+        std::thread::sleep(Duration::from_millis(2));
+        let a2 = save(&mut archive, 1, &(21..=30).collect::<Vec<_>>());
+        std::thread::sleep(Duration::from_millis(2));
+        let a3 = save(&mut archive, 1, &(41..=50).collect::<Vec<_>>());
+        let size = a1.bytes;
+
+        archive.set_pinned(&a1.id, true).unwrap();
+        let lease = archive.lease(&a2.id).unwrap();
+        // Three entries fill the quota; a fourth must evict only the unpinned, unleased one.
+        archive.set_policy(0, size * 3, 0);
+        std::thread::sleep(Duration::from_millis(2));
+        let a4 = save(&mut archive, 1, &(61..=70).collect::<Vec<_>>());
+        assert!(a1.file.exists() && a2.file.exists() && a4.file.exists());
+        assert!(!a3.file.exists(), "only the unprotected entry may be evicted");
+
+        // With every remaining entry protected, a new save fails clearly instead of breaking the quota.
+        let a4_lease = archive.lease(&a4.id).unwrap();
+        archive.set_policy(0, size * 2, 0);
+        let tokens: Vec<u32> = (81..=90).collect();
+        let (id, path) = match archive.prepare_save(1, &tokens, FP, "test").unwrap() {
+            SaveSlot::New { id, path } => (id, path),
+            SaveSlot::Existing(_) => panic!("expected New"),
+        };
+        write_slot(&path, 1, FP, &tokens);
+        let err = archive
+            .commit_save(&id, &path, 1, &tokens, FP, "test")
+            .unwrap_err();
+        assert!(err.to_string().contains("pinned or leased"), "{err}");
+        assert!(!path.exists());
+        assert_eq!(archive.stats().entries, 3);
+        drop((lease, a4_lease));
+    }
+
+    #[test]
+    fn per_key_quota_still_enforces_the_global_budget() {
+        let tmp = TempDir::new("perkey-global");
+        let dir = tmp.path();
+        let mut cfg = config(dir);
+        cfg.budget_bytes = RESERVE_BYTES + 400;
+        let mut archive = Archive::open(cfg).unwrap();
+        archive.set_policy(0, 1 << 30, 0);
+        let mut saved = Vec::new();
+        for i in 0..6u32 {
+            let tokens: Vec<u32> = (0..10).map(|j| i * 1000 + j + 1).collect();
+            std::thread::sleep(Duration::from_millis(2));
+            saved.push(save(&mut archive, 1, &tokens));
+        }
+        assert!(archive.stats().bytes <= 400, "{:?}", archive.stats());
+        assert!(archive.stats().evictions > 0);
+        assert!(archive.list(None, 0).iter().any(|e| e.id == saved[5].id));
+        assert!(archive.list(None, 0).iter().all(|e| e.id != saved[0].id));
+    }
+
+    #[test]
+    fn pin_persists_across_open() {
+        let tmp = TempDir::new("pin-persist");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let a = save(&mut archive, 1, &(1..=6).collect::<Vec<_>>());
+        let b = save(&mut archive, 1, &(20..=25).collect::<Vec<_>>());
+        assert_eq!(archive.pinned_bytes(), 0);
+        archive.set_pinned(&a.id, true).unwrap();
+        assert_eq!(archive.pinned_bytes(), a.bytes);
+        // Idempotent: pinning twice must not double-count.
+        archive.set_pinned(&a.id, true).unwrap();
+        assert_eq!(archive.pinned_bytes(), a.bytes);
+        drop(archive);
+
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let entries = archive.list(None, 0);
+        assert!(entries.iter().find(|e| e.id == a.id).unwrap().pinned);
+        assert!(!entries.iter().find(|e| e.id == b.id).unwrap().pinned);
+        assert_eq!(archive.pinned_bytes(), a.bytes);
+
+        archive.set_pinned(&a.id, false).unwrap();
+        assert_eq!(archive.pinned_bytes(), 0);
+        drop(archive);
+        let archive = Archive::open(config(dir)).unwrap();
+        assert!(!archive.list(None, 0).iter().any(|e| e.pinned));
+        assert_eq!(archive.pinned_bytes(), 0);
+    }
+
+    #[test]
+    fn pin_cap_is_enforced_and_unpin_always_works() {
+        let tmp = TempDir::new("pin-cap");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let a = save(&mut archive, 1, &(1..=6).collect::<Vec<_>>());
+        let b = save(&mut archive, 1, &(20..=25).collect::<Vec<_>>());
+        archive.set_policy(0, 0, a.bytes + 10);
+        archive.set_pinned(&a.id, true).unwrap();
+        assert_eq!(archive.pinned_bytes(), a.bytes);
+
+        let err = archive.set_pinned(&b.id, true).unwrap_err();
+        assert!(err.to_string().contains("pin cap"), "{err}");
+        assert!(!archive.list(None, 0).iter().find(|e| e.id == b.id).unwrap().pinned);
+        assert_eq!(archive.pinned_bytes(), a.bytes);
+
+        // Unpinning is never blocked, even by a cap smaller than the current pinned total.
+        archive.set_policy(0, 0, 1);
+        archive.set_pinned(&a.id, false).unwrap();
+        assert_eq!(archive.pinned_bytes(), 0);
+        assert!(archive.set_pinned(&b.id, true).is_err());
+
+        // Zero means unlimited.
+        archive.set_policy(0, 0, 0);
+        archive.set_pinned(&b.id, true).unwrap();
+        assert_eq!(archive.pinned_bytes(), b.bytes);
+
+        assert!(archive.set_pinned("no-such-entry", true).is_err());
+    }
+
+    #[test]
+    fn pinned_survives_gc_and_ttl() {
+        let tmp = TempDir::new("pin-gc");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let entry = save(&mut archive, 1, &(1..=6).collect::<Vec<_>>());
+        archive.set_pinned(&entry.id, true).unwrap();
+        archive.set_policy(1_000, 0, 0);
+        set_last_used(&mut archive, &entry.id, 0);
+
+        let report = archive.gc().unwrap();
+        assert_eq!((report.evicted, report.expired), (0, 0));
+        assert!(entry.file.exists());
+        assert_eq!(archive.stats().entries, 1);
+
+        // A pin also protects the entry from budget pressure, even when it is over budget by itself.
+        drop(archive);
+        let mut cfg = config(dir);
+        cfg.budget_bytes = RESERVE_BYTES + 1;
+        let mut archive = Archive::open(cfg).unwrap();
+        let report = archive.gc().unwrap();
+        assert_eq!(report.evicted, 0);
+        assert_eq!(archive.stats().entries, 1);
+        assert!(entry.file.exists());
     }
 }
