@@ -55,7 +55,11 @@ Measured results on the integration branch:
 |---|---|
 | archive E2E (`tools/test_slot_archive.sh`) | 106/106: 28 single, 10 restart, 21 parallel, 15 parallel-restart, 30 lifecycle, 2 no-flag |
 | dedup E2E (`tools/test_slot_archive_dedup.sh`) | 88/88: 63 full, 25 restart |
-| explicit slot-save E2E (`tools/test_slot_save.sh`) | 43/43 |
+| explicit slot-save E2E (`tools/test_slot_save.sh`) | 43/43 (unified force restore included) |
+| shutdown/GC E2E (`tools/test_slot_archive_shutdown.sh`) | 56/56 (SIGTERM checkpoint + periodic TTL GC) |
+| fault harness (`tools/test_slot_archive_faults.sh`) | 241/241 |
+| benchmark (`tools/bench_slot_archive.sh`) | 20/20 |
+| soak (`tools/soak_slot_archive.sh`) | 20/20, 40 switches, RSS/GPU flat |
 | lib unit tests | 265 passed, 1 ignored (phase-3 wave) |
 | GPU archive tests | `slot_archive_` 3/3, `slot_segment_` 2/2 |
 | GPU slot/prefill regressions | `slot_` suite (async owner/equivalence included), `unified_`, `prefill_cached_reuses_history`, `prefill_matches_reference` |
@@ -63,8 +67,15 @@ Measured results on the integration branch:
 The dedup run is the one that proves the storage claim: two conversations with a shared prefix produce segment
 rows with `refs >= 2`, deleting one entry keeps the segments used by the other, a continuation restores from
 those segments with `cached_tokens > 0`, and the surviving entry still restores after a process restart. The
-lifecycle run covers TTL expiry, pin survival, unpin/expiry and the `404` on pinning a deleted id. No new timing
-benchmark was run; the file decomposition in §2 remains the measured sizing evidence.
+lifecycle run covers TTL expiry, pin survival, unpin/expiry and the `404` on pinning a deleted id. The shutdown
+E2E confirms a SIGTERM checkpoint plus a restart restore, and that a 1 s periodic GC removes an unpinned TTL entry
+without a manual GC while the pinned entry survives.
+
+The 32k benchmark (24k-token prompt) measured: first checkpoint 405 ms / 327.9 MB (66 MB state + new segments),
+later checkpoints ~283 ms / 72 MB, restore 598 ms with `cached_tokens=24139`; 3 entries produced 26 segments and
+472 MB total. The soak stayed flat at ~18.1–18.5 GB RSS and ~18.9 GB GPU over 40 switches. These are the current
+numbers for the synchronous v2 path; the resumable API is not yet wired to the scheduler, so they still include the
+model-thread stall.
 
 ## 1. What phase 1 actually does
 
