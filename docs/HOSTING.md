@@ -418,10 +418,16 @@ the web server or a reverse proxy serves.
 **Disk and sizing.** `--slot-archive-gb` is GiB (1 GiB = 2^30 bytes), and the example above reserves 200 GiB. The
 budget is logical, with 1 GiB kept free for the temp file and manifest. With q8 KV on the 35B-A3B layout, SLOT-SAVE
 measures about 10.9 GB per 1M tokens: 8k tokens is about 90 MB, 32k about 350 MB, 100k about 1.1 GB, 256k about
-2.8 GB and 1M about 10.9 GB. A 200 GiB budget is about 18M archived tokens, roughly 180 conversations of 100k
-tokens or 18 of 1M. The token history is 4 bytes per token and the recurrent state is small next to the KV. Leave
-filesystem free space above the budget: a write needs room for its temp file, the manifest and the reserve below
-the logical limit.
+2.8 GB and 1M about 10.9 GB. A checkpoint also carries a fixed ~66 MB recurrent/DeltaNet/MTP/PLE/QSA state per
+slot, which is why a short 1.4k-token checkpoint was 81 MB, not a few MB. q4 halves the KV (~5.8 GB/1M) and q2
+reduces it to ~3.9 GB/1M; the fixed state is unchanged. A 200 GiB budget is about 18M archived tokens at q8
+(~34M at q4, ~52M at q2) before the fixed state per conversation.
+
+Format-2 entries deduplicate the KV: the state file is per entry, while `segments.json` + `segments/` hold
+1024-token content-addressed K/V segments shared by conversations with the same prefix. A growing conversation
+writes only new segments; a shared system prompt/tools/document is charged once. Do not edit `segments.json` or
+the segment files by hand. Leave filesystem free space above the budget: a write needs room for its temp file, the
+manifest, the segment manifest and the reserve below the logical limit.
 
 **Eviction and lineage.** A checkpoint that would exceed `budget - 1 GiB` first prunes unpinned ancestors beyond
 `--slot-archive-versions`, then evicts entries with a foreign fingerprint, then the least recently used unpinned
@@ -455,13 +461,13 @@ phase-1 deployment keeps its behavior; on a shared server, tune all three:
   Pinning is an admin-only `POST /slots/archive/{id}?action=pin|unpin`; the entry's `pinned` flag is persisted in
   the manifest, so a pin survives a restart and protects the entry from the TTL, the budget and lineage pruning.
 
-**Checkpoint stalls.** Checkpoints are synchronous in this wave: the model thread copies the state and writes the
-file, and every stream pauses for the duration. The chunked save/restore core exists, but the scheduler does not
-use it yet. At 0.5-1 GB/s a 1 GB state costs 1-2 s; a 10.9 GB 1M-token state costs 10-20 s. Expect a visible pause
-when a conversation switches or a unified slot is reclaimed. Keep `--slot-archive-min-tokens` and
-`--slot-archive-min-delta` high enough that small states and tiny extensions are not written on every turn. A
-restore has the same kind of stall for the read and the copy into the slot, after which only the prompt suffix is
-prefilled.
+**Checkpoint stalls.** Format-2 saves and restores are synchronous in this wave: the model thread copies the
+state, writes the new segments/state and commits the manifest, and every stream pauses for the duration. The GPU
+core also has `save_slot_to`/`restore_slot_from`, a bounded 256 MB writer/reader and `save_slot_file_async_as`;
+v1 entries restore through the async reader, but automatic v2 checkpoints do not use it yet and the scheduler does
+not interleave. A 1 GB state costs 1-2 s at 0.5-1 GB/s; a 10.9 GB 1M-token state costs 10-20 s. Expect a visible
+pause when a conversation switches or a unified slot is reclaimed. Keep `--slot-archive-min-tokens` and
+`--slot-archive-min-delta` high enough that small states and tiny extensions are not written on every turn.
 
 **Restore behavior.** Automatic restore uses a free slot only and never takes a slot a request holds. It never
 uses the `force=1` of the explicit route. If the chosen free slot holds another conversation, the server
@@ -478,10 +484,16 @@ save the resident slots, and every checkpoint still blocks the model thread. Kee
 `TimeoutStopSec` and rely on explicit `action=checkpoint` before a planned restart.
 
 **Security and backups.** Entries are plaintext: the full token history (prompt, system prompt, tools and
-generated tokens) and the KV/recurrent state. Pinning does not encrypt an entry; it only exempts it from the TTL,
-the budget and lineage pruning, so unpin an entry you no longer need. Treat the directory as a copy of the
-conversations: `0700`, files `0600`, no HTTP access, and include it in (or deliberately exclude it from) backups
-and retention. With `--api-keys` entries are owner-scoped and the archive routes are admin-only:
+generated tokens) and the KV/recurrent state. Format-2 entries keep the tokens/recurrent state in `STRSTATE`
+files and the KV in `segments/`; `segments.json` is the segment index. Segments are shared globally inside the
+archive directory while entries remain owner-scoped, so the same prefix can serve several owners without exposing
+an entry they do not own; use a separate archive directory if even that sharing is unacceptable. Pinning does not
+encrypt an entry; it only exempts it from the TTL, the budget and lineage pruning, so unpin an entry you no longer
+need. Treat the directory as a copy of the conversations: `0700`, files `0600`, no HTTP access, and include
+`manifest.json`, `segments.json`, `segments/` and any v1 `.slot` files in (or deliberately exclude them from)
+backups and retention. A backup taken while the server is writing can contain orphan temp/segment files; restore a
+consistent snapshot or stop the service. With `--api-keys` entries are owner-scoped and the archive routes are
+admin-only:
 `GET /slots/archive`, `DELETE /slots/archive/{id}`, `POST /slots/archive/{id}?action=pin|unpin`,
 `POST /slots/archive/gc` and `POST /slots/{id}?action=checkpoint` all answer `403` for a customer key. Without
 keys, owner 0 is shared by every client. A copied entry still restores only with the same model, `--kv`,
@@ -498,6 +510,10 @@ YaRN/RoPE flags and split, because the fingerprint is checked first.
   `POST /slots/{id}?action=restore` through `--slot-save-path` keeps its existing `409` when `--kv-unified` would
   evict a non-empty slot; retry with `?force=1` only if that is intended.
 - `404`: `pin`/`unpin` of an id that is no longer in the manifest, for example after a TTL GC.
+- `segments.json`/segment files: a corrupt segment manifest is rebuilt from the `.seg` files on startup; an entry
+  whose state file or segment chain is missing or invalid is dropped rather than restored. A lost `manifest.json`
+  rebuilds v1 `.slot` entries only; v2 entries are not reconstructable from segments alone, so include
+  `manifest.json`, `segments.json` and `segments/` in the same backup.
 - `501`: the server was started without `--slot-archive-dir`; the archive routes are off.
 - `503`: no model is loaded.
 - Startup: the manifest is validated against the shard files. A missing file drops its entry, an orphan file is

@@ -401,7 +401,14 @@ The match is exact on token ids, within the same model/KV/YaRN/split fingerprint
 not a text-similarity or message-hash cache. The archive is off by default and must be a different directory from
 `--slot-save-path`; the server refuses to start when they resolve to the same one.
 
-- `--slot-archive-gb N`: logical budget for the entry files in GiB (1 GiB = 2^30 bytes), default 50. A
+New checkpoints are **format-2 segmented entries**. The token list and the recurrent/DeltaNet/MTP/PLE/QSA state
+live in a `STRSTATE` file; the attention K/V rows are split into 1024-token content-addressed segments under
+`segments/<2 hex>/<id>.seg`, indexed by `segments.json`. A conversation that grows writes only its new segments,
+and two conversations with the same system prompt/tools/chosen document share the prefix segments. Older
+format-1 `STRATASLOT` entries remain listed and restorable.
+
+- `--slot-archive-gb N`: logical budget for the state files, segment payloads and v1 slot files in GiB
+  (1 GiB = 2^30 bytes), default 50. A segment shared with an older entry is not charged to the newer entry. A
   checkpoint that would exceed `budget - 1 GiB` first prunes unpinned ancestors beyond `--slot-archive-versions`,
   then evicts entries with a foreign fingerprint, then the least-recently-used unpinned entries. It never evicts a
   pinned entry; see `action=pin` below.
@@ -444,7 +451,7 @@ list; the response never contains token text or file paths.
     {"id": "a1b2c3d4e5f60718-0000000000000007-1058-9f3c2a1b4d5e6f70", "owner": 7,
      "n_tokens": 1058, "bytes": 77379688, "created_ms": 1795766400000,
      "last_used_ms": 1795766400000, "pinned": false, "reason": "divergence",
-     "fingerprint": "a1b2c3d4e5f60718"}
+     "fingerprint": "a1b2c3d4e5f60718", "format": 2}
   ]
 }
 ```
@@ -494,14 +501,21 @@ curl -s -X POST -H 'Content-Type: application/json' -d '{}' \
 - **Compaction.** A compacted prompt is a summary plus recent messages, generally not a prefix of the old
   conversation, so it still needs a full prefill. The pre-compact entry is for rollback and audit; the compacted
   prompt is prefilled once and checkpointed as a new lineage, and that entry is the fast resume afterwards.
-- **Restart.** The manifest and entries survive a restart, including each entry's `pinned` flag, and a continuation
-  restores from disk without the old process. A server stop only keeps states that were checkpointed earlier;
-  phase 1 has no shutdown checkpoint, so a conversation still resident in VRAM at `SIGTERM` is lost unless it was
-  checkpointed explicitly.
-- **Privacy.** An entry is a plaintext `STRATASLOT` file created `0600` in a directory created `0700`. It holds
-  the full token history (prompt, system prompt, tools and generated tokens) and the KV/recurrent state, not a
-  compressed transcript. Treat the directory as a copy of the conversations, keep it off any HTTP-served path,
-  and include it in (or deliberately exclude it from) backups and retention.
+- **Storage and dedup.** A format-2 entry references its ordered segment chain; deleting the entry unrefs those
+  segments, and a segment still referenced by another entry survives. `segments.json` and `segments/` are managed
+  by the server: do not edit them by hand. The budget counts a shared segment once; `bytes` for a new entry is its
+  state file plus the segments it actually created.
+- **Restart.** The manifest, `segments.json`, segment files and entries (including each `pinned` flag) survive a
+  restart, and a continuation restores from disk without the old process. A server stop only keeps states that were
+  checkpointed earlier; phase 2 still has no shutdown checkpoint, so a conversation resident in VRAM at `SIGTERM`
+  is lost unless it was checkpointed explicitly. A lost `manifest.json` can rebuild v1 `.slot` entries only; v2
+  entries are not reconstructible from the segment files alone.
+- **Privacy.** An entry is plaintext: a `STRSTATE` file plus `STRKVSEG` segment files (or a v1 `STRATASLOT` file),
+  all created `0600` in a directory created `0700`. It holds the full token history (prompt, system prompt, tools
+  and generated tokens) and the KV/recurrent state, not a compressed transcript. Segments are shared globally
+  inside the archive directory while entries remain owner-scoped; another key cannot restore an entry it does not
+  own. Treat the directory as a copy of the conversations, keep it off any HTTP-served path, and include it in (or
+  deliberately exclude it from) backups and retention.
 
 Without `--slot-archive-dir`, the archive routes answer `501` and the server behaves exactly as before.
 
