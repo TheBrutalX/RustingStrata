@@ -447,7 +447,7 @@ save/restore/erase call the `GpuModel` methods directly. `GET /slots` reports th
 
 ### Regression
 
-- 175 lib tests;
+- 179 lib tests;
 - `prefill_matches_reference`;
 - `unified_kv_budget_grows_one_slot`;
 - the E2E script's 21 `full` checks, 21 restart/busy/unified checks and the `501` check.
