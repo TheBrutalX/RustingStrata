@@ -7,6 +7,7 @@ use crate::cpu_worker::TMAX;
 use crate::backend::{BATCHED, Backend, Buf, GEMM_BM, SAME_X};
 use crate::expert_cache::MATS;
 use crate::model::Model;
+use rayon::prelude::*;
 use crate::weights::Prefetch;
 
 /// Experts staged per group when a layer routes to experts outside the cache. Staging holds three groups.
@@ -370,13 +371,32 @@ impl GpuModel<'_> {
         self.dflash_commit_ctx()?;
         // Missed experts are read from the mapped weights in the order the staging copies take them.
         let pre = self.cache.is_some().then(Prefetch::start);
-        let owned: (Vec<f32>, Vec<f32>);
+        let mut owned: (Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new());
         let (emb, pe): (&[f32], &[f32]) = match input {
             Some(v) => v,
             None => {
                 let hcn = self.m.cfg.hc_n.max(1);
                 let pe = if self.ple_ring.is_some() { toks.iter().flat_map(|&tk| self.m.ple_embed(&mut self.ple_prev, tk)).collect() } else { vec![] };
-                owned = (toks.iter().flat_map(|&tk| self.m.embed(tk).repeat(hcn)).collect(), pe);
+                let ne = self.m.cfg.n_embd;
+                let mut emb = vec![0f32; toks.len() * hcn * ne];
+                // The token rows dequantize independently: spread them over the rayon pool. At 8k tokens this is
+                // ~75 ms on one thread, and it runs while the previous chunk's kernels are still in flight.
+                if hcn == 1 && pe.is_empty() {
+                    let w = self.m.w.get("token_embd.weight")?;
+                    let nv = self.m.cfg.n_vocab;
+                    emb.par_chunks_mut(ne).zip(toks.par_iter()).for_each(|(dst, &tk)| {
+                        w.row((tk as usize).min(nv.saturating_sub(1)), dst);
+                    });
+                } else {
+                    for (i, &tk) in toks.iter().enumerate() {
+                        let e = self.m.embed(tk);
+                        for r in 0..hcn {
+                            let o = (i * hcn + r) * ne;
+                            emb[o..o + ne].copy_from_slice(&e);
+                        }
+                    }
+                }
+                owned = (emb, pe);
                 (&owned.0, &owned.1)
             }
         };
@@ -436,8 +456,14 @@ impl GpuModel<'_> {
                 if skip == 0 { g.dtod(&self.x, 0, &pf.slab, 4 * l.h, 4 * ne)?; }
                 g.dtod(&pf.slab, 0, &pf.slab, 4 * (l.h + (1 - skip) * ne), 4 * (t - 1) * ne)?;
                 g.dtod(&pf.slab, 4 * (t - 1) * ne, &self.x, 0, 4 * ne)?;
-                let emb: Vec<f32> = toks[skip..].iter().flat_map(|&tk| self.m.embed(tk)).collect();
-                g.put(&emb, &pf.slab, 0)?;
+                // The chunk's token rows are already dequantized above (hcn == 1 here): reuse them for the draft
+                // layer instead of a second serial pass over the token embedding table.
+                if input.is_none() && !owned.0.is_empty() && c.hc_n == 0 {
+                    g.put(&owned.0[skip * ne..], &pf.slab, 0)?;
+                } else {
+                    let emb: Vec<f32> = toks[skip..].iter().flat_map(|&tk| self.m.embed(tk)).collect();
+                    g.put(&emb, &pf.slab, 0)?;
+                }
                 t -= skip;
                 g.rms_norm(x, ne, mh.enorm.ptr, at(l.a), 2 * ne, ne, t, eps)?;
                 g.rms_norm(h, ne, mh.hnorm.ptr, at(l.a + ne), 2 * ne, ne, t, eps)?;
