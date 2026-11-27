@@ -10,15 +10,18 @@
 //! the budget. Owner is the conversation owner (`GpuModel::slot_owner`), not the request that triggered a
 //! checkpoint.
 
-use crate::gpu_model::GpuModel;
+use crate::gpu_model::{GpuModel, SegmentSink, SegmentSource};
 use crate::slot_segments::{self, SegmentStore};
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// File name of the compacted manifest inside [`ArchiveConfig::dir`].
@@ -53,6 +56,18 @@ const STATE_V1_HEADER_LEN: u64 = 8 + 4 + 8 + 8 + 4 + 4;
 const STATE_HEADER_LEN: u64 = STATE_V1_HEADER_LEN + 4;
 /// Wire length of one ordered segment reference: 16-byte id, start u64, end u64.
 const STATE_SEGMENT_REF_LEN: u64 = 16 + 8 + 8;
+/// Depth of the segmented-restore reader channel: at most this many validated payloads are staged (see
+/// docs/SLOT-ARCHIVE-PHASE2.md §6).
+const RESTORE_RING: usize = 4;
+/// Granularity of one read call into a segment or state payload; a payload itself may be larger (the fixed
+/// recurrent snapshot is about 64 MiB on the 35B test model).
+const RESTORE_CHUNK: usize = 64 << 20;
+/// `STRATSEG` v1 fixed header/footer lengths. Kept local to the restore reader: the format is validated here without
+/// taking the archive/segment-store lock (see `slot_segments` for the authoritative writer).
+const SEGMENT_HEADER_LEN: u64 = 40;
+const SEGMENT_FOOTER_LEN: u64 = 16;
+/// Longest accepted `STRATSEG` parent id, mirroring `slot_segments`.
+const SEGMENT_MAX_PARENT_LEN: usize = 4096;
 /// Sanity bound on the token list in a `STRSTATE` file (16M ids, 64 MiB), far above any `--ctx`.
 const MAX_STATE_TOKENS: usize = 1 << 24;
 /// Sanity bound on the segment-ref list (1M refs, 32 MiB). Real 1024-token histories use far fewer.
@@ -207,6 +222,450 @@ impl Drop for Lease {
             table.remove(&self.id);
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Asynchronous segmented restore: plan under a short lock, read on a worker, install on the model thread
+// ---------------------------------------------------------------------------------------------------------
+
+/// One ordered KV segment of a [`SegmentedRestorePlan`].
+#[derive(Clone, Debug)]
+pub struct SegmentedRestoreSegment {
+    /// Content-addressed segment id (also used to validate the parent chain).
+    pub id: String,
+    /// First token position covered by this segment.
+    pub start: usize,
+    /// One past the last token position covered by this segment.
+    pub end: usize,
+    /// Absolute path of the `STRATSEG` file.
+    pub path: PathBuf,
+}
+
+/// Everything a v2 restore needs to address the state file and the segment files, captured under a short archive
+/// lock. It contains no payload bytes: the reader thread opens and validates the files.
+#[derive(Clone, Debug)]
+pub struct SegmentedRestorePlan {
+    pub entry_id: String,
+    pub owner: u64,
+    pub fingerprint: u64,
+    /// Exact token history, from the `STRSTATE` header; also the install length.
+    pub tokens: Vec<u32>,
+    pub rope_offset: i32,
+    /// The `STRSTATE` file (token list plus the `STRRSEG` recurrent payload).
+    pub state_path: PathBuf,
+    /// Ordered KV segments, a contiguous cover of `[0, tokens.len())`.
+    pub segments: Vec<SegmentedRestoreSegment>,
+}
+
+/// One message from the restore reader thread. Payloads are complete validated `STRKVSEG`/`STRRSEG` streams; the
+/// bounded channel is what limits how many are staged ahead of the model thread.
+enum RestoreMsg {
+    Segment { start: usize, end: usize, payload: Vec<u8> },
+    State { payload: Vec<u8> },
+}
+
+/// The model-side end of the bounded restore channel: a [`SegmentSource`] over validated payloads.
+///
+/// The reader sends exactly the plan's segments in order, then the recurrent state. No archive lock is involved here,
+/// and dropping this source aborts the reader (its next send fails) without leaving a temp file or partial entry.
+pub struct ChannelSegmentSource {
+    rx: Receiver<Result<RestoreMsg>>,
+    expected_segments: usize,
+    segments_seen: usize,
+    state_seen: bool,
+    error: Option<String>,
+}
+
+impl ChannelSegmentSource {
+    fn recv(&mut self, what: &str) -> Result<RestoreMsg> {
+        if let Some(error) = &self.error {
+            bail!("segmented restore reader failed: {error}");
+        }
+        match self.rx.recv() {
+            Ok(Ok(msg)) => Ok(msg),
+            Ok(Err(err)) => {
+                let message = format!("{err:#}");
+                self.error = Some(message.clone());
+                bail!("segmented restore reader failed while sending {what}: {message}");
+            }
+            Err(_) => {
+                let message = format!("segmented restore reader ended before {what}");
+                self.error = Some(message.clone());
+                bail!("{message}");
+            }
+        }
+    }
+}
+
+impl SegmentSource for ChannelSegmentSource {
+    fn next(&mut self) -> Result<Option<(usize, usize, Vec<u8>)>> {
+        if self.segments_seen >= self.expected_segments {
+            return Ok(None);
+        }
+        match self.recv("a KV segment")? {
+            RestoreMsg::Segment { start, end, payload } => {
+                self.segments_seen += 1;
+                Ok(Some((start, end, payload)))
+            }
+            RestoreMsg::State { .. } => {
+                bail!(
+                    "segmented restore sent the recurrent state after {} of {} KV segments",
+                    self.segments_seen,
+                    self.expected_segments
+                )
+            }
+        }
+    }
+
+    fn state(&mut self) -> Result<Vec<u8>> {
+        if self.state_seen {
+            bail!("segmented restore requested the recurrent state twice");
+        }
+        if self.segments_seen != self.expected_segments {
+            bail!(
+                "segmented restore requested the recurrent state after {} of {} KV segments",
+                self.segments_seen,
+                self.expected_segments
+            );
+        }
+        match self.recv("the recurrent state")? {
+            RestoreMsg::State { payload } => {
+                self.state_seen = true;
+                Ok(payload)
+            }
+            RestoreMsg::Segment { start, end, .. } => {
+                bail!("segmented restore sent an extra KV segment [{start}, {end}) after the plan")
+            }
+        }
+    }
+}
+
+/// Handle for an in-flight segmented restore reader. The entry lease (when any) is held here so the files cannot be
+/// deleted by `DELETE`/GC until the install has finished and the handle is joined or dropped.
+pub struct AsyncSegmentedRestore {
+    handle: Option<JoinHandle<Result<()>>>,
+    _lease: Option<Lease>,
+}
+
+impl AsyncSegmentedRestore {
+    /// Wait for the reader thread and expose any read/validation error it hit. Call this after the source has been
+    /// consumed by [`GpuModel::restore_segmented_from`]; joining while the source still exists but is not consumed can
+    /// wait for the model thread to drain the bounded channel.
+    pub fn join(mut self) -> Result<()> {
+        let Some(handle) = self.handle.take() else {
+            bail!("segmented restore already joined");
+        };
+        match handle.join() {
+            Ok(result) => result,
+            Err(_) => bail!("segmented restore reader thread panicked"),
+        }
+    }
+}
+
+/// Build the immutable restore plan under a short archive lock, then spawn a reader thread that owns the file
+/// handles. The model thread installs payloads from the returned [`ChannelSegmentSource`]; the archive mutex is not
+/// held during any disk read or host→GPU copy.
+pub fn start_async_segmented_restore(
+    archive: Arc<Mutex<Archive>>,
+    entry: ArchiveEntry,
+    lease: Option<Lease>,
+) -> Result<(ChannelSegmentSource, AsyncSegmentedRestore)> {
+    let plan = {
+        let guard = archive.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.segmented_restore_plan(&entry)?
+    };
+    let expected_segments = plan.segments.len();
+    let (tx, rx) = sync_channel::<Result<RestoreMsg>>(RESTORE_RING);
+    let handle = std::thread::Builder::new()
+        .name("slot-archive-restore".to_string())
+        .spawn(move || restore_reader_thread(plan, tx))
+        .context("spawning the segmented restore reader")?;
+    let source = ChannelSegmentSource {
+        rx,
+        expected_segments,
+        segments_seen: 0,
+        state_seen: false,
+        error: None,
+    };
+    Ok((source, AsyncSegmentedRestore { handle: Some(handle), _lease: lease }))
+}
+
+/// The reader thread body. A read/validation error is sent through the channel (so the model thread sees it at the
+/// point it expected data) and returned so [`AsyncSegmentedRestore::join`] reports it too. A dropped receiver is a
+/// clean abort: no error is surfaced and the thread exits without touching the archive.
+fn restore_reader_thread(plan: SegmentedRestorePlan, tx: SyncSender<Result<RestoreMsg>>) -> Result<()> {
+    match read_restore_stream(&plan, &tx) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if send_restore(&tx, Err(anyhow!("{err:#}"))) {
+                Err(err)
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Open and validate every segment file and the state file in plan order, sending one payload per message. Returns
+/// `Ok(())` when the whole stream was sent; a send failure (receiver dropped) also ends cleanly.
+fn read_restore_stream(
+    plan: &SegmentedRestorePlan,
+    tx: &SyncSender<Result<RestoreMsg>>,
+) -> Result<()> {
+    let mut parent: Option<String> = None;
+    for segment in &plan.segments {
+        let expected_tokens = &plan.tokens[segment.start..segment.end];
+        let payload = read_segment_payload(
+            &segment.path,
+            plan.fingerprint,
+            parent.as_deref(),
+            expected_tokens,
+            &segment.id,
+        )
+        .with_context(|| {
+            format!("reading segment {} at [{}, {}) of {}", segment.id, segment.start, segment.end, plan.entry_id)
+        })?;
+        if !send_restore(
+            tx,
+            Ok(RestoreMsg::Segment { start: segment.start, end: segment.end, payload }),
+        ) {
+            return Ok(());
+        }
+        parent = Some(segment.id.clone());
+    }
+
+    let (header, state_segments, tokens, payload) = read_state_file(&plan.state_path)
+        .with_context(|| format!("reading the state file of {}", plan.entry_id))?;
+    if header.fingerprint != plan.fingerprint {
+        bail!(
+            "state file fingerprint {:016x} does not match the plan {:016x}",
+            header.fingerprint,
+            plan.fingerprint
+        );
+    }
+    if header.owner != plan.owner {
+        bail!("state file owner {} does not match the plan {}", header.owner, plan.owner);
+    }
+    if header.rope_offset != plan.rope_offset {
+        bail!(
+            "state file rope offset {} does not match the plan {}",
+            header.rope_offset,
+            plan.rope_offset
+        );
+    }
+    if header.n_tokens != plan.tokens.len() || tokens != plan.tokens {
+        bail!(
+            "state file token history ({} tokens) does not match the plan ({} tokens)",
+            tokens.len(),
+            plan.tokens.len()
+        );
+    }
+    // A legacy v1 state file has no refs and relies on the manifest row; the plan already validated that row.
+    if !state_segments.is_empty() {
+        if state_segments.len() != plan.segments.len() {
+            bail!(
+                "state file has {} segment refs, the plan has {}",
+                state_segments.len(),
+                plan.segments.len()
+            );
+        }
+        for (found, planned) in state_segments.iter().zip(&plan.segments) {
+            if found.id != planned.id || found.start != planned.start || found.end != planned.end {
+                bail!("state file segment {:?} does not match the plan", found.id);
+            }
+        }
+    }
+    if !send_restore(tx, Ok(RestoreMsg::State { payload })) {
+        return Ok(());
+    }
+    Ok(())
+}
+
+fn send_restore(tx: &SyncSender<Result<RestoreMsg>>, msg: Result<RestoreMsg>) -> bool {
+    tx.send(msg).is_ok()
+}
+
+/// Read a segment payload on the reader thread, validating the complete `STRATSEG` v1 framing (magic, version, flags,
+/// length, parent, token range, content-addressed id and footer). This mirrors the writer in `slot_segments` and never
+/// takes the segment-store lock.
+fn read_segment_payload(
+    path: &Path,
+    fingerprint: u64,
+    parent: Option<&str>,
+    tokens: &[u32],
+    id: &str,
+) -> Result<Vec<u8>> {
+    let file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let meta = file.metadata().with_context(|| format!("stat {}", path.display()))?;
+    ensure_regular(&meta, path)?;
+
+    let mut r = BufReader::new(file);
+    let mut magic = [0u8; 8];
+    r.read_exact(&mut magic).with_context(|| format!("reading the segment magic of {}", path.display()))?;
+    if magic != slot_segments::MAGIC {
+        bail!("bad segment magic {magic:02x?} in {}", path.display());
+    }
+    let version = crate::slot_file::read_u32(&mut r).context("reading the segment version")?;
+    if version != slot_segments::VERSION {
+        bail!("unsupported segment version {version} in {}", path.display());
+    }
+    let flags = crate::slot_file::read_u32(&mut r).context("reading the segment flags")?;
+    if flags != 0 {
+        bail!("unknown segment flags {flags:#x} in {}", path.display());
+    }
+    let stored_fingerprint = crate::slot_file::read_u64(&mut r).context("reading the segment fingerprint")?;
+    if stored_fingerprint != fingerprint {
+        bail!(
+            "segment {} fingerprint {:016x} does not match the plan {:016x}",
+            path.display(),
+            stored_fingerprint,
+            fingerprint
+        );
+    }
+    let n_tokens = crate::slot_file::read_u32(&mut r)? as usize;
+    if n_tokens == 0 || n_tokens > slot_segments::MAX_TOKENS {
+        bail!("segment {} has {n_tokens} tokens, outside 1..={}", path.display(), slot_segments::MAX_TOKENS);
+    }
+    let parent_len = crate::slot_file::read_u32(&mut r)? as usize;
+    if parent_len > SEGMENT_MAX_PARENT_LEN {
+        bail!(
+            "segment {} parent id is {parent_len} bytes, the limit is {SEGMENT_MAX_PARENT_LEN}",
+            path.display()
+        );
+    }
+    let payload_len = crate::slot_file::read_u64(&mut r).context("reading the segment payload length")?;
+    if payload_len == 0 || payload_len > slot_segments::MAX_PAYLOAD_BYTES as u64 {
+        bail!(
+            "segment {} has a {payload_len}-byte payload, outside 1..={}",
+            path.display(),
+            slot_segments::MAX_PAYLOAD_BYTES
+        );
+    }
+    let total = SEGMENT_HEADER_LEN
+        .checked_add(parent_len as u64)
+        .and_then(|n| n.checked_add(4 * n_tokens as u64))
+        .and_then(|n| n.checked_add(payload_len))
+        .and_then(|n| n.checked_add(SEGMENT_FOOTER_LEN))
+        .context("segment length overflow")?;
+    if meta.len() != total {
+        bail!("segment file {} is {} bytes, the header describes {total}", path.display(), meta.len());
+    }
+
+    let stored_parent = if parent_len == 0 {
+        None
+    } else {
+        let mut buf = vec![0u8; parent_len];
+        r.read_exact(&mut buf).context("reading the segment parent id")?;
+        let parent = String::from_utf8(buf).context("segment parent id is not UTF-8")?;
+        if !valid_segment_id(&parent) {
+            bail!("invalid parent segment id {parent:?} in {}", path.display());
+        }
+        Some(parent)
+    };
+    if stored_parent.as_deref() != parent {
+        bail!(
+            "segment {} parent {:?} does not match the planned {:?}",
+            path.display(),
+            stored_parent,
+            parent
+        );
+    }
+    let mut saved_tokens = Vec::with_capacity(n_tokens);
+    for index in 0..n_tokens {
+        saved_tokens
+            .push(crate::slot_file::read_u32(&mut r).with_context(|| {
+                format!("reading segment token {index} of {n_tokens} from {}", path.display())
+            })?);
+    }
+    if saved_tokens != tokens {
+        bail!("segment {} does not contain the planned token range", path.display());
+    }
+    let computed = slot_segments::segment_id(fingerprint, parent, tokens);
+    if computed != id {
+        bail!("segment {} contains segment {computed}, not {id}", path.display());
+    }
+
+    let payload = read_chunked(&mut r, payload_len, path)?;
+    let mut footer = [0u8; SEGMENT_FOOTER_LEN as usize];
+    r.read_exact(&mut footer).with_context(|| format!("reading the footer of {}", path.display()))?;
+    let mut footer_magic = [0u8; 8];
+    footer_magic.copy_from_slice(&footer[..8]);
+    if footer_magic != slot_segments::FOOTER_MAGIC {
+        bail!("bad segment footer magic {footer_magic:02x?} in {}", path.display());
+    }
+    let stored = u64::from_le_bytes(footer[8..16].try_into().expect("8 bytes"));
+    let expected = total - SEGMENT_FOOTER_LEN;
+    if stored != expected {
+        bail!(
+            "segment {} footer length {stored} does not match the {expected} bytes before it",
+            path.display()
+        );
+    }
+    Ok(payload)
+}
+
+/// Read exactly `len` bytes, in at most [`RESTORE_CHUNK`]-sized calls. The full payload is assembled for the model
+/// thread; the bounded channel limits how many assembled payloads are staged.
+fn read_chunked<R: Read>(r: &mut R, len: u64, path: &Path) -> Result<Vec<u8>> {
+    let len = usize::try_from(len).context("segment payload does not fit in memory")?;
+    let mut out = vec![0u8; len];
+    let mut done = 0usize;
+    while done < len {
+        let n = (len - done).min(RESTORE_CHUNK);
+        r.read_exact(&mut out[done..done + n])
+            .with_context(|| format!("reading {} bytes of {}", n, path.display()))?;
+        done += n;
+    }
+    Ok(out)
+}
+
+/// A v2 segmented save in progress, created by [`Archive::begin_segmented`].
+///
+/// The phases are split so a writer thread can perform the disk work while the model thread only copies payloads:
+///
+/// 1. [`Archive::begin_segmented`] validates the history, resolves the entry id and (when the same content is
+///    already archived) touches the reusable entry.
+/// 2. [`Archive::put_segment`] stores each 1024-token KV segment and takes its reference.
+/// 3. [`Archive::put_state`] writes the `STRSTATE` file with the ordered refs and the recurrent snapshot.
+/// 4. [`Archive::finish_segmented`] applies the budget/lineage policy and commits the manifest row.
+///
+/// The type deliberately holds no GPU or file handle: it is the archive-side state of one save. Dropping an
+/// unfinished save does not clean up by itself (there is no archive borrow in `Drop`); call
+/// [`Archive::abort_segmented`], which releases the refs taken so far and removes the state file. Both
+/// [`Archive::save_segmented`] and the async writer do this on every error.
+pub struct SegmentedSave {
+    id: String,
+    tokens: Vec<u32>,
+    owner: u64,
+    fingerprint: u64,
+    prefix_hash: u64,
+    rope_offset: i32,
+    reason: String,
+    refs: Vec<SegmentRef>,
+    /// Segment ids this save took a reference on, released by `abort_segmented`.
+    taken: Vec<String>,
+    /// Bytes of segment files this save created (existing segments are shared, not charged again).
+    new_bytes: u64,
+    /// The last segment id, the parent of the next `put_segment`.
+    parent: Option<String>,
+    /// Tokens covered by `put_segment` so far; also proves the chain is contiguous.
+    next_start: usize,
+    /// Same content already archived: the save only touches that entry and does no file writes.
+    reusable: Option<ArchiveEntry>,
+    state_path: Option<PathBuf>,
+    finished: bool,
+    aborted: bool,
+}
+
+impl SegmentedSave {
+    /// The stable content id this save will use (also the id of a reusable entry).
+    pub fn id(&self) -> &str { &self.id }
+    /// Number of tokens in the full history.
+    pub fn n_tokens(&self) -> usize { self.tokens.len() }
+    /// Whether [`Archive::begin_segmented`] found a complete, reusable entry (the save becomes a touch).
+    pub fn is_reusable(&self) -> bool { self.reusable.is_some() }
+    /// The last segment id, which is the parent of the next segment.
+    pub fn parent(&self) -> Option<&str> { self.parent.as_deref() }
 }
 
 impl Archive {
@@ -656,6 +1115,344 @@ impl Archive {
         Ok(())
     }
 
+    /// Start a v2 segmented save for `tokens` and return its phase state.
+    ///
+    /// This is the first half of [`Archive::save_segmented`] split out for a writer thread. It validates the history
+    /// (non-empty and at least `min_tokens`), resolves the content id and, when a complete v2 entry with the same
+    /// tokens already exists, touches it and marks the save reusable: the caller may then call
+    /// [`Archive::finish_segmented`] directly and skip the segment/state writes. A stale or v1 row with the same id is
+    /// removed; a leased entry is refused instead of replaced.
+    ///
+    /// The returned state holds no file handle and no GPU state. On failure before this returns, nothing is left
+    /// behind.
+    pub fn begin_segmented(
+        &mut self,
+        tokens: &[u32],
+        owner: u64,
+        fingerprint: u64,
+        rope_offset: i32,
+        reason: &str,
+    ) -> Result<SegmentedSave> {
+        if tokens.is_empty() {
+            bail!("slot archive: a segmented save has no token history");
+        }
+        if tokens.len() < self.cfg.min_tokens {
+            bail!(
+                "slot archive: history of {} tokens is below the min_tokens limit {}",
+                tokens.len(),
+                self.cfg.min_tokens
+            );
+        }
+        let prefix_hash = prefix_hash(tokens);
+        let id = id_for(fingerprint, owner, tokens.len(), prefix_hash);
+        let mut save = SegmentedSave {
+            id: id.clone(),
+            tokens: tokens.to_vec(),
+            owner,
+            fingerprint,
+            prefix_hash,
+            rope_offset,
+            reason: reason.to_string(),
+            refs: Vec::new(),
+            taken: Vec::new(),
+            new_bytes: 0,
+            parent: None,
+            next_start: 0,
+            reusable: None,
+            state_path: None,
+            finished: false,
+            aborted: false,
+        };
+
+        // Same content is already archived: touch it. Only a complete v2 entry counts; a stale or v1 row with the
+        // same id is removed and replaced (a lease blocks the replacement, never the touch of a live v2 entry).
+        if let Some(existing) = self.entries.get(&id).cloned() {
+            let reusable = existing.format == 2
+                && existing.n_tokens == tokens.len()
+                && self.entry_data_present(&existing)
+                && existing.state_file.as_deref().is_some_and(|path| {
+                    read_state_header(path).is_ok_and(|(header, saved)| {
+                        header.fingerprint == fingerprint
+                            && header.owner == owner
+                            && header.n_tokens == tokens.len()
+                            && saved == tokens
+                    })
+                });
+            if reusable {
+                self.touch(&id);
+                save.reusable = Some(
+                    self.entries
+                        .get(&id)
+                        .cloned()
+                        .context("slot archive entry disappeared while touching it")?,
+                );
+                return Ok(save);
+            }
+            if self.leases(&id) > 0 {
+                bail!("slot archive: entry {id} is leased; cannot replace it with a segmented save");
+            }
+            self.delete(&id)?;
+        }
+        Ok(save)
+    }
+
+    /// Store one KV segment of an in-progress save.
+    ///
+    /// `parent` must be the id returned by the previous call (or `None` for the chain root) and `tokens` must be
+    /// the next contiguous slice of the save's full history. The id is content-addressed exactly as
+    /// [`SegmentStore::put`] computes it and is returned for the next call. A reusable save (same content already
+    /// archived) validates the chain but writes nothing.
+    ///
+    /// On any error the save is aborted: references taken so far are released and the state file, if already
+    /// written, is removed. Callers may still call [`Archive::abort_segmented`] (it is idempotent).
+    pub fn put_segment(
+        &mut self,
+        save: &mut SegmentedSave,
+        parent: Option<&str>,
+        tokens: &[u32],
+        payload: &[u8],
+    ) -> Result<String> {
+        if save.aborted || save.finished {
+            bail!("slot archive: segmented save {} is no longer accepting segments", save.id);
+        }
+        if tokens.is_empty() || tokens.len() > SEGMENT_TOKENS {
+            let err = anyhow::anyhow!(
+                "slot archive: a segment of {} tokens is outside [1, {SEGMENT_TOKENS}]",
+                tokens.len()
+            );
+            self.abort_segmented(save);
+            return Err(err);
+        }
+        if parent != save.parent.as_deref() {
+            let err = anyhow::anyhow!(
+                "slot archive: segment parent chain mismatch at token {}",
+                save.next_start
+            );
+            self.abort_segmented(save);
+            return Err(err);
+        }
+        let start = save.next_start;
+        let end = start + tokens.len();
+        if save.tokens.get(start..end) != Some(tokens) {
+            let err = anyhow::anyhow!(
+                "slot archive: segment [{start}, {end}) does not match the saved history"
+            );
+            self.abort_segmented(save);
+            return Err(err);
+        }
+
+        let expected_id = slot_segments::segment_id(save.fingerprint, parent, tokens);
+        let id = if save.reusable.is_some() {
+            // The entry already owns this exact chain; only keep the cursor moving.
+            expected_id
+        } else {
+            let existed = self.segments.contains(&expected_id);
+            let segment = match self.segments.put(save.fingerprint, parent, tokens, payload) {
+                Ok(segment) => segment,
+                Err(err) => {
+                    self.abort_segmented(save);
+                    return Err(err);
+                }
+            };
+            if segment.id != expected_id {
+                let err = anyhow::anyhow!(
+                    "slot archive: segment store returned id {}, expected {expected_id}",
+                    segment.id
+                );
+                self.abort_segmented(save);
+                return Err(err);
+            }
+            if !existed {
+                save.new_bytes = save.new_bytes.saturating_add(segment.bytes);
+            }
+            save.taken.push(segment.id.clone());
+            save.refs.push(SegmentRef { id: segment.id.clone(), start, end });
+            segment.id
+        };
+        save.parent = Some(id.clone());
+        save.next_start = end;
+        Ok(id)
+    }
+
+    /// Write the per-entry `STRSTATE` file for an in-progress save.
+    ///
+    /// `tokens` must be the full history passed to [`Archive::begin_segmented`], and every segment must already have
+    /// been put. The file is written temp + fsync + rename with the current segment refs. A reusable save writes
+    /// nothing.
+    pub fn put_state(
+        &mut self,
+        save: &mut SegmentedSave,
+        tokens: &[u32],
+        payload: &[u8],
+    ) -> Result<()> {
+        if save.aborted || save.finished {
+            bail!("slot archive: segmented save {} is no longer accepting state", save.id);
+        }
+        if tokens != save.tokens.as_slice() {
+            let err = anyhow::anyhow!(
+                "slot archive: state token list does not match the segmented save"
+            );
+            self.abort_segmented(save);
+            return Err(err);
+        }
+        if save.next_start != save.tokens.len() {
+            let err = anyhow::anyhow!(
+                "slot archive: state written after {} of {} tokens of segments",
+                save.next_start,
+                save.tokens.len()
+            );
+            self.abort_segmented(save);
+            return Err(err);
+        }
+        if save.reusable.is_some() {
+            return Ok(());
+        }
+        if save.state_path.is_some() {
+            let err = anyhow::anyhow!("slot archive: segmented save {} wrote its state twice", save.id);
+            self.abort_segmented(save);
+            return Err(err);
+        }
+        let path = match state_path(&self.cfg.dir, &save.id) {
+            Ok(path) => path,
+            Err(err) => {
+                self.abort_segmented(save);
+                return Err(err);
+            }
+        };
+        let header = StateHeader {
+            fingerprint: save.fingerprint,
+            owner: save.owner,
+            rope_offset: save.rope_offset,
+            n_tokens: tokens.len(),
+        };
+        if let Err(err) =
+            write_state_file_atomic(&path, &header, &save.refs, &save.tokens, payload)
+        {
+            self.abort_segmented(save);
+            return Err(err);
+        }
+        save.state_path = Some(path);
+        Ok(())
+    }
+
+    /// Apply the budget/lineage policy and commit the manifest row for an in-progress save.
+    ///
+    /// For a reusable save this only returns the touched entry. Otherwise the state file must have been written by
+    /// [`Archive::put_state`]; its bytes plus the new segment bytes are the entry's charge. On any error the state
+    /// file and the references taken by this save are removed, so no entry is left and no segment stays referenced.
+    pub fn finish_segmented(&mut self, save: &mut SegmentedSave) -> Result<ArchiveEntry> {
+        if save.aborted {
+            bail!("slot archive: segmented save {} was aborted", save.id);
+        }
+        if save.finished {
+            bail!("slot archive: segmented save {} was already finished", save.id);
+        }
+        if let Some(entry) = save.reusable.take() {
+            save.finished = true;
+            return self
+                .entries
+                .get(&entry.id)
+                .cloned()
+                .context("slot archive entry disappeared before the save finished");
+        }
+        let state_path = match save.state_path.clone() {
+            Some(path) => path,
+            None => {
+                let err = anyhow::anyhow!(
+                    "slot archive: segmented save {} finished before its state file was written",
+                    save.id
+                );
+                self.abort_segmented(save);
+                return Err(err);
+            }
+        };
+        if save.next_start != save.tokens.len() {
+            let err = anyhow::anyhow!(
+                "slot archive: segmented save {} covers {} of {} tokens",
+                save.id,
+                save.next_start,
+                save.tokens.len()
+            );
+            self.abort_segmented(save);
+            return Err(err);
+        }
+        let bytes = match fs::metadata(&state_path) {
+            Ok(meta) if meta.is_file() => meta.len().saturating_add(save.new_bytes),
+            Ok(_) => {
+                let err = anyhow::anyhow!(
+                    "slot archive: {} is not a regular file",
+                    state_path.display()
+                );
+                self.abort_segmented(save);
+                return Err(err);
+            }
+            Err(err) => {
+                self.abort_segmented(save);
+                return Err(err).with_context(|| format!("stat {}", state_path.display()));
+            }
+        };
+
+        if let Err(err) =
+            self.reserve_budget(&save.id, save.owner, bytes, save.fingerprint)
+        {
+            self.abort_segmented(save);
+            return Err(err);
+        }
+
+        // Lineage is computed after budget enforcement, so it never points at an entry evicted above.
+        let parent_entry = self
+            .longest_prefix(save.owner, &save.tokens, save.fingerprint)
+            .filter(|e| e.n_tokens < save.tokens.len() && e.id != save.id)
+            .map(|e| e.id);
+        let now = now_ms();
+        let entry = ArchiveEntry {
+            id: save.id.clone(),
+            file: state_path.clone(),
+            state_file: Some(state_path.clone()),
+            segments: save.refs.clone(),
+            bytes,
+            n_tokens: save.tokens.len(),
+            owner: save.owner,
+            fingerprint: save.fingerprint,
+            prefix_hash: save.prefix_hash,
+            created_ms: now,
+            last_used_ms: now,
+            parent: parent_entry,
+            pinned: false,
+            reason: save.reason.clone(),
+            format: 2,
+        };
+        self.entries.insert(save.id.clone(), entry.clone());
+        let record = JournalOp::Add { v: JOURNAL_VERSION, entry: self.manifest_row(&entry) };
+        if let Err(err) = self.append_journal(&record) {
+            self.entries.remove(&save.id);
+            self.abort_segmented(save);
+            return Err(err);
+        }
+        self.maybe_compact();
+        save.finished = true;
+        save.taken.clear();
+        save.state_path = None;
+        Ok(entry)
+    }
+
+    /// Abort an in-progress save: remove the state file, if written, and release every segment reference taken.
+    ///
+    /// Idempotent and harmless after a completed save. A reusable save (a touch of an existing entry) leaves the
+    /// existing entry untouched.
+    pub fn abort_segmented(&mut self, save: &mut SegmentedSave) {
+        if save.finished || save.aborted {
+            return;
+        }
+        save.aborted = true;
+        if let Some(path) = save.state_path.take() {
+            let _ = fs::remove_file(path);
+        }
+        let taken = std::mem::take(&mut save.taken);
+        save.refs.clear();
+        self.release_segments(&taken);
+    }
+
     /// Save the idle slot `slot` as a v2 segmented entry: `SEGMENT_TOKENS`-sized content-addressed KV segments plus
     /// one `STRSTATE` file holding the token list and the recurrent snapshot.
     ///
@@ -663,8 +1460,11 @@ impl Archive {
     /// responsible for the slot being idle and for holding whatever lock keeps it so; this method only validates the
     /// history (`pos == history.len()`, non-empty). The same content already archived is touched, not rewritten.
     ///
-    /// On failure every reference taken by this call is released and the state file is removed. Segment bytes are
-    /// counted per new file only; an entry that shares segments with an older entry does not pay for them again.
+    /// This is the synchronous composition of [`Archive::begin_segmented`], [`Archive::put_segment`],
+    /// [`Archive::put_state`] and [`Archive::finish_segmented`], so the bytes, manifest row and refcounts are the
+    /// same as `save_segmented_to` with a collecting sink. On failure every reference taken by this call is released
+    /// and the state file is removed. Segment bytes are counted per new file only; an entry that shares segments
+    /// with an older entry does not pay for them again.
     pub fn save_segmented(
         &mut self,
         g: &mut GpuModel<'_>,
@@ -686,162 +1486,143 @@ impl Archive {
                 tokens.len()
             );
         }
-        if tokens.len() < self.cfg.min_tokens {
-            bail!(
-                "slot archive: history of {} tokens is below the min_tokens limit {}",
-                tokens.len(),
-                self.cfg.min_tokens
-            );
-        }
         let fingerprint = g.slot_fingerprint();
-        let prefix_hash = prefix_hash(&tokens);
-        let id = id_for(fingerprint, owner, tokens.len(), prefix_hash);
-
-        // Same content is already archived: touch it. Only a complete v2 entry counts; a stale or v1 row with the
-        // same id is removed and replaced (a lease blocks the replacement, never the touch of a live v2 entry).
-        if let Some(existing) = self.entries.get(&id).cloned() {
-            let reusable = existing.format == 2
-                && existing.n_tokens == tokens.len()
-                && self.entry_data_present(&existing)
-                && existing.state_file.as_deref().is_some_and(|path| {
-                    read_state_header(path).is_ok_and(|(header, saved)| {
-                        header.fingerprint == fingerprint
-                            && header.owner == owner
-                            && header.n_tokens == tokens.len()
-                            && saved == tokens
-                    })
-                });
-            if reusable {
-                self.touch(&id);
-                return self
-                    .entries
-                    .get(&id)
-                    .cloned()
-                    .context("slot archive entry disappeared while touching it");
-            }
-            if self.leases(&id) > 0 {
-                bail!("slot archive: entry {id} is leased; cannot replace it with a segmented save");
-            }
-            self.delete(&id)?;
+        let rope_offset = g.slot_rope_offset(slot);
+        let mut save =
+            self.begin_segmented(&tokens, owner, fingerprint, rope_offset, reason)?;
+        if save.is_reusable() {
+            return self.finish_segmented(&mut save);
         }
 
-        // Write the segments first: a crash leaves only orphan segment files, never an entry whose segments are
-        // missing. Track every segment this entry takes a reference on so a later failure can release it again.
-        let mut refs = Vec::new();
-        let mut taken: Vec<String> = Vec::new();
-        let mut new_bytes = 0u64;
-        let mut parent: Option<String> = None;
-        let mut write_segments = || -> Result<()> {
+        let written = (|| -> Result<()> {
+            let mut parent = save.parent().map(str::to_string);
             for (index, chunk) in tokens.chunks(SEGMENT_TOKENS).enumerate() {
                 let start = index * SEGMENT_TOKENS;
                 let end = start + chunk.len();
-                let segment_id = slot_segments::segment_id(fingerprint, parent.as_deref(), chunk);
-                let existed = self.segments.contains(&segment_id);
                 let mut payload = Vec::new();
                 g.save_kv_segment(slot, start, end, &mut payload)?;
-                let segment = self.segments.put(fingerprint, parent.as_deref(), chunk, &payload)?;
-                if segment.id != segment_id {
-                    bail!(
-                        "slot archive: segment store returned id {}, expected {segment_id}",
-                        segment.id
-                    );
-                }
-                if !existed {
-                    new_bytes = new_bytes.saturating_add(segment.bytes);
-                }
-                taken.push(segment.id.clone());
-                refs.push(SegmentRef { id: segment.id.clone(), start, end });
-                parent = Some(segment.id);
+                parent = Some(self.put_segment(&mut save, parent.as_deref(), chunk, &payload)?);
             }
-            Ok(())
-        };
-        if let Err(err) = write_segments() {
-            self.release_segments(&taken);
-            return Err(err);
-        }
-
-        // The recurrent snapshot is the per-entry part; the token list and the header live in the same file.
-        let mut state_payload = Vec::new();
-        let state_written = (|| -> Result<PathBuf> {
+            // The recurrent snapshot is the per-entry part; the token list and the header live in the same file.
+            let mut state_payload = Vec::new();
             g.save_recurrent_to(slot, &mut state_payload)?;
-            let path = state_path(&self.cfg.dir, &id)?;
-            write_state_file_atomic(
-                &path,
-                &StateHeader {
-                    fingerprint,
-                    owner,
-                    rope_offset: g.slot_rope_offset(slot),
-                    n_tokens: tokens.len(),
-                },
-                &refs,
-                &tokens,
-                &state_payload,
-            )?;
-            Ok(path)
+            self.put_state(&mut save, &tokens, &state_payload)?;
+            Ok(())
         })();
-        let state_path = match state_written {
-            Ok(path) => path,
-            Err(err) => {
-                self.release_segments(&taken);
-                return Err(err);
-            }
-        };
-        let bytes = match fs::metadata(&state_path) {
-            Ok(meta) if meta.is_file() => meta.len().saturating_add(new_bytes),
-            Ok(_) => {
-                let _ = fs::remove_file(&state_path);
-                self.release_segments(&taken);
-                bail!("slot archive: {} is not a regular file", state_path.display());
-            }
-            Err(err) => {
-                let _ = fs::remove_file(&state_path);
-                self.release_segments(&taken);
-                return Err(err).with_context(|| format!("stat {}", state_path.display()));
-            }
-        };
-
-        if let Err(err) = self.reserve_budget(&id, owner, bytes, fingerprint) {
-            let _ = fs::remove_file(&state_path);
-            self.release_segments(&taken);
+        if let Err(err) = written {
+            self.abort_segmented(&mut save);
             return Err(err);
         }
 
-        // Lineage is computed after budget enforcement, so it never points at an entry evicted above.
-        let parent_entry = self
-            .longest_prefix(owner, &tokens, fingerprint)
-            .filter(|e| e.n_tokens < tokens.len() && e.id != id)
-            .map(|e| e.id);
-        let now = now_ms();
-        let entry = ArchiveEntry {
-            id: id.clone(),
-            file: state_path.clone(),
-            state_file: Some(state_path.clone()),
-            segments: refs,
-            bytes,
-            n_tokens: tokens.len(),
-            owner,
-            fingerprint,
-            prefix_hash,
-            created_ms: now,
-            last_used_ms: now,
-            parent: parent_entry,
-            pinned: false,
-            reason: reason.to_string(),
-            format: 2,
-        };
-        self.entries.insert(id.clone(), entry.clone());
-        let record = JournalOp::Add { v: JOURNAL_VERSION, entry: self.manifest_row(&entry) };
-        if let Err(err) = self.append_journal(&record) {
-            self.entries.remove(&id);
-            let _ = fs::remove_file(&state_path);
-            self.release_segments(&taken);
-            return Err(err);
-        }
-        self.maybe_compact();
+        let entry = self.finish_segmented(&mut save)?;
         // The slot is reusable at this history, exactly as after a v1 synchronous save (`save_state` cleared the
         // marker while writing the recurrent payload).
         g.mark_slot_saved(slot, &tokens, owner);
         Ok(entry)
+    }
+
+    /// Build the immutable addressing plan for a v2 restore under a short archive lock.
+    ///
+    /// This validates the entry and its `STRSTATE` header/token list/segment refs against the archive row, proves the
+    /// content-addressed segment chain, and resolves each segment id to its store path. It deliberately does not read
+    /// the recurrent payload or any segment payload: [`start_async_segmented_restore`] gives that work to a reader
+    /// thread so the archive mutex is never held across the disk reads or the model thread's host→GPU copies.
+    pub fn segmented_restore_plan(&self, entry: &ArchiveEntry) -> Result<SegmentedRestorePlan> {
+        if entry.format != 2 {
+            bail!(
+                "slot archive: entry {} is format {}, not a segmented (format 2) entry",
+                entry.id,
+                entry.format
+            );
+        }
+        if entry.n_tokens == 0 {
+            bail!("slot archive: entry {} has no tokens", entry.id);
+        }
+        let state_path = entry
+            .state_file
+            .as_deref()
+            .context("segmented entry has no state file")?
+            .to_path_buf();
+        let (header, state_segments, tokens) = read_state_manifest(&state_path)
+            .with_context(|| format!("validating the state file of entry {}", entry.id))?;
+        if header.fingerprint != entry.fingerprint {
+            bail!(
+                "slot archive: {} header fingerprint {:016x} does not match the entry {:016x}",
+                state_path.display(),
+                header.fingerprint,
+                entry.fingerprint
+            );
+        }
+        if header.owner != entry.owner {
+            bail!(
+                "slot archive: {} header owner {} does not match the entry owner {}",
+                state_path.display(),
+                header.owner,
+                entry.owner
+            );
+        }
+        if header.n_tokens != entry.n_tokens || tokens.len() != entry.n_tokens {
+            bail!(
+                "slot archive: {} has {} tokens, the entry has {}",
+                state_path.display(),
+                tokens.len(),
+                entry.n_tokens
+            );
+        }
+        // A v2 state file carries the ordered refs; a legacy v1 state file does not, so the manifest row is used.
+        if !state_segments.is_empty() && state_segments != entry.segments {
+            bail!(
+                "slot archive: {} segment refs do not match the manifest row",
+                state_path.display()
+            );
+        }
+        if !segments_cover(&entry.segments, entry.n_tokens) {
+            bail!(
+                "slot archive: entry {} segment ranges are not a contiguous cover of its history",
+                entry.id
+            );
+        }
+        validate_segment_chain(entry.fingerprint, &entry.segments, &tokens)
+            .with_context(|| format!("validating the segment chain of {}", entry.id))?;
+
+        let mut segments = Vec::with_capacity(entry.segments.len());
+        for segment in &entry.segments {
+            let row = self
+                .segments
+                .segment(&segment.id)
+                .with_context(|| format!("segment {} is missing from the store", segment.id))?;
+            if row.n_tokens != segment.end - segment.start {
+                bail!(
+                    "slot archive: segment {} has {} tokens, the entry range [{}, {}) needs {}",
+                    segment.id,
+                    row.n_tokens,
+                    segment.start,
+                    segment.end,
+                    segment.end - segment.start
+                );
+            }
+            let meta = fs::metadata(&row.file)
+                .with_context(|| format!("stat {}", row.file.display()))?;
+            if !meta.is_file() {
+                bail!("slot archive: segment {} is not a regular file", row.file.display());
+            }
+            segments.push(SegmentedRestoreSegment {
+                id: segment.id.clone(),
+                start: segment.start,
+                end: segment.end,
+                path: row.file.clone(),
+            });
+        }
+
+        Ok(SegmentedRestorePlan {
+            entry_id: entry.id.clone(),
+            owner: header.owner,
+            fingerprint: header.fingerprint,
+            tokens,
+            rope_offset: header.rope_offset,
+            state_path,
+            segments,
+        })
     }
 
     /// Restore a v2 entry into the idle slot `slot` and return the number of restored tokens.
@@ -1529,6 +2310,381 @@ impl Drop for Archive {
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// Async segmented saves
+// ---------------------------------------------------------------------------------------------------------
+//
+// The model thread performs the GPU copies and sends opaque payloads over a bounded channel. A writer thread owns
+// the archive: it takes the mutex only while one phase (begin/put/state/finish/abort) runs, never while the model
+// thread is copying the next chunk. The sink therefore never touches the archive mutex or the disk. One automatic
+// save at a time is assumed, as in the server design (docs/SLOT-ARCHIVE-PHASE2.md §5.3); two concurrent saves of the
+// same content would both take segment references for the same entry.
+
+/// Depth of the bounded model→writer channel: four payloads, so a slow disk stalls the model thread only after
+/// roughly four segments are staged, exactly like the v1 async save ring.
+const ASYNC_SEGMENT_RING: usize = 4;
+
+/// The writer's failure, shared with the sink so every later `put`/`state`/`finish` reports the original error.
+type SharedError = Arc<Mutex<Option<String>>>;
+
+fn set_shared_error(shared: &SharedError, err: &anyhow::Error) {
+    let mut slot = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot.is_none() {
+        *slot = Some(format!("{err:#}"));
+    }
+}
+
+fn shared_error(shared: &SharedError) -> Option<anyhow::Error> {
+    shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .map(|message| anyhow::anyhow!("{message}"))
+}
+
+/// One command from the model thread to the segmented archive writer.
+enum SaveCmd {
+    Begin {
+        tokens: Vec<u32>,
+        owner: u64,
+        fingerprint: u64,
+        rope_offset: i32,
+        reply: SyncSender<std::result::Result<(), String>>,
+    },
+    Segment {
+        parent: Option<String>,
+        tokens: Vec<u32>,
+        payload: Vec<u8>,
+    },
+    State {
+        tokens: Vec<u32>,
+        payload: Vec<u8>,
+    },
+    Finish {
+        reply: SyncSender<std::result::Result<(), String>>,
+    },
+    Abort,
+}
+
+/// The model-side [`SegmentSink`] for an async segmented save.
+///
+/// It only serializes the payload into the bounded channel and computes the content id of each segment (the same
+/// deterministic id the archive store will use). It never locks the archive and never writes a file. Payload
+/// sends block when the writer is [`ASYNC_SEGMENT_RING`] segments behind; that backpressure is deliberate.
+///
+/// Dropping the sink before [`SegmentSink::finish`] aborts the save: the writer removes the state file, releases the
+/// segment references and commits no entry. After `finish` returns `Ok`, the entry is durable and the slot can be
+/// reused.
+pub struct ChannelSegmentSink {
+    tx: SyncSender<SaveCmd>,
+    shared: SharedError,
+    abort: Arc<AtomicBool>,
+    fingerprint: u64,
+    started: bool,
+    finished: bool,
+}
+
+impl ChannelSegmentSink {
+    fn check(&self) -> Result<()> {
+        if let Some(err) = shared_error(&self.shared) {
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn send(&mut self, cmd: SaveCmd) -> Result<()> {
+        self.check()?;
+        if self.tx.send(cmd).is_err() {
+            return Err(shared_error(&self.shared).unwrap_or_else(|| {
+                anyhow::anyhow!("segmented archive writer stopped")
+            }));
+        }
+        Ok(())
+    }
+}
+
+impl SegmentSink for ChannelSegmentSink {
+    fn begin(
+        &mut self,
+        tokens: &[u32],
+        owner: u64,
+        fingerprint: u64,
+        rope_offset: i32,
+    ) -> Result<()> {
+        if self.started {
+            bail!("slot archive: segmented sink begin called twice");
+        }
+        if self.finished {
+            bail!("slot archive: segmented sink already finished");
+        }
+        self.check()?;
+        let (reply, ack) = sync_channel(1);
+        self.send(SaveCmd::Begin {
+            tokens: tokens.to_vec(),
+            owner,
+            fingerprint,
+            rope_offset,
+            reply,
+        })?;
+        match ack.recv() {
+            Ok(Ok(())) => {
+                self.fingerprint = fingerprint;
+                self.started = true;
+                Ok(())
+            }
+            Ok(Err(err)) => Err(anyhow::anyhow!("{err}")),
+            Err(_) => Err(shared_error(&self.shared).unwrap_or_else(|| {
+                anyhow::anyhow!("segmented archive writer stopped during begin")
+            })),
+        }
+    }
+
+    fn put(&mut self, parent: Option<&str>, tokens: &[u32], payload: &[u8]) -> Result<String> {
+        if !self.started {
+            bail!("slot archive: segmented sink put before begin");
+        }
+        if self.finished {
+            bail!("slot archive: segmented sink put after finish");
+        }
+        self.check()?;
+        // The id is content-addressed and does not depend on the writer having processed the payload yet.
+        let id = slot_segments::segment_id(self.fingerprint, parent, tokens);
+        self.send(SaveCmd::Segment {
+            parent: parent.map(str::to_string),
+            tokens: tokens.to_vec(),
+            payload: payload.to_vec(),
+        })?;
+        Ok(id)
+    }
+
+    fn state(&mut self, tokens: &[u32], payload: &[u8]) -> Result<()> {
+        if !self.started {
+            bail!("slot archive: segmented sink state before begin");
+        }
+        if self.finished {
+            bail!("slot archive: segmented sink state after finish");
+        }
+        self.check()?;
+        self.send(SaveCmd::State {
+            tokens: tokens.to_vec(),
+            payload: payload.to_vec(),
+        })
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if !self.started {
+            bail!("slot archive: segmented sink finish before begin");
+        }
+        if self.finished {
+            bail!("slot archive: segmented sink finish called twice");
+        }
+        self.check()?;
+        let (reply, ack) = sync_channel(1);
+        // Set `finished` before waiting: an error means the writer aborted, so Drop must not send another Abort.
+        self.finished = true;
+        self.send(SaveCmd::Finish { reply })?;
+        match ack.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(anyhow::anyhow!("{err}")),
+            Err(_) => Err(shared_error(&self.shared).unwrap_or_else(|| {
+                anyhow::anyhow!("segmented archive writer stopped before the commit")
+            })),
+        }
+    }
+}
+
+impl Drop for ChannelSegmentSink {
+    fn drop(&mut self) {
+        if !self.started || self.finished {
+            return;
+        }
+        // Prompt the writer even if the channel is full; it also checks the shared flag on every iteration.
+        self.abort.store(true, Ordering::Relaxed);
+        match self.tx.try_send(SaveCmd::Abort) {
+            Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
+}
+
+/// Handle for an in-flight async segmented save. [`Self::join`] waits for the writer's commit and returns the
+/// committed entry.
+///
+/// Dropping the handle does not abort the save (the sink does). Do not hold the archive mutex while joining: the
+/// writer needs it to finish.
+pub struct AsyncSegmentedSave {
+    handle: Option<JoinHandle<Result<ArchiveEntry>>>,
+}
+
+impl AsyncSegmentedSave {
+    /// Wait for the writer thread and return the committed entry. Every writer or commit error is returned here, in
+    /// addition to being surfaced through the sink.
+    pub fn join(mut self) -> Result<ArchiveEntry> {
+        let Some(handle) = self.handle.take() else {
+            bail!("slot archive: async segmented save already joined");
+        };
+        match handle.join() {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("slot archive: segmented writer thread panicked")),
+        }
+    }
+}
+
+/// Start an async segmented save writer for `archive`.
+///
+/// The returned [`ChannelSegmentSink`] implements [`crate::gpu_model::SegmentSink`] and is `Send`; pass it to
+/// [`GpuModel::save_segmented_to`](crate::gpu_model::GpuModel::save_segmented_to). The writer thread takes the
+/// archive mutex only while a phase runs and commits on `finish`; [`AsyncSegmentedSave::join`] returns that entry.
+/// `owner` must match the owner passed to the GPU save; `reason` is stored in the entry.
+///
+/// Errors in any phase, including the commit, are retained in the sink (so later `put`/`state`/`finish` calls fail
+/// with the original cause) and returned by `join`. Aborting (dropping the sink before `finish`, or a writer error)
+/// removes the state file and releases the segment references, leaving no entry.
+pub fn start_async_segmented_save(
+    archive: Arc<Mutex<Archive>>,
+    owner: u64,
+    reason: &str,
+) -> Result<(ChannelSegmentSink, AsyncSegmentedSave)> {
+    let (tx, rx) = sync_channel(ASYNC_SEGMENT_RING);
+    let shared: SharedError = Arc::new(Mutex::new(None));
+    let abort = Arc::new(AtomicBool::new(false));
+    let sink = ChannelSegmentSink {
+        tx,
+        shared: Arc::clone(&shared),
+        abort: Arc::clone(&abort),
+        fingerprint: 0,
+        started: false,
+        finished: false,
+    };
+    let reason = reason.to_string();
+    let handle = std::thread::Builder::new()
+        .name("slot-archive-seg-save".into())
+        .spawn(move || async_segmented_writer(archive, owner, reason, rx, shared, abort))
+        .context("spawning the segmented archive writer")?;
+    Ok((sink, AsyncSegmentedSave { handle: Some(handle) }))
+}
+
+fn lock_archive(archive: &Arc<Mutex<Archive>>) -> MutexGuard<'_, Archive> {
+    archive.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn abort_segmented_locked(
+    archive: &Arc<Mutex<Archive>>,
+    save: &mut SegmentedSave,
+    shared: &SharedError,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    // The archive is locked only for the cleanup, never while waiting for the next payload.
+    {
+        let mut guard = lock_archive(archive);
+        guard.abort_segmented(save);
+    }
+    set_shared_error(shared, &err);
+    err
+}
+
+fn async_segmented_writer(
+    archive: Arc<Mutex<Archive>>,
+    expected_owner: u64,
+    reason: String,
+    rx: Receiver<SaveCmd>,
+    shared: SharedError,
+    abort: Arc<AtomicBool>,
+) -> Result<ArchiveEntry> {
+    let (tokens, owner, fingerprint, rope_offset, begin_reply) = match rx.recv() {
+        Ok(SaveCmd::Begin { tokens, owner, fingerprint, rope_offset, reply }) => {
+            (tokens, owner, fingerprint, rope_offset, reply)
+        }
+        Ok(_) => {
+            let err = anyhow::anyhow!("segmented archive writer received a command before begin");
+            set_shared_error(&shared, &err);
+            return Err(err);
+        }
+        Err(_) => {
+            let err = anyhow::anyhow!("segmented archive writer stopped before begin");
+            set_shared_error(&shared, &err);
+            return Err(err);
+        }
+    };
+    if owner != expected_owner {
+        let err = anyhow::anyhow!(
+            "segmented archive writer: begin owner {owner} does not match the save owner {expected_owner}"
+        );
+        let _ = begin_reply.send(Err(format!("{err:#}")));
+        set_shared_error(&shared, &err);
+        return Err(err);
+    }
+
+    // `begin` may touch an existing entry; hold the lock only for that phase.
+    let mut save = {
+        let mut guard = lock_archive(&archive);
+        match guard.begin_segmented(&tokens, owner, fingerprint, rope_offset, &reason) {
+            Ok(save) => save,
+            Err(err) => {
+                set_shared_error(&shared, &err);
+                let _ = begin_reply.send(Err(format!("{err:#}")));
+                return Err(err);
+            }
+        }
+    };
+    let _ = begin_reply.send(Ok(()));
+
+    loop {
+        if abort.load(Ordering::Relaxed) {
+            let err = anyhow::anyhow!("segmented archive save aborted");
+            return Err(abort_segmented_locked(&archive, &mut save, &shared, err));
+        }
+        match rx.recv() {
+            Ok(SaveCmd::Segment { parent, tokens, payload }) => {
+                let result = {
+                    let mut guard = lock_archive(&archive);
+                    guard.put_segment(&mut save, parent.as_deref(), &tokens, &payload)
+                };
+                if let Err(err) = result {
+                    return Err(abort_segmented_locked(&archive, &mut save, &shared, err));
+                }
+            }
+            Ok(SaveCmd::State { tokens, payload }) => {
+                let result = {
+                    let mut guard = lock_archive(&archive);
+                    guard.put_state(&mut save, &tokens, &payload)
+                };
+                if let Err(err) = result {
+                    return Err(abort_segmented_locked(&archive, &mut save, &shared, err));
+                }
+            }
+            Ok(SaveCmd::Finish { reply }) => {
+                let result = {
+                    let mut guard = lock_archive(&archive);
+                    guard.finish_segmented(&mut save)
+                };
+                match result {
+                    Ok(entry) => {
+                        let _ = reply.send(Ok(()));
+                        return Ok(entry);
+                    }
+                    Err(err) => {
+                        let _ = reply.send(Err(format!("{err:#}")));
+                        set_shared_error(&shared, &err);
+                        return Err(err);
+                    }
+                }
+            }
+            Ok(SaveCmd::Abort) => {
+                let err = anyhow::anyhow!("segmented archive save aborted");
+                return Err(abort_segmented_locked(&archive, &mut save, &shared, err));
+            }
+            Ok(SaveCmd::Begin { .. }) => {
+                let err = anyhow::anyhow!("segmented archive save received a second begin");
+                return Err(abort_segmented_locked(&archive, &mut save, &shared, err));
+            }
+            Err(_) => {
+                let err = anyhow::anyhow!("segmented archive save aborted before it completed");
+                return Err(abort_segmented_locked(&archive, &mut save, &shared, err));
+            }
+        }
+    }
+}
+
 /// Milliseconds since the Unix epoch, saturating to 0 before it.
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
@@ -1963,6 +3119,14 @@ pub(crate) fn prefix_hash(tokens: &[u32]) -> u64 {
 /// The stable content id: `fingerprint-owner-n_tokens-prefix_hash`, all hex except `n_tokens`.
 pub(crate) fn id_for(fingerprint: u64, owner: u64, n_tokens: usize, prefix_hash: u64) -> String {
     format!("{fingerprint:016x}-{owner:016x}-{n_tokens}-{prefix_hash:016x}")
+}
+
+/// The content id of one segment: a stable hash of the fingerprint, the parent id and the token range.
+///
+/// [`SegmentStore::put`] computes the same value. A [`crate::gpu_model::SegmentSink`] implementation needs it to
+/// return the id that the next `put` passes as its parent, without having to reach the (private) store helper.
+pub fn segment_id(fingerprint: u64, parent: Option<&str>, tokens: &[u32]) -> String {
+    slot_segments::segment_id(fingerprint, parent, tokens)
 }
 
 fn entry_id(fingerprint: u64, owner: u64, tokens: &[u32]) -> String {
@@ -4148,5 +5312,173 @@ mod tests {
         let archive = Archive::open(config(dir)).unwrap();
         assert_eq!(archive.stats().entries, 0);
         assert!(path.exists(), "the legacy state file is left for the operator");
+    }
+
+    #[test]
+    fn segmented_restore_plan_resolves_tokens_ranges_and_paths() {
+        let tmp = TempDir::new("segment-plan");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let tokens: Vec<u32> = (1..=14).collect();
+        let entry = v2_entry(&mut archive, 9, &tokens, "segmented");
+
+        let plan = archive.segmented_restore_plan(&entry).unwrap();
+        assert_eq!(plan.entry_id, entry.id);
+        assert_eq!(plan.owner, 9);
+        assert_eq!(plan.fingerprint, FP);
+        assert_eq!(plan.tokens, tokens);
+        assert_eq!(plan.rope_offset, 0);
+        assert_eq!(Some(&plan.state_path), entry.state_file.as_ref());
+        assert_eq!(plan.segments.len(), entry.segments.len());
+        let mut next = 0usize;
+        for (planned, reference) in plan.segments.iter().zip(&entry.segments) {
+            assert_eq!(planned.id, reference.id);
+            assert_eq!(planned.start, next);
+            assert_eq!(planned.end, reference.end);
+            assert_eq!(planned.path, archive.segments().segment(&reference.id).unwrap().file);
+            assert!(planned.path.is_file());
+            next = planned.end;
+        }
+        assert_eq!(next, tokens.len());
+
+        // Flipping a payload byte changes neither the header nor the token list. The plan must still succeed: it does
+        // not read the recurrent payload under the archive lock.
+        let mut state = fs::read(&plan.state_path).unwrap();
+        let last = state.len() - 1;
+        state[last] ^= 0xff;
+        fs::write(&plan.state_path, &state).unwrap();
+        assert!(
+            archive.segmented_restore_plan(&entry).is_ok(),
+            "the plan must not read the state payload"
+        );
+    }
+
+    #[test]
+    fn segmented_restore_plan_rejects_bad_format_owner_ranges_and_missing_files() {
+        let tmp = TempDir::new("segment-plan-bad");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let tokens: Vec<u32> = (1..=12).collect();
+        let entry = v2_entry(&mut archive, 3, &tokens, "segmented");
+
+        let mut v1 = entry.clone();
+        v1.format = 1;
+        assert!(archive.segmented_restore_plan(&v1).is_err(), "a v1 entry is not segmented");
+
+        let mut wrong_owner = entry.clone();
+        wrong_owner.owner += 1;
+        assert!(archive.segmented_restore_plan(&wrong_owner).is_err(), "owner must match the state header");
+
+        let mut wrong_fingerprint = entry.clone();
+        wrong_fingerprint.fingerprint ^= 1;
+        assert!(archive.segmented_restore_plan(&wrong_fingerprint).is_err(), "fingerprint must match");
+
+        let mut wrong_count = entry.clone();
+        wrong_count.n_tokens += 1;
+        assert!(archive.segmented_restore_plan(&wrong_count).is_err(), "token count must match");
+
+        let mut broken_ranges = entry.clone();
+        broken_ranges.segments[0].end -= 1;
+        assert!(archive.segmented_restore_plan(&broken_ranges).is_err(), "ranges must be contiguous");
+
+        let mut wrong_chain = entry.clone();
+        wrong_chain.segments[0].id = "0000000000000000".to_string();
+        assert!(archive.segmented_restore_plan(&wrong_chain).is_err(), "segment ids are content-addressed");
+
+        let segment_file = archive.segments().segment(&entry.segments[0].id).unwrap().file.clone();
+        fs::remove_file(&segment_file).unwrap();
+        assert!(archive.segmented_restore_plan(&entry).is_err(), "a missing segment file is rejected");
+    }
+
+    #[test]
+    fn channel_segment_source_streams_ordered_bounded_payloads() {
+        use crate::gpu_model::SegmentSource;
+        let tmp = TempDir::new("segment-channel");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let tokens: Vec<u32> = (100..=131).collect();
+        let entry = v2_entry(&mut archive, 5, &tokens, "segmented");
+        let state_path = entry.state_file.clone().unwrap();
+        let archive = Arc::new(Mutex::new(archive));
+        let (mut source, handle) =
+            start_async_segmented_restore(Arc::clone(&archive), entry.clone(), None).unwrap();
+
+        let mut next = 0usize;
+        let mut ranges = Vec::new();
+        while let Some((start, end, payload)) = source.next().unwrap() {
+            assert_eq!(start, next, "segments are delivered in order");
+            assert!(end > start && end <= tokens.len());
+            let expected: Vec<u8> = tokens[start..end].iter().flat_map(|t| t.to_le_bytes()).collect();
+            assert_eq!(payload, expected, "payload [{start}, {end})");
+            ranges.push((start, end));
+            next = end;
+        }
+        assert_eq!(next, tokens.len());
+        assert_eq!(ranges.len(), entry.segments.len());
+        assert_eq!(source.state().unwrap(), b"test-recurrent-payload");
+        assert!(source.state().is_err(), "the state can only be requested once");
+        handle.join().unwrap();
+        assert!(state_path.exists());
+    }
+
+    #[test]
+    fn channel_segment_source_reports_a_truncated_segment() {
+        use crate::gpu_model::SegmentSource;
+        let tmp = TempDir::new("segment-truncated");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let tokens: Vec<u32> = (1..=8).collect();
+        let entry = v2_entry(&mut archive, 1, &tokens, "segmented");
+        let file = archive.segments().segment(&entry.segments[0].id).unwrap().file.clone();
+        let data = fs::read(&file).unwrap();
+        fs::write(&file, &data[..data.len() - 1]).unwrap();
+
+        let archive = Arc::new(Mutex::new(archive));
+        let (mut source, handle) =
+            start_async_segmented_restore(Arc::clone(&archive), entry, None).unwrap();
+        let err = source.next().unwrap_err();
+        assert!(format!("{err:#}").contains("segment file"), "{err:#}");
+        assert!(handle.join().is_err(), "join must expose the reader error");
+    }
+
+    #[test]
+    fn channel_segment_source_reports_a_truncated_state() {
+        use crate::gpu_model::SegmentSource;
+        let tmp = TempDir::new("segment-state-truncated");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        // More segments than the bounded channel holds, so the reader is still sending segments when the state file
+        // is truncated; it cannot reach the state read until the receiver drains them.
+        let tokens: Vec<u32> = (1..=64).collect();
+        let entry = v2_entry(&mut archive, 1, &tokens, "segmented");
+        let state = entry.state_file.clone().unwrap();
+        let archive = Arc::new(Mutex::new(archive));
+        let (mut source, handle) =
+            start_async_segmented_restore(Arc::clone(&archive), entry, None).unwrap();
+
+        let data = fs::read(&state).unwrap();
+        fs::write(&state, &data[..data.len() - 1]).unwrap();
+        while source.next().unwrap().is_some() {}
+        let err = source.state().unwrap_err();
+        assert!(format!("{err:#}").contains("state file"), "{err:#}");
+        assert!(handle.join().is_err(), "join must expose the reader error");
+    }
+
+    #[test]
+    fn channel_segment_source_dropped_receiver_aborts_cleanly() {
+        use crate::gpu_model::SegmentSource;
+        let tmp = TempDir::new("segment-dropped");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        // 64 tokens at four per segment: more messages than the bounded channel holds, so the reader is blocked in a
+        // send when the receiver disappears.
+        let tokens: Vec<u32> = (1..=64).collect();
+        let entry = v2_entry(&mut archive, 1, &tokens, "segmented");
+        let archive = Arc::new(Mutex::new(archive));
+        let (mut source, handle) =
+            start_async_segmented_restore(Arc::clone(&archive), entry, None).unwrap();
+        assert!(source.next().unwrap().is_some());
+        drop(source);
+        handle.join().expect("a dropped receiver aborts the reader cleanly");
     }
 }

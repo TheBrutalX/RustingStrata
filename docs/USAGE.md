@@ -230,7 +230,10 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   server started without `--model` serves whichever model the client picks. The replies in progress end first. A
   `model` that no listed file has is answered by the loaded model. If the load fails, the request gets `503` with
   the reason and the next chat request loads the model that was there before. With API keys only the admin key sees
-  the other models and switches; a customer key sees and gets the loaded model.
+  the other models and switches; a customer key sees and gets the loaded model. The loaded model entry also
+  carries the context in the shapes OpenAI-compatible clients commonly read: `context_length`,
+  `max_context_length`, `max_model_len`, `context_window`, `top_provider.context_length`, and
+  `meta.n_ctx`/`meta.n_ctx_train`/`meta.context_length`.
 - A streamed reply sends its response head when the model takes the request, before the prompt runs. While the prompt
   runs, and while the text of a tool call is held back, the stream sends the SSE comment `: keep-alive` every 15 s, so
   a client that stops after some minutes without a byte keeps reading. If the prompt fails after the head, the stream

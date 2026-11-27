@@ -40,6 +40,11 @@ fn gq_min(pos: usize, nt: usize) -> i32 {
 mod prefill;
 mod slot;
 
+/// The archive segmented-restore source abstraction (see [`GpuModel::restore_segmented_from`]).
+pub use slot::SegmentSource;
+/// The sink trait behind [`GpuModel::save_segmented_to`]; the archive's channel sink implements it.
+pub use slot::SegmentSink;
+
 /// A tensor `GpuModel::load_part` never uploads: the PLE table stays on the CPU.
 fn cpu_only(name: &str) -> bool { name == "per_layer_token_embd.weight" }
 

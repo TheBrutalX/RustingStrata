@@ -2,7 +2,7 @@
 
 Phase 1 is merged (PR #12, `edc0204`): automatic checkpoint on divergence/reclaim, prefix restore in single-slot
 and `--parallel`, manifest/LRU/lineage, routes and metrics. This document analyses what phase 2 should change, in
-what order, and what it costs. **Status: implemented (phase 2 subset).** The sections below keep the design
+what order, and what it costs. **Status: implemented (phase 2 subset + phase 4 async).** The sections below keep the design
 analysis, but the status notes and §15–§16 state what landed and what did not.
 
 It is deliberately narrower than the phase-2 bullet list in [SLOT-ARCHIVE.md](SLOT-ARCHIVE.md): the goal is the
@@ -27,27 +27,15 @@ fault/perf harnesses.
 - **Lifecycle.** `--slot-archive-ttl`, `--slot-archive-per-key-gb`, `--slot-archive-pin-gb`,
   `POST /slots/archive/{id}?action=pin|unpin`, `pinned_bytes` in `GET` and metrics, and `expired` in the GC
   response and metrics are implemented.
-- **I/O split in the GPU core.** `save_slot_to`/`restore_slot_from`, a bounded writer (`save_slot_file_async_as`,
-  four 64 MiB chunks = 256 MiB) and the matching reader exist. v1-format entries restore through the async reader
-  (disk read on a worker, H2D/install on the model thread). The v1 async writer API remains, but the server does
-  not schedule background v1 saves for automatic checkpoints. **v2 `save_segmented` is still synchronous**, and
-  the server's automatic checkpoints are v2.
+- **I/O split in the GPU core.** `save_slot_to`/`restore_slot_from`, the resumable `_with` variants, bounded
+  writer/reader APIs and the segmented sink/source exist. Automatic v2 checkpoints and restores now use background
+  writer/reader threads; explicit `action=save`/`action=checkpoint` remain synchronous. See the phase-4 section.
 - **Budget.** A v2 entry's `bytes` is its state file plus the segment bytes that entry created; a segment shared
   with an older entry is not charged again. The budget is logical, not a filesystem quota.
 
-Not in this wave:
-
-- asynchronous or chunked v2 save/restore, request-level `saving`/`restoring` slot states, and scheduler
-  interleaving; an automatic v2 checkpoint still holds the archive mutex and the model thread for the segment
-  writes, the state write and the GPU copies;
-- a shutdown checkpoint (`--slot-archive-on-shutdown` does not exist);
-- manifest batching/journal; `manifest.json` is still rewritten in full, and `segments.json` is a second full
-  rewrite;
-- v2 entry rebuild after manifest loss: the startup rebuild scans `.slot` v1 files only, while the segment store
-  can rebuild its own manifest from `.seg` files;
-- park/LRU eviction checkpoints, multi-version branching/branch ids, and compression or archive-only
-  re-quantization;
-- an owner-namespaced dedup mode; the default is global segment sharing with owner-scoped entries.
+The phase-2-only limits below were superseded by the phase-3/phase-4 waves: async segmented I/O, shutdown
+checkpoint, manifest journal/batching, v2 rebuild and fault/bench/soak harnesses are now implemented. The list is
+kept only as the original phase-2 scope.
 
 Measured results on the integration branch:
 
@@ -76,6 +64,23 @@ later checkpoints ~283 ms / 72 MB, restore 598 ms with `cached_tokens=24139`; 3 
 472 MB total. The soak stayed flat at ~18.1–18.5 GB RSS and ~18.9 GB GPU over 40 switches. These are the current
 numbers for the synchronous v2 path; the resumable API is not yet wired to the scheduler, so they still include the
 model-thread stall.
+
+## Phase 4 wave (async segmented I/O)
+
+- **Save:** `GpuModel::save_segmented_to` + `SegmentSink`; `ChannelSegmentSink` + `start_async_segmented_save`; a
+  writer thread owns the archive lock and writes segments/state/manifest. The model thread performs only the
+  GPU→host copies and sends bounded payloads.
+- **Restore:** `GpuModel::restore_segmented_from` + `SegmentSource`; `start_async_segmented_restore` and a reader
+  thread own the file handles; the entry lease is held until install/join; the model thread performs H2D/install.
+- **Scheduler:** automatic checkpoints/restores use the async jobs; the saving/restoring slot is pinned, and
+  `Sched::yield_between` services only other slots' decode steps (up to 2 ms per copy). Explicit
+  `action=save`/`action=checkpoint` stay synchronous.
+- **Locking:** the archive mutex is not held during GPU copies; the writer/reader takes it per phase. `finish`
+  still waits for the final state/manifest commit, so the model thread can wait for that commit at the end.
+- **Benchmark:** the explicit-checkpoint path remains synchronous by design; the async automatic path is exercised
+  by the archive/dedup E2E. `tests/archive_phase_bench.rs` measured the async sink path on the same 22.5k-token
+  f16 state at **546 ms total** versus **930 ms** for the synchronous `save_segmented` (GPU copies + overlapped
+  segment disk writes + final commit), about a 41% reduction.
 
 ## 1. What phase 1 actually does
 
