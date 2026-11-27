@@ -90,6 +90,14 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   `POST /slots/{id}?action=save|restore|erase` routes. The directory must exist at start. Without the flag the POST
   routes answer `501`. Files hold plaintext KV and the token history, so treat the directory as sensitive. See
   [Slot state files](#slot-state-files-save-and-restore).
+- `--slot-archive-dir DIR` (`serve`): opt-in directory of automatically checkpointed slot states, with
+  `GET /slots/archive`, `DELETE /slots/archive/{id}`, `POST /slots/archive/gc` and
+  `POST /slots/{id}?action=checkpoint`. The server creates a missing directory `0700` and keeps it separate from
+  `--slot-save-path`. See [Conversation archive](#conversation-archive).
+- `--slot-archive-gb N` (default 50 GiB), `--slot-archive-min-tokens N` (default 256), `--slot-archive-min-delta N`
+  (default 1024) and `--slot-archive-versions N` (default 1) tune the archive: the logical budget in GiB
+  (`N << 30` bytes), the shortest state worth saving, the minimum growth since the last checkpoint, and how many
+  entries to keep per lineage.
 - `--rope-scaling none|linear|yarn` changes the RoPE plan, not only the KV size. `yarn` and `linear` need
   `--rope-scale FACTOR` (2 doubles the context); `yarn` also needs `--yarn-orig-ctx N` (the context the model was
   trained on) and takes `--yarn-beta-fast`/`--yarn-beta-slow` (32/1, llama.cpp's defaults). A file that carries
@@ -374,6 +382,99 @@ curl -s -X POST -H 'Content-Type: application/json' \
   DeltaNet/MTP/PLE/QSA state plus 4 bytes per token of history); a 1M-token q8 slot is about 10.9 GB with the
   35B-A3B layout. Files are created `0600`. Keep the directory private and include it in your backup and retention
   policy, or exclude it deliberately.
+
+### Conversation archive
+
+`serve --slot-archive-dir DIR` turns slot state files into a cache the server manages itself. Before a slot
+is reused for a prompt that does not extend its history, before `--kv-unified` reclaims it, and before an
+automatic restore overwrites a free slot's conversation, the server checkpoints its state to `DIR`. A later
+request whose prompt starts with an archived history restores that state into a free slot and prefills only the
+new suffix. The client keeps sending the full message list and sees the usual
+`usage.prompt_tokens_details.cached_tokens`; there is no conversation id and no client change.
+
+The match is exact on token ids, within the same model/KV/YaRN/split fingerprint and the same API-key owner. It is
+not a text-similarity or message-hash cache. The archive is off by default and must be a different directory from
+`--slot-save-path`; the server refuses to start when they resolve to the same one.
+
+- `--slot-archive-gb N`: logical budget for the entry files in GiB (1 GiB = 2^30 bytes), default 50. A
+  checkpoint that would exceed `budget - 1 GiB` first prunes unpinned ancestors beyond `--slot-archive-versions`,
+  then evicts entries with a foreign fingerprint, then the least-recently-used unpinned entries. It never evicts a
+  pinned entry, but phase 1 has no route that sets `pinned`; that field is reserved.
+- `--slot-archive-min-tokens N`: do not archive a history shorter than this, default 256.
+- `--slot-archive-min-delta N`: do not rewrite a lineage unless it grew by at least this many tokens since the
+  longest archived prefix, default 1024.
+- `--slot-archive-versions N`: keep up to N entries per lineage, default 1. Pruning is lazy: ancestors are removed
+  only under budget pressure or when `POST /slots/archive/gc` runs, so a parent and a continuation coexist while
+  there is room. A longer child cannot be rewound to its shorter parent, so raise N when earlier points matter for
+  rollback.
+
+`POST /slots/archive/gc` first drops rows whose file is missing, then applies the same lineage pruning and LRU
+eviction when the archive is over the target. It has no current-fingerprint argument, so foreign entries are
+ordinary LRU candidates there.
+
+`GET /slots/archive` reports the directory, the budget, the bytes in use and one row per entry. Optional `?limit=`
+(maximum rows), `?owner=` (API-key id) and `?fingerprint=` (hex) filter the list; the response never contains token
+text or file paths.
+
+```json
+{
+  "dir": "/var/lib/strata/archive",
+  "budget_bytes": 53687091200,
+  "used_bytes": 12345678901,
+  "entries": [
+    {"id": "a1b2c3d4e5f60718-0000000000000007-1058-9f3c2a1b4d5e6f70", "owner": 7,
+     "n_tokens": 1058, "bytes": 77379688, "created_ms": 1795766400000,
+     "last_used_ms": 1795766400000, "pinned": false, "reason": "divergence",
+     "fingerprint": "a1b2c3d4e5f60718"}
+  ]
+}
+```
+
+- `DELETE /slots/archive/{id}` deletes one entry and answers
+  `{"id": "...", "deleted": true, "freed_bytes": 77379688}`.
+- `POST /slots/archive/gc` runs the eviction policy on demand and answers
+  `{"evicted": 3, "freed_bytes": 123}`.
+- `POST /slots/{id}?action=checkpoint` with `{}` saves the idle slot now, using the archive budget instead of a
+  client filename, and answers `{"id_slot": 0, "id": "...", "n_saved": 1058, "n_written": 77379688,
+  "timings": {"save_ms": 83.7}}`. It needs `--slot-archive-dir`, not `--slot-save-path`. Use it before building
+  a compacted prompt or before a branch point.
+
+```sh
+curl -s http://127.0.0.1:8080/slots/archive
+curl -s -X POST -H 'Content-Type: application/json' -d '{}' \
+    'http://127.0.0.1:8080/slots/0?action=checkpoint'
+curl -s -X DELETE 'http://127.0.0.1:8080/slots/archive/<id>'
+curl -s -X POST -H 'Content-Type: application/json' -d '{}' \
+    http://127.0.0.1:8080/slots/archive/gc
+```
+
+- **Owner.** An entry is matched only by a request with the same API-key owner, and a checkpoint records the
+  conversation's owner, not the owner of the request that caused an eviction. Without `--api-keys` every request
+  has owner 0, so the archive is shared by all clients. With keys, `GET /slots/archive`, `DELETE`,
+  `POST /slots/archive/gc` and `POST /slots/{id}?action=checkpoint` are admin-only: a customer key gets `403`,
+  like the explicit slot routes.
+- **Unified KV.** Automatic restore uses a free slot only, never takes a slot a request holds, and never forces.
+  If that free slot holds another conversation, the server checkpoints it before the restore overwrites it. If
+  the growth would need a non-empty reclaim victim, the server skips the archive hit and prefills normally; that
+  is not a `409`. An explicit `action=restore` keeps its `force=1` behavior. A restored slot is pinned until the
+  request is admitted or `action=erase` clears it, so a reclaim cannot take it between restore and admission.
+- **Best effort.** A missing, corrupt, truncated, foreign or owner-mismatched entry is a cache miss, not a
+  request error: the chat still runs and prefills from position 0. A read or write that fails at run time is
+  logged and skipped (a lookup is a miss); a directory that cannot be opened at startup stops the server with
+  the path in the error. The archive never changes the token stream or a greedy reply; it only changes how much
+  is prefilled.
+- **Compaction.** A compacted prompt is a summary plus recent messages, generally not a prefix of the old
+  conversation, so it still needs a full prefill. The pre-compact entry is for rollback and audit; the compacted
+  prompt is prefilled once and checkpointed as a new lineage, and that entry is the fast resume afterwards.
+- **Restart.** The manifest and entries survive a restart, and a continuation restores from disk without the old
+  process. A server stop only keeps states that were checkpointed earlier; phase 1 has no shutdown checkpoint, so
+  a conversation still resident in VRAM at `SIGTERM` is lost unless it was checkpointed explicitly.
+- **Privacy.** An entry is a plaintext `STRATASLOT` file created `0600` in a directory created `0700`. It holds
+  the full token history (prompt, system prompt, tools and generated tokens) and the KV/recurrent state, not a
+  compressed transcript. Treat the directory as a copy of the conversations, keep it off any HTTP-served path,
+  and include it in (or deliberately exclude it from) backups and retention.
+
+Without `--slot-archive-dir`, the archive routes answer `501` and the server behaves exactly as before.
 
 ## Prompt caching
 

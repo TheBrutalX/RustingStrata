@@ -1127,3 +1127,36 @@ fn slot_save_restore_round_trip() {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+/// `save_slot_file_as` writes the explicit conversation owner into the header and the saved state, and leaves the
+/// caller's request owner alone on both success and failure. (GPU integration test; not part of the CPU-only pass.)
+#[test]
+fn slot_save_as_records_explicit_owner() {
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let ids = tok.encode("The capital of France is").unwrap();
+    for (bk, gpu) in common::backends() {
+        eprintln!("backend {bk}");
+        let mut gm = GpuModel::load(&m, gpu, 256, 0, 512 << 20, 0).unwrap();
+        gm.owner = 7;
+        gm.prefill(&ids).unwrap();
+        let path = std::env::temp_dir().join(format!("strata-slot-as-{}-{bk}.bin", std::process::id()));
+        gm.save_slot_file_as(0, &path, 0x1234).unwrap();
+        assert_eq!(gm.owner, 7, "{bk}: caller owner after success");
+        assert_eq!(gm.slot_owner(0), 0x1234, "{bk}: saved owner");
+        let mut f = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let (h, tokens) = rusting_strata::slot_file::read_header(&mut f).unwrap();
+        assert_eq!(h.owner, 0x1234, "{bk}: header owner");
+        assert_eq!(h.fingerprint, gm.slot_fingerprint(), "{bk}: header fingerprint");
+        assert_eq!(h.n_tokens as usize, ids.len(), "{bk}: header n_tokens");
+        assert_eq!(tokens, ids, "{bk}: header tokens");
+        // A failed save (empty history) must restore the caller's owner too.
+        gm.reset().unwrap();
+        assert!(gm.save_slot_file_as(0, &path, 0x5678).is_err(), "{bk}: empty slot saved");
+        assert_eq!(gm.owner, 7, "{bk}: caller owner after failure");
+        let _ = std::fs::remove_file(&path);
+    }
+}

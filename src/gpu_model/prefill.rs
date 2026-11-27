@@ -1011,7 +1011,7 @@ impl GpuModel<'_> {
     /// every row; else only for the rows that ask for logits (a prompt's last row), in row order.
     fn batch_rows(&mut self, rows: &[(usize, u32, bool)], all: bool) -> anyhow::Result<Vec<(u32, Vec<f32>)>> {
         let t = rows.len();
-        let pos: Vec<usize> = rows.iter().enumerate().map(|(r, &(s, ..))| *self.slot_pos(s) + rows[..r].iter().filter(|x| x.0 == s).count()).collect();
+        let pos: Vec<usize> = rows.iter().enumerate().map(|(r, &(s, ..))| *self.slot_pos_mut(s) + rows[..r].iter().filter(|x| x.0 == s).count()).collect();
         let heads: Vec<usize> = (0..t).filter(|&r| all || rows[r].2).collect();
         for (&(s, ..), &p) in rows.iter().zip(&pos) { self.kv_need(s, p + 1)?; }
         // Recurrent layers or experts: the layers of `prefill_chunk` in rows mode (`Batch::dense` is the forward below).
@@ -1100,7 +1100,7 @@ impl GpuModel<'_> {
         };
         let mut q = Some(&mut *self);
         while let Some(p) = q {
-            for &(s, ..) in rows { *p.slot_pos(s) += 1; }
+            for &(s, ..) in rows { *p.slot_pos_mut(s) += 1; }
             for &(s, tok, _) in rows { p.slot_ids_mut(s).push(tok); }
             p.row_tokens += t;
             p.after_experts(t, p.row_tokens)?;

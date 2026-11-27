@@ -10,6 +10,7 @@ use rusting_strata::model::{Model, State};
 use rusting_strata::{backend, gpu_model::GpuModel};
 use rusting_strata::{config::ModelConfig, gguf::Gguf, hf, ops, ops::Sampler, quant::GgmlType, serve, tokenizer::Tokenizer};
 use rusting_strata::chat::{Hold, Msg, Template, Think};
+use rusting_strata::slot_archive::{self, Archive, ArchiveConfig, ArchiveEntry, SaveSlot};
 use rusting_strata::vision::{self, VisionProjector};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -285,6 +286,24 @@ struct Hosting {
     /// Without it those endpoints answer 501. Files contain plaintext KV: treat the directory as sensitive.
     #[arg(long, value_name = "DIR")]
     slot_save_path: Option<PathBuf>,
+    /// Enable the disk-backed conversation archive in this directory (`GET /slots/archive`). Idle slots are saved
+    /// here automatically and restored when a later prompt continues them. Files contain plaintext KV and token
+    /// history: this is opt-in, and the directory must differ from `--slot-save-path`.
+    #[arg(long, value_name = "DIR")]
+    slot_archive_dir: Option<PathBuf>,
+    /// Logical size of the conversation archive, in GiB (1 << 30 bytes) [default: 50].
+    #[arg(long, value_name = "N", default_value_t = 50)]
+    slot_archive_gb: u64,
+    /// Do not archive a slot whose history is shorter than this many tokens [default: 256].
+    #[arg(long, value_name = "N", default_value_t = 256)]
+    slot_archive_min_tokens: usize,
+    /// Do not write a new archive entry unless the conversation grew by at least this many tokens since the
+    /// longest archived prefix [default: 1024].
+    #[arg(long, value_name = "N", default_value_t = 1024)]
+    slot_archive_min_delta: usize,
+    /// Archive entries kept per conversation lineage [default: 1].
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    slot_archive_versions: usize,
     /// Free the model (its VRAM and its memory in this process) after this many seconds without a chat request. The
     /// next chat request loads it again, with the same options, and is answered after the load.
     #[arg(long, value_name = "SECONDS")]
@@ -1954,6 +1973,31 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             if let Some(p) = &host.slot_save_path {
                 anyhow::ensure!(p.is_dir(), "--slot-save-path {} is not a directory", p.display());
             }
+            // The conversation archive is opt-in and must not share the explicit slot-file directory.
+            let archive: Option<ArchiveHandle> = match &host.slot_archive_dir {
+                Some(dir) => {
+                    if let Some(save) = &host.slot_save_path {
+                        let same = save == dir || std::fs::canonicalize(save).ok()
+                            .zip(std::fs::canonicalize(dir).ok()).is_some_and(|(a, b)| a == b);
+                        anyhow::ensure!(!same, "--slot-archive-dir {} must differ from --slot-save-path {}",
+                            dir.display(), save.display());
+                    }
+                    anyhow::ensure!(host.slot_archive_gb > 0, "--slot-archive-gb must be at least 1");
+                    anyhow::ensure!(host.slot_archive_versions > 0, "--slot-archive-versions must be at least 1");
+                    let cfg = ArchiveConfig {
+                        dir: dir.clone(),
+                        budget_bytes: host.slot_archive_gb.saturating_mul(1 << 30),
+                        min_tokens: host.slot_archive_min_tokens,
+                        min_delta: host.slot_archive_min_delta,
+                        versions: host.slot_archive_versions,
+                    };
+                    let a = Archive::open(cfg).with_context(|| format!("opening the slot archive at {}", dir.display()))?;
+                    say!("slot archive: {} ({} GiB, min {} tokens, min delta {}, {} version(s) per lineage)",
+                        dir.display(), host.slot_archive_gb, host.slot_archive_min_tokens, host.slot_archive_min_delta, host.slot_archive_versions);
+                    Some(std::sync::Arc::new(std::sync::Mutex::new(a)))
+                }
+                None => None,
+            };
             let api_key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
             anyhow::ensure!(api_key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
             let mut allowed_hosts = host.allowed_hosts.clone();
@@ -2009,6 +2053,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 if n == 0 { std::thread::sleep(Duration::from_millis(200)); if oc.load(Relaxed) == 0 { std::thread::sleep(Duration::from_secs(3)); say!("stopped"); std::process::exit(0); } }
                 else { say!("stopping: {n} requests to finish"); std::thread::sleep(Duration::from_secs(5)); }
             });
+            let conn_archive = archive.clone();
             std::thread::spawn(move || for (i, conn) in listener.incoming().enumerate() {
                 let mut c = match conn { Ok(c) => c, Err(e) => { say!("request {i}: {e:#}"); continue } };
                 if stop.load(Relaxed) {
@@ -2040,7 +2085,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         Err(e) => say!("{}: {e:#}, keeping the old keys", f.display()),
                     }
                 }
-                let (tx, oc, st, a, k, allowed, held, hub, offer) = (tx.clone(), open_conns.clone(), st.clone(), a.clone(), k.clone(), allowed.clone(), held.clone(), hub.clone(), offer.clone());
+                let (tx, oc, st, a, k, allowed, held, hub, offer, ar) = (tx.clone(), open_conns.clone(), st.clone(), a.clone(), k.clone(), allowed.clone(), held.clone(), hub.clone(), offer.clone(), conn_archive.clone());
                 std::thread::spawn(move || {
                     let q = c.set_read_timeout(Some(Duration::from_secs(30))).and_then(|_| c.set_write_timeout(Some(Duration::from_secs(30))))
                         .map_err(Into::into).and_then(|_| serve::read_request(&mut BufReader::new(&c)));
@@ -2063,13 +2108,15 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     if let Ok(r) = &q && r.method == "GET" && matches!(r.path.as_str(), "/api/stats" | "/metrics") && let k = k.read().unwrap().clone()
                         && (k.any() || serve::host_ok(&r.host, &a, &allowed)) && k.who(&r.auth).is_some_and(|w| w.admin) {
                         if r.path == "/metrics" {
-                            let b = st.lock().unwrap().prometheus(oc.load(Relaxed) - 1, t0.elapsed().as_secs());
+                            let mut b = st.lock().unwrap().prometheus(oc.load(Relaxed) - 1, t0.elapsed().as_secs());
+                            if let Some(a) = &ar && let Ok(a) = a.lock() { archive_prometheus(&a.stats(), &mut b); }
                             let _ = write!(&c, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
                             oc.fetch_sub(1, Relaxed);
                             return;
                         }
                         let mut v = json!(*st.lock().unwrap());
                         (v["system"], v["uptime_s"]) = (serve::system(), t0.elapsed().as_secs().into());
+                        if let Some(a) = &ar && let Ok(a) = a.lock() { v["archive"] = archive_metrics(&a.stats()); }
                         return reply(v, "200 OK");
                     }
                     // MCP tools for the page. Answered here: a tool can run for minutes and must not hold the model's
@@ -2165,7 +2212,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             });
             let s = Serving { rx: rx.into(), waiting, stop, addr, allowed_hosts, keys, usage, max_tokens: host.max_tokens.unwrap_or(usize::MAX), dir, model: model.clone(), extra,
                 dl: Default::default(), stats, opts: Default::default(), idle: host.auto_unload.map(Duration::from_secs),
-                slot_save_path: host.slot_save_path.clone(), asleep: Default::default(), parked: Default::default(), alias: host.alias };
+                slot_save_path: host.slot_save_path.clone(), archive, asleep: Default::default(), parked: Default::default(), alias: host.alias };
             // The model to load next and the /api/load request waiting for the outcome (none for --model).
             let mut next = model.map(|p| (p, None));
             say!("listening on {} (models folder: {})", term::hl(&url), s.dir.display());
@@ -3357,6 +3404,8 @@ struct Serving {
     idle: Option<Duration>,
     /// `--slot-save-path`: directory of explicit slot state files; the endpoints answer 501 without it.
     slot_save_path: Option<PathBuf>,
+    /// `--slot-archive-dir`: the automatic conversation archive; the archive routes answer 501 without it.
+    archive: Option<ArchiveHandle>,
     /// The model `--auto-unload` freed (while another loads for a chat request: the model to go back to if that load
     /// fails), and the chat request that waits for a load (answered once the model has loaded).
     asleep: std::sync::Mutex<Option<PathBuf>>,
@@ -3475,11 +3524,158 @@ impl Serving {
     }
 }
 
+/// The archive handle shared by the serving loop, the scheduler and the explicit routes.
+type ArchiveHandle = std::sync::Arc<std::sync::Mutex<Archive>>;
+
+/// One successful checkpoint's metadata, for the explicit `action=checkpoint` answer.
+struct CheckpointInfo { id: String, n_saved: usize, n_written: u64, save_ms: f64 }
+
+/// Save the idle slot `slot` to the archive, if policy allows it. One place for the divergence, eviction and
+/// explicit triggers (docs/SLOT-ARCHIVE.md §9). `target` is the slot the caller is about to use: the model cursor is
+/// left there, never on a victim. A failure is returned for the caller to log or surface; it never fails a chat.
+fn checkpoint_slot(archive: &ArchiveHandle, g: &mut GpuModel, slot: usize, target: usize, reason: &str, busy: bool)
+    -> anyhow::Result<Option<CheckpointInfo>> {
+    if busy || slot >= g.slots() { return Ok(None); }
+    let tokens = g.slot_tokens(slot).to_vec();
+    if tokens.is_empty() { return Ok(None); }
+    let mut a = match archive.lock() { Ok(a) => a, Err(_) => anyhow::bail!("slot archive lock poisoned") };
+    if tokens.len() < a.config().min_tokens { return Ok(None); }
+    // A partial state (mid-prefill/decode) or an image prompt (M-RoPE offset) is not a plain text prefix.
+    if g.slot_pos(slot) != tokens.len() || g.slot_shifted(slot) { return Ok(None); }
+    // The conversation's owner, not the request that triggered the eviction.
+    let owner = g.slot_owner(slot);
+    let fp = g.slot_fingerprint();
+    let small = a.longest_prefix(owner, &tokens, fp).is_some_and(|e| tokens.len().saturating_sub(e.n_tokens) < a.config().min_delta);
+    let (id, path) = match a.prepare_save(owner, &tokens, fp, reason) {
+        // The same state is already archived: only its LRU position changes, even below `min_delta`.
+        Ok(SaveSlot::Existing(e)) => {
+            a.touch(&e.id);
+            if g.current_slot() != target { g.use_slot(target); }
+            return Ok(Some(CheckpointInfo { id: e.id, n_saved: tokens.len(), n_written: 0, save_ms: 0.0 }));
+        }
+        Ok(SaveSlot::New { .. }) if small => {
+            if g.current_slot() != target { g.use_slot(target); }
+            return Ok(None);
+        }
+        Ok(SaveSlot::New { id, path }) => (id, path),
+        Err(e) => { a.note_failure(); return Err(e); }
+    };
+    let t = Instant::now();
+    let written = match g.save_slot_file_as(slot, &path, owner) {
+        Ok(n) => n,
+        Err(e) => {
+            a.note_failure();
+            let _ = std::fs::remove_file(&path);
+            if g.current_slot() != target { g.use_slot(target); }
+            return Err(e);
+        }
+    };
+    let saved = a.commit_save(&id, &path, owner, &tokens, fp, reason);
+    if g.current_slot() != target { g.use_slot(target); }
+    match saved {
+        Ok(e) => {
+            let save_ms = t.elapsed().as_secs_f64() * 1e3;
+            say!("archive: saved slot {slot} reason={reason} n={} bytes={written} ms={save_ms:.1}", tokens.len());
+            Ok(Some(CheckpointInfo { id: e.id, n_saved: tokens.len(), n_written: written, save_ms }))
+        }
+        Err(e) => {
+            a.note_failure();
+            let _ = std::fs::remove_file(&path);
+            Err(e)
+        }
+    }
+}
+
+/// Look an exact archived prefix up. Errors and misses are logged but never fail the request.
+fn archive_lookup(archive: &ArchiveHandle, owner: u64, ids: &[u32], keep: usize, fingerprint: u64, ctx: usize) -> Option<ArchiveEntry> {
+    let mut a = match archive.lock() { Ok(a) => a, Err(_) => return None };
+    match a.lookup(owner, ids, keep, fingerprint, ctx) {
+        Ok(hit) => hit,
+        Err(e) => { a.note_failure(); say!("archive: lookup: {e:#}"); None }
+    }
+}
+
+/// Restore `entry` into an idle slot with the existing validated reader. Records the outcome in the metrics; the
+/// caller decides whether to fall back to the normal prefill.
+fn archive_restore(archive: &ArchiveHandle, g: &mut GpuModel, slot: usize, entry: &ArchiveEntry) -> anyhow::Result<usize> {
+    let t = Instant::now();
+    let r = g.restore_slot_file(slot, &entry.file, false);
+    let mut a = match archive.lock() { Ok(a) => a, Err(_) => anyhow::bail!("slot archive lock poisoned") };
+    match r {
+        Ok(_) => {
+            a.note_restore();
+            say!("archive: restored slot {slot} n={} ms={:.1}", entry.n_tokens, t.elapsed().as_secs_f64() * 1e3);
+            Ok(entry.n_tokens)
+        }
+        Err(e) => { a.note_failure(); Err(e) }
+    }
+}
+
+/// Single-slot archive policy: restore a matching entry into slot 0 before the prefill, else checkpoint a slot whose
+/// conversation the prompt diverges from. Everything is best-effort: a failure only logs and leaves the normal
+/// prefill path in place (docs/SLOT-ARCHIVE.md §13).
+fn archive_before_single(archive: &ArchiveHandle, g: &mut GpuModel, owner: u64, ids: &[u32], keep: usize) {
+    let hit = archive_lookup(archive, owner, ids, keep, g.slot_fingerprint(), g.ctx());
+    if let Some(hit) = hit && hit.n_tokens <= keep {
+        let (sv, o) = g.slot_saved(0);
+        let ram = if o == owner && ids[..keep].starts_with(sv) { sv.len() } else { 0 };
+        if hit.n_tokens > ram {
+            // Automatic restore never evicts a non-empty slot (under a unified budget).
+            let blocked = g.kv_reclaim_plan(0, hit.n_tokens).iter().any(|&v| v != 0 && !g.slot_tokens(v).is_empty());
+            if !blocked {
+                if !g.slot_tokens(0).is_empty()
+                    && let Err(e) = checkpoint_slot(archive, g, 0, 0, "evict", false) {
+                    say!("archive: checkpoint slot 0 before restore: {e:#}");
+                }
+                match archive_restore(archive, g, 0, &hit) {
+                    Ok(_) => { g.use_slot(0); return; }
+                    Err(e) => say!("archive: restore into slot 0 (falling back to prefill): {e:#}"),
+                }
+            }
+        }
+    }
+    // The prompt diverges from the slot's history (switch or compact): save it before `prefill_cached` resets it.
+    let h = g.slot_tokens(0).to_vec();
+    if !h.is_empty() && !(keep >= h.len() && ids[..keep].starts_with(&h))
+        && let Err(e) = checkpoint_slot(archive, g, 0, 0, "divergence", false) {
+        say!("archive: checkpoint slot 0 (divergence): {e:#}");
+    }
+    // The reclaim plan is empty with a single slot outside a unified budget, but keep the trigger in one place.
+    for v in g.kv_reclaim_plan(0, ids.len()) {
+        if v != 0 && !g.slot_tokens(v).is_empty()
+            && let Err(e) = checkpoint_slot(archive, g, v, 0, "evict", false) {
+            say!("archive: checkpoint unified victim slot {v}: {e:#}");
+        }
+    }
+}
+
+/// The archive metrics shared by `/metrics` and `/api/stats`.
+fn archive_metrics(s: &slot_archive::ArchiveStats) -> Value {
+    json!({"entries": s.entries, "bytes": s.bytes, "budget_bytes": s.budget_bytes, "hits": s.hits, "misses": s.misses,
+        "restores": s.restores, "evictions": s.evictions, "failures": s.failures})
+}
+
+fn archive_prometheus(s: &slot_archive::ArchiveStats, out: &mut String) {
+    let mut m = |name: &str, kind: &str, help: &str, v: u64| {
+        out.push_str(&format!("# HELP strata_{name} {help}\n# TYPE strata_{name} {kind}\nstrata_{name} {v}\n"));
+    };
+    m("slot_archive_entries", "gauge", "Conversations in the slot archive.", s.entries as u64);
+    m("slot_archive_bytes", "gauge", "Logical bytes in the slot archive.", s.bytes);
+    m("slot_archive_budget_bytes", "gauge", "Logical budget of the slot archive.", s.budget_bytes);
+    m("slot_archive_hits_total", "counter", "Archive lookups that matched a saved prefix.", s.hits);
+    m("slot_archive_misses_total", "counter", "Archive lookups with no match.", s.misses);
+    m("slot_archive_restores_total", "counter", "Successful restores from the archive.", s.restores);
+    m("slot_archive_evictions_total", "counter", "Entries removed by the archive budget.", s.evictions);
+    m("slot_archive_failures_total", "counter", "Archive save/restore/lookup failures.", s.failures);
+}
+
 /// An explicit slot-file operation requested by the admin HTTP routes.
 enum SlotAction {
     Save { slot: usize, path: PathBuf, owner: u64 },
     Restore { slot: usize, path: PathBuf, force: bool },
     Erase { slot: usize },
+    /// Write the slot to the conversation archive (no filename).
+    Checkpoint { slot: usize },
 }
 
 /// What a request thread asks of the model's thread under `--parallel` (`Serving::serve_slots`).
@@ -3528,6 +3724,9 @@ impl Client {
     }
     fn slot_erase(&mut self, slot: usize) -> anyhow::Result<Value> {
         self.control(|back| Job::Slot { action: SlotAction::Erase { slot }, back })
+    }
+    fn slot_checkpoint(&mut self, slot: usize) -> anyhow::Result<Value> {
+        self.control(|back| Job::Slot { action: SlotAction::Checkpoint { slot }, back })
     }
     fn slots_info(&mut self) -> anyhow::Result<Value> {
         self.control(|back| Job::Slots { back })
@@ -3585,6 +3784,8 @@ struct Sched {
     controls: std::collections::VecDeque<Control>,
     /// Restored slots that must not be reclaimed by `kv_grow_unified` while idle.
     pinned: Vec<bool>,
+    /// `--slot-archive-dir`: shared with the serving loop (None: the archive is off).
+    archive: Option<ArchiveHandle>,
 }
 
 enum Control { Action(SlotAction, std::sync::mpsc::Sender<anyhow::Result<Value>>), Info(std::sync::mpsc::Sender<anyhow::Result<Value>>) }
@@ -3653,7 +3854,8 @@ impl Sched {
                 }
                 Control::Action(action, back) => {
                     let slot = match &action {
-                        SlotAction::Save { slot, .. } | SlotAction::Restore { slot, .. } | SlotAction::Erase { slot } => *slot,
+                        SlotAction::Save { slot, .. } | SlotAction::Restore { slot, .. } | SlotAction::Erase { slot }
+                            | SlotAction::Checkpoint { slot } => *slot,
                     };
                     if slot >= self.held.len() {
                         let _ = back.send(Err(anyhow::anyhow!("Invalid slot ID")));
@@ -3703,6 +3905,24 @@ impl Sched {
                             self.pinned[slot] = false;
                             g.set_active(&self.active());
                             Ok(json!({"id_slot": slot, "n_erased": n}))
+                        }
+                        SlotAction::Checkpoint { slot } => {
+                            let Some(archive) = &self.archive else {
+                                anyhow::bail!("This server does not support the slot archive. Start it with `--slot-archive-dir`");
+                            };
+                            g.set_active(&self.active());
+                            let target = g.current_slot();
+                            let busy = self.held.get(slot).copied().unwrap_or(false) || self.prefill.get(slot).copied().unwrap_or(false);
+                            match checkpoint_slot(archive, g, slot, target, "checkpoint", busy)? {
+                                Some(cp) => Ok(json!({
+                                    "id_slot": slot,
+                                    "id": cp.id,
+                                    "n_saved": cp.n_saved,
+                                    "n_written": cp.n_written,
+                                    "timings": {"save_ms": cp.save_ms},
+                                })),
+                                None => anyhow::bail!("slot {slot} has nothing to checkpoint (empty, partial, image or under --slot-archive-min-tokens)"),
+                            }
                         }
                     } })();
                     let _ = back.send(r);
@@ -3770,7 +3990,7 @@ impl Serving {
             // Owned here, so that a panic drops the queued jobs' reply channels and the request threads end (the
             // scope then joins them and the panic goes on).
             let (jobs, mut s) = (jobs, Sched { held: vec![false; n], prefill: vec![false; n], freed: vec![0; n], who: vec![0; n],
-                pinned: vec![false; n], ..Default::default() });
+                pinned: vec![false; n], archive: self.archive.clone(), ..Default::default() });
             let mut open = true;
             loop {
                 while open && wake.is_none() && next.lock().unwrap().is_none() {
@@ -3812,8 +4032,10 @@ impl Serving {
                 // Models with a batched forward prefill the queued prompts together, one free slot each. A unified
                 // KV budget grows one slot at a time, so its prompts are prefilled one at a time (decode still batches).
                 let lim = if g.kv_unified() { 1 } else { g.batch_cap().max(1) };
-                let fits = |c: &Job| matches!(c, Job::Chat { ids, .. } if ids.len() <= g.ctx());
+                let fits = { let ctx = g.ctx(); move |c: &Job| matches!(c, Job::Chat { ids, .. } if ids.len() <= ctx) };
                 let mut adm: Vec<(usize, Job)> = vec![];
+                // Archive writes already made in this batch (a victim is never saved twice).
+                let mut saved: std::collections::HashSet<usize> = std::collections::HashSet::new();
                 // An image prompt runs alone, in the least recently used free slot.
                 if let Some(j) = s.next_chat().filter(|&j| matches!(s.chats[j], Job::Image { .. }))
                     && let Some(sl) = (0..n).filter(|&i| !s.held[i]).min_by_key(|&i| s.freed[i]) {
@@ -3824,16 +4046,75 @@ impl Serving {
                     let Some(j) = s.next_chat() else { break };
                     if !adm.is_empty() && !(fits(&s.chats[j]) && fits(&adm[0].1)) { break; }
                     let Job::Chat { ids, keep, owner, .. } = &s.chats[j] else { break };
-                    let Some(sl) = (0..n).filter(|&i| !s.held[i]).max_by_key(|&i| {
+                    let free = |i: usize| !s.held[i] && !adm.iter().any(|(x, _)| *x == i);
+                    // The free slot whose saved state the prompt extends the furthest, else the least recently used.
+                    let Some(mut sl) = (0..n).filter(|&i| free(i)).max_by_key(|&i| {
                         let (sv, o) = g.slot_saved(i);
                         (if o == *owner && ids[..*keep].starts_with(sv) { sv.len() } else { 0 }, std::cmp::Reverse(s.freed[i]))
                     }) else { break };
-                    // Held while the rest are chosen, so that `next_chat` counts it against its key.
-                    s.pinned[sl] = false;
+                    // An archived prefix longer than anything in RAM: restore it into a free slot (empty first,
+                    // else LRU). A failed restore falls back to the normal slot and prefill.
+                    if let Some(archive) = &self.archive {
+                        let (sv, o) = g.slot_saved(sl);
+                        let ram = if o == *owner && ids[..*keep].starts_with(sv) { sv.len() } else { 0 };
+                        if let Some(hit) = archive_lookup(archive, *owner, ids, *keep, g.slot_fingerprint(), g.ctx())
+                            && hit.n_tokens <= *keep && hit.n_tokens > ram
+                            && let Some(rs) = (0..n).filter(|&i| free(i))
+                                .min_by_key(|&i| (if g.slot_tokens(i).is_empty() { 0u8 } else { 1 }, s.freed[i])) {
+                            // Under a unified KV budget, never evict a non-empty slot for an automatic restore.
+                            g.set_active(&s.active());
+                            let blocked = g.kv_reclaim_plan(rs, hit.n_tokens).iter()
+                                .any(|&v| v != rs && !g.slot_tokens(v).is_empty());
+                            if !blocked {
+                                // The target's old conversation is lost by the restore: checkpoint it first.
+                                if !g.slot_tokens(rs).is_empty() {
+                                    let busy = s.held[rs] || s.prefill[rs];
+                                    if let Err(e) = checkpoint_slot(archive, g, rs, rs, "evict", busy) {
+                                        say!("archive: checkpoint slot {rs} before restore: {e:#}");
+                                    }
+                                    saved.insert(rs);
+                                }
+                                s.pinned[rs] = true;
+                                g.set_active(&s.active());
+                                match archive_restore(archive, g, rs, &hit) {
+                                    Ok(_) => { sl = rs; }
+                                    Err(e) => {
+                                        say!("archive: restore into slot {rs} (falling back to prefill): {e:#}");
+                                        s.pinned[rs] = false;
+                                        g.set_active(&s.active());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Held while the rest are chosen, so that `next_chat` counts it against its key. A restored
+                    // slot was pinned during the restore; once the request holds it, `held` protects it and the pin
+                    // must be cleared or the slot could never be reclaimed again.
                     (s.held[sl], s.who[sl]) = (true, *owner);
+                    s.pinned[sl] = false;
                     adm.push((sl, s.chats.remove(j).unwrap()));
                 }
                 for (sl, _) in &adm { s.held[*sl] = false; }
+                // Before the model grows or resets a slot: save a diverging target and the unified reclaim victims.
+                if let Some(archive) = &self.archive {
+                    g.set_active(&s.active());
+                    for (sl, job) in &adm {
+                        let Job::Chat { ids, keep, .. } = job else { continue };
+                        let h = g.slot_tokens(*sl);
+                        if !h.is_empty() && !(*keep >= h.len() && ids[..*keep].starts_with(h)) && saved.insert(*sl) {
+                            if let Err(e) = checkpoint_slot(archive, g, *sl, *sl, "divergence", false) {
+                                say!("archive: checkpoint slot {sl} (divergence): {e:#}");
+                            }
+                        }
+                        for v in g.kv_reclaim_plan(*sl, ids.len()) {
+                            if v != *sl && !g.slot_tokens(v).is_empty() && saved.insert(v) {
+                                if let Err(e) = checkpoint_slot(archive, g, v, *sl, "evict", false) {
+                                    say!("archive: checkpoint unified victim slot {v}: {e:#}");
+                                }
+                            }
+                        }
+                    }
+                }
                 if !adm.is_empty() {
                     for (sl, _) in &adm { s.prefill[*sl] = true; }
                     g.set_active(&s.active());
@@ -4178,7 +4459,109 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, mut l: Option<&mu
             };
             send(&mut w, "200 OK", v)
         }
+        // The conversation archive (docs/SLOT-ARCHIVE.md §12.2). Admin-only like the slot routes above, and the
+        // archive routes answer before the generic `/slots/{id}` parser.
+        ("GET", "/slots/archive") => {
+            let Some(archive) = &s.archive else {
+                return send(&mut w, "501 Not Implemented", json!({"error": {
+                    "message": "This server does not have a slot archive. Start it with `--slot-archive-dir`",
+                    "type": "not_supported"}}));
+            };
+            let query = path.split('?').nth(1).unwrap_or("");
+            let limit = query.split('&').find_map(|kv| kv.strip_prefix("limit=")).and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+            let owner = query.split('&').find_map(|kv| kv.strip_prefix("owner=")).and_then(|v| v.parse::<u64>().ok());
+            let fingerprint = query.split('&').find_map(|kv| kv.strip_prefix("fingerprint="))
+                .and_then(|v| u64::from_str_radix(v, 16).ok());
+            let (dir, budget, used, entries) = {
+                let a = match archive.lock() { Ok(a) => a, Err(_) => return send(&mut w, "500 Internal Server Error", json!({"error": {"message": "slot archive lock poisoned", "type": "server_error"}})) };
+                let st = a.stats();
+                let mut entries = a.list(owner, 0);
+                if let Some(fp) = fingerprint { entries.retain(|e| e.fingerprint == fp); }
+                if limit > 0 { entries.truncate(limit); }
+                (a.config().dir.display().to_string(), st.budget_bytes, st.bytes, entries)
+            };
+            let entries: Vec<Value> = entries.into_iter().map(|e| json!({
+                "id": e.id,
+                "owner": e.owner,
+                "n_tokens": e.n_tokens,
+                "bytes": e.bytes,
+                "created_ms": e.created_ms,
+                "last_used_ms": e.last_used_ms,
+                "pinned": e.pinned,
+                "reason": e.reason,
+                "fingerprint": format!("{:016x}", e.fingerprint),
+            })).collect();
+            send(&mut w, "200 OK", json!({"dir": dir, "budget_bytes": budget, "used_bytes": used, "entries": entries}))
+        }
+        ("DELETE", r) if r.starts_with("/slots/archive/") => {
+            let Some(archive) = &s.archive else {
+                return send(&mut w, "501 Not Implemented", json!({"error": {
+                    "message": "This server does not have a slot archive. Start it with `--slot-archive-dir`",
+                    "type": "not_supported"}}));
+            };
+            let id = r.trim_start_matches("/slots/archive/");
+            if id.is_empty() || id.contains('/') {
+                return send(&mut w, "400 Bad Request", json!({"error": {"message": "Invalid archive entry id", "type": "invalid_request_error"}}));
+            }
+            let res = match archive.lock() { Ok(mut a) => a.delete(id), Err(_) => Err(anyhow::anyhow!("slot archive lock poisoned")) };
+            match res {
+                Ok(freed) => send(&mut w, "200 OK", json!({"id": id, "deleted": true, "freed_bytes": freed})),
+                Err(err) => send(&mut w, "404 Not Found", json!({"error": {"message": format!("{err:#}"), "type": "not_found"}})),
+            }
+        }
+        ("POST", "/slots/archive/gc") => {
+            let Some(archive) = &s.archive else {
+                return send(&mut w, "501 Not Implemented", json!({"error": {
+                    "message": "This server does not have a slot archive. Start it with `--slot-archive-dir`",
+                    "type": "not_supported"}}));
+            };
+            let res = match archive.lock() { Ok(mut a) => a.gc(), Err(_) => Err(anyhow::anyhow!("slot archive lock poisoned")) };
+            match res {
+                Ok(r) => send(&mut w, "200 OK", json!({"evicted": r.evicted, "freed_bytes": r.freed_bytes})),
+                Err(err) => send(&mut w, "500 Internal Server Error", json!({"error": {"message": format!("{err:#}"), "type": "server_error"}})),
+            }
+        }
         ("POST", r) if r.starts_with("/slots/") => {
+            let query = path.split('?').nth(1).unwrap_or("");
+            let action = query.split('&').find_map(|kv| kv.strip_prefix("action=")).unwrap_or("");
+            // `action=checkpoint` writes to the conversation archive and takes no client filename, so it does not
+            // need `--slot-save-path` (docs/SLOT-ARCHIVE.md §12.2).
+            if action == "checkpoint" {
+                let Some(id) = r.strip_prefix("/slots/").and_then(|x| x.parse::<usize>().ok()) else {
+                    return send(&mut w, "400 Bad Request", json!({"error": {"message": "Invalid slot ID", "type": "invalid_request_error"}}));
+                };
+                let Some(archive) = s.archive.clone() else {
+                    return send(&mut w, "501 Not Implemented", json!({"error": {
+                        "message": "This server does not have a slot archive. Start it with `--slot-archive-dir`",
+                        "type": "not_supported"}}));
+                };
+                let Some(l) = l.as_deref_mut() else {
+                    return send(&mut w, "503 Service Unavailable", json!({"error": {"message": "no model loaded", "type": "server_error"}}));
+                };
+                let res = match &mut l.r {
+                    Runner::Gpu(g) => {
+                        if id >= g.slots() {
+                            return send(&mut w, "400 Bad Request", json!({"error": {"message": "Invalid slot ID", "type": "invalid_request_error"}}));
+                        }
+                        let target = g.current_slot();
+                        checkpoint_slot(&archive, g, id, target, "checkpoint", false).and_then(|cp| {
+                            cp.map(|cp| json!({
+                                "id_slot": id,
+                                "id": cp.id,
+                                "n_saved": cp.n_saved,
+                                "n_written": cp.n_written,
+                                "timings": {"save_ms": cp.save_ms},
+                            })).ok_or_else(|| anyhow::anyhow!("slot {id} has nothing to checkpoint (empty, partial, image or under --slot-archive-min-tokens)"))
+                        })
+                    }
+                    Runner::Slot(c) => { c.owner = who.id; c.slot_checkpoint(id) }
+                    _ => Err(anyhow::anyhow!("slot actions need a GPU model")),
+                };
+                return match res {
+                    Ok(v) => send(&mut w, "200 OK", v),
+                    Err(err) => send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})),
+                };
+            }
             let Some(dir) = s.slot_save_path.as_deref() else {
                 return send(&mut w, "501 Not Implemented", json!({"error": {
                     "message": "This server does not support slots action. Start it with `--slot-save-path`",
@@ -4187,8 +4570,6 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, mut l: Option<&mu
             let Some(id) = r.strip_prefix("/slots/").and_then(|x| x.parse::<usize>().ok()) else {
                 return send(&mut w, "400 Bad Request", json!({"error": {"message": "Invalid slot ID", "type": "invalid_request_error"}}));
             };
-            let query = path.split('?').nth(1).unwrap_or("");
-            let action = query.split('&').find_map(|kv| kv.strip_prefix("action=")).unwrap_or("");
             if !matches!(action, "save" | "restore" | "erase") {
                 return send(&mut w, "400 Bad Request", json!({"error": {"message": "Invalid slots action", "type": "invalid_request_error"}}));
             }
@@ -4443,6 +4824,19 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, mut l: Option<&mu
             };
             let n = room(e, ids.len(), req.max_tokens.unwrap_or(usize::MAX).min(s.max_tokens));
             if n == 0 { return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("prompt of {} tokens fills the context", ids.len()), "type": "invalid_request_error"}})); }
+            // The message history the prompt extends (`Runner::chat` computes the same `keep`). The archive is a
+            // single-slot path here: `--parallel` chats go through `Sched`, not `Runner::Gpu`.
+            let chat_history = if vision_prompt.is_none() {
+                tpl.render(&req.messages[..n_hist], &req.tools, req.think.unwrap_or(e.think_default), preserve, false)
+            } else { String::new() };
+            let chat_keep = if s.archive.is_some() && vision_prompt.is_none() {
+                let h = tok.encode(&chat_history)?;
+                if ids.starts_with(&h) { h.len() } else { 0 }
+            } else { 0 };
+            if let Some(archive) = &s.archive && vision_prompt.is_none()
+                && let Runner::Gpu(g) = &mut *r && g.slots() == 1 {
+                archive_before_single(archive, g, who.id, &ids, chat_keep);
+            }
             let id = format!("chatcmpl-{i}");
             let chunk = |delta: serde_json::Value, finish: Option<&str>| json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": name,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]});
@@ -4477,7 +4871,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, mut l: Option<&mu
                 if req.stream { write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?; }
                 let (chat_ids, chat_logits, chat_cached) = serve::alive(&w, req.stream, || anyhow::Ok(match &vision_prompt {
                     Some(p) => (p.ids.clone(), r.chat_image(p, &image_input.as_ref().unwrap().embeddings)?, 0),
-                    None => r.chat(tok, &prompt, &tpl.render(&req.messages[..n_hist], &req.tools, req.think.unwrap_or(e.think_default), preserve, false), &system)?,
+                    None => r.chat(tok, &prompt, &chat_history, &system)?,
                 }))?;
                 (_, logits, cached) = (chat_ids, chat_logits, chat_cached);
                 if let Runner::Slot(c) = &*r && let Some(t) = c.started { t0 = t; start(&mut busy); }
