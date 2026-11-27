@@ -318,6 +318,22 @@ struct Hosting {
     /// is a safety valve, not a target: a pin route that would exceed it answers 409.
     #[arg(long, value_name = "N")]
     slot_archive_pin_gb: Option<u64>,
+    /// Checkpoint every non-empty resident slot into the conversation archive on a graceful stop (SIGTERM), most
+    /// recently used first, before the model is freed. Off by default: the extra writes delay a restart. When this
+    /// is on, `systemd`'s `TimeoutStopSec` must exceed `--slot-archive-shutdown-timeout` plus the expert-profile save
+    /// (about 3 s).
+    #[arg(long)]
+    slot_archive_on_shutdown: bool,
+    /// Deadline for `--slot-archive-on-shutdown`, for example `30s` or `2m`. Units are `d`, `h`, `m` or `s` (a plain
+    /// number is seconds). A slot save in progress is not interrupted; the deadline is checked before each slot, and
+    /// the rest are logged and skipped [default: 30s].
+    #[arg(long, value_name = "DURATION", default_value = "30s")]
+    slot_archive_shutdown_timeout: String,
+    /// Run archive GC (TTL, quota, unusable entries, orphan segments) this often while the archive is enabled, for
+    /// example `5m` or `1h`; `0` disables the timer [default: 5m]. Units are `d`, `h`, `m` or `s` (a plain number is
+    /// seconds). `POST /slots/archive/gc` stays available either way.
+    #[arg(long, value_name = "DURATION", default_value = "5m")]
+    slot_archive_gc_interval: String,
     /// Free the model (its VRAM and its memory in this process) after this many seconds without a chat request. The
     /// next chat request loads it again, with the same options, and is answered after the load.
     #[arg(long, value_name = "SECONDS")]
@@ -2043,6 +2059,26 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 }
                 None => None,
             };
+            // Shutdown checkpoint and periodic GC only exist with an archive. Both durations use the TTL parser
+            // (`0` = off for GC); a shutdown deadline of zero would skip every slot, so it is refused when enabled.
+            let (shutdown_checkpoint, gc_timer) = match &archive {
+                Some(handle) => {
+                    let shutdown_ms = parse_ttl(&host.slot_archive_shutdown_timeout)
+                        .with_context(|| format!("--slot-archive-shutdown-timeout {:?}", host.slot_archive_shutdown_timeout))?;
+                    anyhow::ensure!(!host.slot_archive_on_shutdown || shutdown_ms > 0,
+                        "--slot-archive-shutdown-timeout must be at least 1s when --slot-archive-on-shutdown is set");
+                    let gc_ms = parse_ttl(&host.slot_archive_gc_interval)
+                        .with_context(|| format!("--slot-archive-gc-interval {:?}", host.slot_archive_gc_interval))?;
+                    let shutdown = host.slot_archive_on_shutdown.then(|| Duration::from_millis(shutdown_ms));
+                    if let Some(d) = shutdown {
+                        say!("slot archive: shutdown checkpoint on (deadline {d:?}, then the expert-profile save)");
+                    }
+                    let gc = (gc_ms > 0).then(|| GcTimer::start(handle.clone(), Duration::from_millis(gc_ms)));
+                    if gc.is_some() { say!("slot archive: periodic gc every {:?}", Duration::from_millis(gc_ms)); }
+                    (shutdown, gc)
+                }
+                None => (None, None),
+            };
             let api_key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
             anyhow::ensure!(api_key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
             let mut allowed_hosts = host.allowed_hosts.clone();
@@ -2087,15 +2123,17 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let (per_key, held) = (host.max_per_key, serve::Open::default());
             let stop = on_sigterm();
             // SIGTERM (systemctl stop or restart): new requests get 503, the requests accepted before it finish, then
-            // the server exits. The model thread does that itself, after saving the expert profile (`Serving::stopped`);
-            // this thread covers a server with no model or one loading. Two looks 0.2 s apart cover a connection counted
-            // just before the signal, and the model thread gets 3 s to save first.
+            // the server exits. The model thread does that itself, after the optional shutdown checkpoint and the
+            // expert-profile save (`Serving::stopped`); this thread covers a server with no model or one loading. Two
+            // looks 0.2 s apart cover a connection counted just before the signal, and the model thread gets 3 s for
+            // the expert profile plus the shutdown checkpoint's own deadline to finish first.
+            let stop_grace = Duration::from_secs(3) + shutdown_checkpoint.unwrap_or_default();
             let oc = open_conns.clone();
             std::thread::spawn(move || loop {
                 std::thread::sleep(Duration::from_millis(200));
                 if !stop.load(Relaxed) { continue; }
                 let n = oc.load(Relaxed);
-                if n == 0 { std::thread::sleep(Duration::from_millis(200)); if oc.load(Relaxed) == 0 { std::thread::sleep(Duration::from_secs(3)); say!("stopped"); std::process::exit(0); } }
+                if n == 0 { std::thread::sleep(Duration::from_millis(200)); if oc.load(Relaxed) == 0 { std::thread::sleep(stop_grace); say!("stopped"); std::process::exit(0); } }
                 else { say!("stopping: {n} requests to finish"); std::thread::sleep(Duration::from_secs(5)); }
             });
             let conn_archive = archive.clone();
@@ -2257,7 +2295,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             });
             let s = Serving { rx: rx.into(), waiting, stop, addr, allowed_hosts, keys, usage, max_tokens: host.max_tokens.unwrap_or(usize::MAX), dir, model: model.clone(), extra,
                 dl: Default::default(), stats, opts: Default::default(), idle: host.auto_unload.map(Duration::from_secs),
-                slot_save_path: host.slot_save_path.clone(), archive, pending: Default::default(), asleep: Default::default(), parked: Default::default(), alias: host.alias };
+                slot_save_path: host.slot_save_path.clone(), archive, pending: Default::default(), asleep: Default::default(), parked: Default::default(), alias: host.alias,
+                shutdown_checkpoint, _gc: gc_timer };
             // The model to load next and the /api/load request waiting for the outcome (none for --model).
             let mut next = model.map(|p| (p, None));
             say!("listening on {} (models folder: {})", term::hl(&url), s.dir.display());
@@ -3451,6 +3490,11 @@ struct Serving {
     slot_save_path: Option<PathBuf>,
     /// `--slot-archive-dir`: the automatic conversation archive; the archive routes answer 501 without it.
     archive: Option<ArchiveHandle>,
+    /// `--slot-archive-on-shutdown`: checkpoint every resident slot on a graceful stop, within this deadline.
+    shutdown_checkpoint: Option<Duration>,
+    /// `--slot-archive-gc-interval`: the periodic archive GC thread; `None` when the archive or the timer is off.
+    /// Dropping it stops and joins the thread, so a graceful stop does not leave it running. Held only for its Drop.
+    _gc: Option<GcTimer>,
     /// v1 async archive commits still writing their file or manifest. Automatic checkpoints are v2 and synchronous
     /// now, so this is normally empty; it is still drained when a serving loop ends (bounded: a wedged disk must not
     /// hold shutdown).
@@ -3499,6 +3543,14 @@ impl Serving {
         // the automatic archive commits, bounded so a wedged disk cannot hold a restart.
         drain_pending_saves(&self.pending);
         next
+    }
+
+    /// On a graceful stop, save every non-empty resident slot once, most recently used first (docs §8). Called
+    /// after the accepted requests drain and before the model is dropped. `recency` is the scheduler's last-freed
+    /// tick per slot; the single-slot path passes an empty slice and the order is just the slot number.
+    fn checkpoint_on_shutdown(&self, g: &mut GpuModel, recency: &[u64]) {
+        let (Some(timeout), Some(archive)) = (self.shutdown_checkpoint, &self.archive) else { return };
+        checkpoint_slots_on_shutdown(archive, g, recency, timeout);
     }
 
     /// One serving loop; [`Serving::serve`] drains the background archive commits after it returns.
@@ -3613,6 +3665,58 @@ fn drain_pending_saves_within(pending: &PendingSaves, timeout: Duration) {
 /// [`drain_pending_saves_within`] with the server's bounded shutdown wait.
 fn drain_pending_saves(pending: &PendingSaves) { drain_pending_saves_within(pending, PENDING_SAVE_JOIN); }
 
+/// `--slot-archive-gc-interval`: a background loop that runs [`Archive::gc`] at the interval while the archive is
+/// enabled. It takes the archive lock only for the GC call, never touches the model, and polls a stop flag between
+/// short sleeps so a graceful stop does not wait for the next interval. Dropping the timer stops it and waits a
+/// bounded time for a GC already running (a wedged disk must not hold shutdown).
+struct GcTimer {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// How long shutdown waits for a periodic GC already running before leaving it to the process exit.
+const GC_JOIN: Duration = Duration::from_secs(2);
+
+impl GcTimer {
+    fn start(archive: ArchiveHandle, interval: Duration) -> GcTimer {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let handle = std::thread::Builder::new().name("slot-archive-gc".into()).spawn(move || {
+            let poll = Duration::from_millis(100).min(interval);
+            loop {
+                // Sleep the interval in poll-sized pieces, stopping early on shutdown.
+                let mut left = interval;
+                while !left.is_zero() && !flag.load(Relaxed) {
+                    let d = left.min(poll);
+                    std::thread::sleep(d);
+                    left = left.saturating_sub(d);
+                }
+                if flag.load(Relaxed) { break; }
+                let res = match archive.lock() {
+                    Ok(mut a) => a.gc(),
+                    Err(_) => Err(anyhow::anyhow!("slot archive lock poisoned")),
+                };
+                match res {
+                    Ok(r) => say!("archive: periodic gc: {} evicted, {} expired, {} bytes freed", r.evicted, r.expired, r.freed_bytes),
+                    Err(e) => say!("archive: periodic gc: {e:#}"),
+                }
+            }
+        }).expect("spawn the slot-archive GC thread");
+        GcTimer { stop, handle: Some(handle) }
+    }
+}
+
+impl Drop for GcTimer {
+    fn drop(&mut self) {
+        self.stop.store(true, Relaxed);
+        let Some(h) = self.handle.take() else { return };
+        let deadline = Instant::now() + GC_JOIN;
+        while !h.is_finished() && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(20)); }
+        if h.is_finished() { let _ = h.join(); }
+        else { say!("archive: periodic gc still running at shutdown; not waiting further"); }
+    }
+}
+
 /// Parse a `--slot-archive-ttl` duration into milliseconds. A plain number means seconds; `d`, `h`, `m` and `s`
 /// are the units, and `0` disables the TTL. Fractions are refused rather than silently rounded.
 fn parse_ttl(s: &str) -> anyhow::Result<u64> {
@@ -3656,6 +3760,15 @@ fn below_min_delta(n_tokens: usize, longest: Option<usize>, min_delta: usize) ->
 /// core ([`GpuModel::mark_slot_saved`]) once the entry is persisted.
 fn checkpoint_slot(archive: &ArchiveHandle, g: &mut GpuModel, slot: usize, target: usize, reason: &str,
                    busy: bool) -> anyhow::Result<Option<CheckpointInfo>> {
+    checkpoint_slot_with(archive, g, slot, target, reason, busy, false)
+}
+
+/// [`checkpoint_slot`], with `force` to ignore the `--slot-archive-min-delta` heuristic. The shutdown checkpoint
+/// forces a save because it is the last chance for the conversation; `--slot-archive-min-tokens` is still enforced
+/// by [`Archive::save_segmented`].
+#[allow(clippy::too_many_arguments)]
+fn checkpoint_slot_with(archive: &ArchiveHandle, g: &mut GpuModel, slot: usize, target: usize, reason: &str,
+                        busy: bool, force: bool) -> anyhow::Result<Option<CheckpointInfo>> {
     if busy || slot >= g.slots() { return Ok(None); }
     let tokens = g.slot_tokens(slot).to_vec();
     if tokens.is_empty() { return Ok(None); }
@@ -3673,7 +3786,7 @@ fn checkpoint_slot(archive: &ArchiveHandle, g: &mut GpuModel, slot: usize, targe
     // A continuation that grew less than `min_delta` past the longest archived prefix is not worth a new entry.
     // An exact duplicate is still touched (not rewritten) by `save_segmented`, so it bypasses this check.
     let longest = a.longest_prefix(owner, &tokens, fp).map(|e| e.n_tokens);
-    if below_min_delta(tokens.len(), longest, a.config().min_delta) {
+    if !force && below_min_delta(tokens.len(), longest, a.config().min_delta) {
         drop(a);
         if g.current_slot() != target { g.use_slot(target); }
         return Ok(None);
@@ -3693,6 +3806,64 @@ fn checkpoint_slot(archive: &ArchiveHandle, g: &mut GpuModel, slot: usize, targe
         }
         Err(e) => { a.note_failure(); Err(e) }
     }
+}
+
+/// The shutdown checkpoint's slot order: most recently used first. `recency[slot]` is the scheduler's last-freed
+/// tick (higher = more recent; the single-slot path has no ticks and passes an empty slice). Ties keep the lower
+/// slot first, so the order is deterministic.
+fn shutdown_checkpoint_order(n: usize, recency: &[u64]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&s| (std::cmp::Reverse(recency.get(s).copied().unwrap_or(0)), s));
+    order
+}
+
+/// Time left before a shutdown checkpoint's deadline, or `None` once it is spent. The deadline is checked between
+/// synchronous slot saves; a save already running is not interrupted.
+fn shutdown_budget(start: Instant, timeout: Duration) -> Option<Duration> {
+    timeout.checked_sub(start.elapsed()).filter(|left| !left.is_zero())
+}
+
+/// Checkpoint every non-empty resident slot on a graceful stop, most recently used first, within `timeout`. The v2
+/// `save_segmented` call is synchronous, so the deadline is checked before each slot and the rest are logged and
+/// skipped; a slot already saving finishes. Failures are logged and counted, never fatal. Returns
+/// `(saved, skipped, failed, bytes_written)` for the summary.
+fn checkpoint_slots_on_shutdown(archive: &ArchiveHandle, g: &mut GpuModel, recency: &[u64], timeout: Duration)
+    -> (usize, usize, usize, u64) {
+    let start = Instant::now();
+    let target = g.current_slot();
+    let order = shutdown_checkpoint_order(g.slots(), recency);
+    let (mut saved, mut skipped, mut failed, mut bytes) = (0, 0, 0, 0u64);
+    let mut deadline_hit = false;
+    for slot in order {
+        let n = g.slot_tokens(slot).len();
+        if n == 0 { continue; }
+        // As in a normal checkpoint: a partial state or an image prompt is not a plain text prefix.
+        if g.slot_pos(slot) != n || g.slot_shifted(slot) {
+            say!("archive: shutdown checkpoint: slot {slot} skipped ({n} tokens: partial or image state)");
+            skipped += 1;
+            continue;
+        }
+        if shutdown_budget(start, timeout).is_none() {
+            say!("archive: shutdown checkpoint: slot {slot} skipped ({n} tokens): deadline {timeout:?} reached");
+            skipped += 1;
+            deadline_hit = true;
+            continue;
+        }
+        // Forced: a shutdown is the last chance for this conversation, so a small growth since the last entry is
+        // still worth saving. `--slot-archive-min-tokens` remains the core's lower bound.
+        match checkpoint_slot_with(archive, g, slot, target, "shutdown", false, true) {
+            Ok(Some(cp)) => { saved += 1; bytes = bytes.saturating_add(cp.n_written); }
+            Ok(None) => {
+                say!("archive: shutdown checkpoint: slot {slot} skipped ({n} tokens: below --slot-archive-min-tokens)");
+                skipped += 1;
+            }
+            Err(e) => { say!("archive: shutdown checkpoint: slot {slot}: {e:#}"); failed += 1; }
+        }
+    }
+    let ms = start.elapsed().as_secs_f64() * 1e3;
+    let late = if deadline_hit { ", deadline reached" } else { "" };
+    say!("archive: shutdown checkpoint: saved {saved}, skipped {skipped}, failed {failed}, {bytes} bytes in {ms:.1} ms (deadline {timeout:?}{late})");
+    (saved, skipped, failed, bytes)
 }
 
 /// Look an exact archived prefix up, taking a lease that protects it from DELETE and GC. Errors and misses are
@@ -4139,6 +4310,8 @@ impl Serving {
         let (last, mut idle, mut wake) = (std::sync::Mutex::new(Instant::now()), false, None);
         let rx = self.rx.lock().unwrap();
         let n = g.slots();
+        // The scheduler's last-used order, kept after the scope for the shutdown checkpoint.
+        let mut recency = Vec::new();
         std::thread::scope(|sc| {
             // Owned here, so that a panic drops the queued jobs' reply channels and the request threads end (the
             // scope then joins them and the panic goes on).
@@ -4329,8 +4502,13 @@ impl Serving {
                 }
                 if s.ready() { s.run(g); }
             }
+            recency = s.freed.clone();
         });
-        match (next.into_inner().unwrap(), wake) { (Some((p, w)), _) => Next::Load(p, w), (None, Some(p)) => Next::Wake(p), (None, None) if idle => Next::Idle, _ => Next::Stop }
+        let next = match (next.into_inner().unwrap(), wake) { (Some((p, w)), _) => Next::Load(p, w), (None, Some(p)) => Next::Wake(p), (None, None) if idle => Next::Idle, _ => Next::Stop };
+        // A graceful stop: all request threads have ended, so checkpoint the resident slots in the scheduler's
+        // most-recently-used order before the model is dropped.
+        if matches!(&next, Next::Stop) { self.checkpoint_on_shutdown(g, &recency); }
+        next
     }
 }
 
@@ -4474,6 +4652,13 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
     }
     let next = s.serve(Some(&mut l), &engine);
     s.stats.lock().unwrap().unload(None);
+    // A graceful stop (SIGTERM/stopped): the accepted requests have drained, so checkpoint the resident slots before
+    // the expert-profile save and the model drop. The `--parallel` path does this in `serve_slots`, where the
+    // scheduler's recency order is still available.
+    if matches!(&next, Next::Stop) && !matches!(&l.r, Runner::Gpu(g) if g.slots() > 1)
+        && let Runner::Gpu(g) = &mut l.r {
+        s.checkpoint_on_shutdown(g, &[]);
+    }
     // A failed profile save must not stop the server between two models.
     if let Err(e) = l.r.finish() { say!("{e:#}"); }
     Ok(next)
@@ -5946,5 +6131,62 @@ mod archive_ttl_tests {
         for bad in ["", " ", "-1", "1.5h", "12x", "d", "30 d", "h30", "99999999999999999999d"] {
             assert!(parse_ttl(bad).is_err(), "{bad:?} should be refused");
         }
+    }
+}
+
+#[cfg(test)]
+mod archive_lifecycle_flag_tests {
+    use super::{parse_ttl, Cmd, Cli};
+    use clap::Parser;
+
+    fn host(args: &[&str]) -> super::Hosting {
+        let cli = Cli::try_parse_from(args).expect("the test flags parse");
+        let Some(Cmd::Serve { host, .. }) = cli.cmd else { panic!("serve expected") };
+        host
+    }
+
+    #[test]
+    fn shutdown_and_gc_defaults() {
+        let h = host(&["rustingstrata", "serve"]);
+        assert!(!h.slot_archive_on_shutdown);
+        assert_eq!(h.slot_archive_shutdown_timeout, "30s");
+        assert_eq!(h.slot_archive_gc_interval, "5m");
+        // The defaults use the same duration parser as --slot-archive-ttl.
+        assert_eq!(parse_ttl(&h.slot_archive_shutdown_timeout).unwrap(), 30_000);
+        assert_eq!(parse_ttl(&h.slot_archive_gc_interval).unwrap(), 300_000);
+    }
+
+    #[test]
+    fn shutdown_and_gc_flags_are_accepted() {
+        let h = host(&["rustingstrata", "serve", "--slot-archive-on-shutdown",
+            "--slot-archive-shutdown-timeout", "90s", "--slot-archive-gc-interval", "0"]);
+        assert!(h.slot_archive_on_shutdown);
+        assert_eq!(parse_ttl(&h.slot_archive_shutdown_timeout).unwrap(), 90_000);
+        // `0` is the documented way to turn the periodic timer off.
+        assert_eq!(parse_ttl(&h.slot_archive_gc_interval).unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod archive_shutdown_tests {
+    use super::{shutdown_budget, shutdown_checkpoint_order};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn checkpoint_order_is_most_recently_used_first() {
+        // Higher last-freed ticks are more recent; equal ticks keep the lower slot first.
+        assert_eq!(shutdown_checkpoint_order(4, &[5, 9, 1, 9]), vec![1, 3, 0, 2]);
+        // The single-slot path passes no ticks: slot order is the natural order.
+        assert_eq!(shutdown_checkpoint_order(3, &[]), vec![0, 1, 2]);
+        assert!(shutdown_checkpoint_order(0, &[]).is_empty());
+    }
+
+    #[test]
+    fn deadline_is_spent_once_the_timeout_passes() {
+        let now = Instant::now();
+        assert!(shutdown_budget(now, Duration::from_secs(30)).is_some());
+        assert!(shutdown_budget(now - Duration::from_secs(31), Duration::from_secs(30)).is_none());
+        // Exactly at the deadline counts as spent: the next slot is skipped.
+        assert!(shutdown_budget(now - Duration::from_millis(5), Duration::from_millis(5)).is_none());
     }
 }
