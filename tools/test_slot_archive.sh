@@ -7,23 +7,28 @@
 # archived prefix is restored (cached_tokens), checkpoints the slot explicitly,
 # deletes that checkpoint, runs a manual GC, restarts the server on the same
 # archive directory, and checks that the divergence entry survived and still
-# restores. Last, it starts a second server without --slot-archive-dir and
-# checks that the archive routes answer 501.
+# restores. It then starts a --parallel 2 server on a separate archive
+# directory, sends A and B into different slots, sends a third conversation C
+# that must evict one of them, checks the evicted state reached the archive,
+# restarts the parallel server, and checks that the continuation of the
+# evicted conversation restores its prefix from disk (cached_tokens). Finally,
+# it starts a server without --slot-archive-dir and checks that the archive
+# routes answer 501.
 #
 # Usage: tools/test_slot_archive.sh MODEL BIN SERVER_DIR [PORT]
 #
 #   MODEL       GGUF model to serve.
 #   BIN         rustingstrata binary (a path, or a name on PATH).
 #   SERVER_DIR  directory the server runs in.
-#   PORT        port of the archive-enabled server (default 8080); PORT + 1 is
-#               used by the server without --slot-archive-dir.
+#   PORT        port of the archive-enabled servers (default 8080); PORT + 1
+#               is used by the server without --slot-archive-dir.
 #
 # Environment:
 #   LOAD_TIMEOUT     seconds to wait for a model load (default 600).
 #   REQUEST_TIMEOUT  seconds per HTTP test request (default 600).
 #
 # Requires python3 (stdlib urllib only), a CUDA GPU, and enough VRAM for
-# --parallel 1 with a 64k q8 KV cache.
+# --parallel 1 and --parallel 2 with a 64k q8 KV cache.
 
 set -uo pipefail
 
@@ -34,8 +39,9 @@ Usage: tools/test_slot_archive.sh MODEL BIN SERVER_DIR [PORT]
   MODEL       GGUF model to serve
   BIN         rustingstrata binary (path or name on PATH)
   SERVER_DIR  directory the server runs in
-  PORT        archive-enabled server port (default 8080); the server
-              without --slot-archive-dir uses PORT + 1
+  PORT        archive-enabled server port (default 8080), shared in turn by
+              the single-slot, parallel and no-flag servers; PORT + 1 is
+              used by the server without --slot-archive-dir
 
 Environment: LOAD_TIMEOUT (default 600), REQUEST_TIMEOUT (default 600)
 EOF
@@ -81,13 +87,18 @@ fi
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/strata-slot-archive.XXXXXX") \
   || fail "could not create a temporary directory"
 ARCHIVE="$WORK/archive"
+ARCHIVE2="$WORK/archive-parallel"
 STATE="$WORK/state.json"
+STATE2="$WORK/parallel-state.json"
 LOG1="$WORK/server-archive.log"
 LOG2="$WORK/server-restart.log"
 LOG3="$WORK/server-noflag.log"
+LOG4="$WORK/server-parallel.log"
+LOG5="$WORK/server-parallel-restart.log"
 
 PID1=""
 PID2=""
+PID3=""
 SERVER_PID=""
 
 alive() {
@@ -111,6 +122,7 @@ stop_server() {
 cleanup() {
   stop_server "${PID1:-}"
   stop_server "${PID2:-}"
+  stop_server "${PID3:-}"
   rm -rf -- "$WORK"
 }
 trap cleanup EXIT
@@ -134,6 +146,15 @@ start_server() {
       ( cd "$SERVER_DIR" && exec "$BIN" serve \
           --model "$MODEL" --gpu --backend cuda --parallel 1 --ctx 65536 \
           --kv q8 --addr "127.0.0.1:$port" ) >"$log" 2>&1 &
+      ;;
+    parallel)
+      # Two slots make the scheduler keep A and B side by side; a third
+      # conversation then has to evict one of them into ARCHIVE2.
+      ( cd "$SERVER_DIR" && exec "$BIN" serve \
+          --model "$MODEL" --gpu --backend cuda --parallel 2 --ctx 65536 \
+          --kv q8 --slot-archive-dir "$ARCHIVE2" --slot-archive-gb 5 \
+          --slot-archive-min-tokens 64 --slot-archive-min-delta 1 \
+          --addr "127.0.0.1:$port" ) >"$log" 2>&1 &
       ;;
     *)
       fail "unknown server mode: $mode"
@@ -274,13 +295,24 @@ PARAGRAPH_B = (
     "capture better than any official survey. "
 )
 
+PARAGRAPH_C = (
+    "A printing house in the old quarter kept its metal type in numbered "
+    "cases, and an apprentice learned the layout by touch before he set a "
+    "single line. The foreman measured each page in picas, locked the forme "
+    "with wooden quoins, and inked the letters with a leather ball. When a "
+    "storm broke the skylight, the crew covered the presses with canvas and "
+    "dried the paper beside the stove, because a wet sheet would smear every "
+    "impression and waste a week of work. The last owner donated the cases to "
+    "a museum, where visitors still trace the letters and smell the oil. "
+)
 
-def long_prompt(paragraph):
+
+def long_prompt(paragraph, size=8000):
     parts = []
-    size = 0
-    while size < 8000:  # roughly 2000 tokens, well above --slot-archive-min-tokens
+    total = 0
+    while total < size:  # roughly 2000 tokens, well above --slot-archive-min-tokens
         parts.append(paragraph)
-        size += len(paragraph)
+        total += len(paragraph)
     return "".join(parts) + "\n\nAnswer with one short sentence."
 
 
@@ -611,6 +643,330 @@ def run_restart(base, state_path, timeout):
     return report.summary()
 
 
+def slots_of(base, timeout):
+    status, body = http(base, "GET", "/slots", None, timeout)
+    slots = as_obj(body).get("slots")
+    if not isinstance(slots, list):
+        return status, body, []
+    return status, body, [slot for slot in slots if isinstance(slot, dict)]
+
+
+def used_map(slots):
+    return {
+        as_int(slot.get("id")): as_int(slot.get("n_past"))
+        for slot in slots
+        if as_int(slot.get("n_past")) > 0
+    }
+
+
+def run_parallel(base, state_path, archive_dir, timeout):
+    report = Report()
+    prompt_a = long_prompt(PARAGRAPH_A)
+    prompt_b = long_prompt(PARAGRAPH_B)
+    # C is deliberately longer than A and B, so its token count cannot be
+    # mistaken for the evicted slot's previous count when the slots are read.
+    prompt_c = long_prompt(PARAGRAPH_C, 9200)
+
+    status, body = chat(base, [{"role": "user", "content": prompt_a}], timeout)
+    reply_a = reply_of(as_obj(body))
+    report.check(
+        "parallel: prompt A answered",
+        status == 200 and bool(reply_a),
+        "status=%s reply=%s" % (status, brief(reply_a)),
+    )
+    status_a, body_a, slots_a = slots_of(base, timeout)
+    used_a = used_map(slots_a)
+    report.check(
+        "parallel: GET /slots after A returns 200",
+        status_a == 200,
+        "status=%s body=%s" % (status_a, brief(body_a)),
+    )
+    report.check(
+        "parallel: A occupies exactly one slot",
+        len(used_a) == 1,
+        "slots=%s" % brief(body_a),
+    )
+    a_slot = next(iter(used_a)) if len(used_a) == 1 else None
+    a_n = used_a.get(a_slot)
+
+    # B must be admitted to the other free slot: with two slots and no prior
+    # state the scheduler has no reason to reuse A's, and if it does the
+    # eviction test below is meaningless.
+    status, body = chat(base, [{"role": "user", "content": prompt_b}], timeout)
+    reply_b = reply_of(as_obj(body))
+    report.check(
+        "parallel: prompt B answered",
+        status == 200 and bool(reply_b),
+        "status=%s reply=%s" % (status, brief(reply_b)),
+    )
+    status_b, body_b, slots_b = slots_of(base, timeout)
+    used_b = used_map(slots_b)
+    report.check(
+        "parallel: GET /slots after B returns 200",
+        status_b == 200,
+        "status=%s body=%s" % (status_b, brief(body_b)),
+    )
+    others = [slot for slot in used_b if slot != a_slot]
+    b_slot = others[0] if len(others) == 1 else None
+    placement_ok = (
+        len(used_b) == 2
+        and a_slot is not None
+        and b_slot is not None
+        and used_b.get(a_slot) == a_n
+    )
+    report.check(
+        "parallel: A and B land in different slots",
+        placement_ok,
+        "A slot=%r n_past=%r; after B used=%s body=%s"
+        % (a_slot, a_n, used_b, brief(body_b)),
+    )
+    report.check(
+        "parallel: A's slot is untouched by B",
+        a_slot is not None and used_b.get(a_slot) == a_n,
+        "A slot=%r n_past=%r; after B used=%s"
+        % (a_slot, a_n, used_b),
+    )
+    if not placement_ok:
+        print(
+            "NOTE parallel: A and B share a slot; cannot test eviction",
+            flush=True,
+        )
+        return report.summary()
+
+    # C extends neither history, so the scheduler must pick the least recently
+    # used slot, checkpoint its conversation and replace it with C.
+    status, body = chat(base, [{"role": "user", "content": prompt_c}], timeout)
+    reply_c = reply_of(as_obj(body))
+    report.check(
+        "parallel: prompt C answered",
+        status == 200 and bool(reply_c),
+        "status=%s reply=%s" % (status, brief(reply_c)),
+    )
+    status_c, body_c, slots_c = slots_of(base, timeout)
+    used_c = used_map(slots_c)
+    report.check(
+        "parallel: GET /slots after C returns 200",
+        status_c == 200,
+        "status=%s body=%s" % (status_c, brief(body_c)),
+    )
+
+    # The slot that changed n_past now holds C; the other still holds exactly
+    # the token count A or B had after its turn. Compare per slot, so the test
+    # does not assume whether the scheduler chose A's or B's slot.
+    changed = [slot for slot in (a_slot, b_slot) if used_c.get(slot) != used_b.get(slot)]
+    unchanged = [slot for slot in (a_slot, b_slot) if used_c.get(slot) == used_b.get(slot)]
+    resident_slot = unchanged[0] if len(unchanged) == 1 else None
+    c_slot = changed[0] if len(changed) == 1 else None
+    eviction_ok = (
+        len(used_c) == 2
+        and resident_slot is not None
+        and c_slot is not None
+        and resident_slot != c_slot
+        and used_c.get(c_slot, 0) > 0
+    )
+    report.check(
+        "parallel: C evicts one conversation",
+        eviction_ok,
+        "after B=%s after C=%s changed=%s unchanged=%s body=%s"
+        % (used_b, used_c, changed, unchanged, brief(body_c)),
+    )
+    if resident_slot == a_slot:
+        resident_label, evicted_label = "A", "B"
+    elif resident_slot == b_slot:
+        resident_label, evicted_label = "B", "A"
+    else:
+        resident_label, evicted_label = None, None
+    if not eviction_ok or evicted_label is None:
+        print("NOTE parallel: could not identify the evicted conversation", flush=True)
+        return report.summary()
+    evicted_slot = a_slot if evicted_label == "A" else b_slot
+    evicted_n = used_b.get(evicted_slot)
+    print(
+        "NOTE parallel: %s remains in slot %r (n_past=%r); %s was evicted from slot %r (n_past=%r)"
+        % (resident_label, resident_slot, used_c.get(resident_slot),
+           evicted_label, evicted_slot, evicted_n),
+        flush=True,
+    )
+
+    entry = None
+    archive_body = {}
+    last = "no response"
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        status, body = http(base, "GET", "/slots/archive", None, 5.0)
+        last = "status=%s body=%s" % (status, brief(body))
+        if status == 200:
+            archive_body = as_obj(body)
+            entries = entries_of(body)
+            if entries:
+                # The evicted slot was checkpointed at exactly its last turn's
+                # n_past, so the entry's token count identifies it among the
+                # conversations that lived in the two slots.
+                matching = [
+                    e for e in entries if as_int(e.get("n_tokens")) == evicted_n
+                ]
+                entry = (
+                    matching[0]
+                    if matching
+                    else max(entries, key=lambda e: as_int(e.get("n_tokens")))
+                )
+                break
+        time.sleep(0.25)
+
+    report.check(
+        "parallel: GET /slots/archive returns 200",
+        last.startswith("status=200"),
+        last,
+    )
+    check_metadata(report, archive_body, archive_dir)
+
+    entries = entries_of(archive_body)
+    report.check(
+        "parallel: archive lists the evicted entry",
+        entry is not None and bool(entries),
+        "evicted=%s n_past=%r %s" % (evicted_label, evicted_n, last),
+    )
+    if entry is None and entries:
+        entry = entries[0]
+    report.check(
+        "parallel: archive entry matches the evicted conversation",
+        entry is not None
+        and evicted_n is not None
+        and evicted_n > 0
+        and as_int(entry.get("n_tokens")) == evicted_n,
+        "evicted=%s n_past=%r entry=%s" % (evicted_label, evicted_n, brief(entry)),
+    )
+    if entry is not None:
+        report.check(
+            "parallel: archive entry has an id",
+            isinstance(entry.get("id"), str) and bool(entry.get("id")),
+            "entry=%s" % brief(entry),
+        )
+        reason = entry.get("reason")
+        report.check(
+            "parallel: archive entry records a reason",
+            isinstance(reason, str) and bool(reason),
+            "reason=%r entry=%s" % (reason, brief(entry)),
+        )
+        report.positive(
+            "parallel: archive entry n_tokens > 0", as_int(entry.get("n_tokens"))
+        )
+        report.positive(
+            "parallel: archive entry bytes > 0", as_int(entry.get("bytes"))
+        )
+        print("NOTE parallel evicted entry: %s" % brief(entry), flush=True)
+
+    replies = {"A": reply_a, "B": reply_b}
+    prompts = {"A": prompt_a, "B": prompt_b}
+    # The restart phase must replay the exact strings the server tokenized.
+    write_state(
+        state_path,
+        {
+            "archive_dir": archive_dir,
+            "entry_id": entry.get("id") if entry is not None else None,
+            "entry_n_tokens": (
+                as_int(entry.get("n_tokens")) if entry is not None else 0
+            ),
+            "evicted_label": evicted_label,
+            "evicted_prompt": prompts.get(evicted_label, ""),
+            "evicted_reply": replies.get(evicted_label) or "...",
+            "evicted_n_past": evicted_n if evicted_n is not None else 0,
+            "resident_label": resident_label,
+        },
+    )
+    return report.summary()
+
+
+def run_parallel_restart(base, state_path, timeout):
+    report = Report()
+    state = read_state(state_path)
+    entry_id = state.get("entry_id")
+    entry_n = as_int(state.get("entry_n_tokens"))
+    evicted_label = state.get("evicted_label")
+    prompt = state.get("evicted_prompt") or ""
+    assistant_reply = state.get("evicted_reply") or "..."
+
+    status, body = http(base, "GET", "/slots/archive", None, timeout)
+    obj = as_obj(body)
+    report.check(
+        "parallel: restart GET /slots/archive returns 200",
+        status == 200,
+        "status=%s body=%s" % (status, brief(obj)),
+    )
+    check_metadata(report, obj, state.get("archive_dir"))
+
+    entries = entries_of(obj)
+    listed = (
+        entry_id in ids_of(obj) if isinstance(entry_id, str) else False
+    )
+    report.check(
+        "parallel: archive survives restart",
+        listed,
+        "id=%r body=%s" % (entry_id, brief(obj)),
+    )
+    if listed:
+        entry = next((e for e in entries if e.get("id") == entry_id), {})
+        report.positive(
+            "parallel: restart entry keeps n_tokens", as_int(entry.get("n_tokens"))
+        )
+        report.check(
+            "parallel: restart entry keeps the evicted token count",
+            entry_n > 0 and as_int(entry.get("n_tokens")) == entry_n,
+            "n_tokens=%r want=%r entry=%s"
+            % (entry.get("n_tokens"), entry_n, brief(entry)),
+        )
+        report.positive(
+            "parallel: restart entry keeps bytes", as_int(entry.get("bytes"))
+        )
+
+    # Same strings as the evicted turn: no slot holds the conversation after
+    # the restart, so a cached prefix can only come from ARCHIVE2 on disk.
+    continuation = [
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": assistant_reply},
+        {"role": "user", "content": "Continue with one short sentence"},
+    ]
+    status, body = chat(base, continuation, timeout)
+    obj = as_obj(body)
+    cached = cached_of(obj)
+    report.check(
+        "parallel: restart continuation returns 200",
+        status == 200,
+        "status=%s body=%s" % (status, brief(obj)),
+    )
+    report.check(
+        "parallel: restart restores the archived prefix",
+        status == 200 and cached > 0,
+        "evicted=%s cached_tokens=%d body=%s"
+        % (evicted_label, cached, brief(obj)),
+    )
+
+    status, body, slots = slots_of(base, timeout)
+    report.check(
+        "parallel: GET /slots after restart returns 200",
+        status == 200,
+        "status=%s body=%s" % (status, brief(body)),
+    )
+    report.check(
+        "parallel: /slots reports the expected number of slots",
+        len(slots) == 2,
+        "slots=%d body=%s" % (len(slots), brief(body)),
+    )
+    report.check(
+        "parallel: /slots reports pinned as a boolean for every slot",
+        bool(slots) and all(isinstance(slot.get("pinned"), bool) for slot in slots),
+        "slots=%s" % brief(slots),
+    )
+    used = used_map(slots)
+    report.check(
+        "parallel: restored conversation occupies a slot",
+        len(used) >= 1,
+        "used=%s slots=%s" % (used, brief(slots)),
+    )
+    print("NOTE parallel slots after restart: %s" % brief(slots), flush=True)
+    return report.summary()
+
+
 def run_noflag(base):
     report = Report()
     status, body = http(base, "GET", "/slots/archive")
@@ -719,6 +1075,22 @@ def main(argv):
             )
             return 2
         return run_restart(base, argv[3], seconds(argv[4], 600.0))
+    if mode == "parallel":
+        if len(argv) < 6:
+            print(
+                "usage: check.py parallel BASE_URL STATE_FILE ARCHIVE_DIR TIMEOUT",
+                file=sys.stderr,
+            )
+            return 2
+        return run_parallel(base, argv[3], argv[4], seconds(argv[5], 600.0))
+    if mode == "parallel-restart":
+        if len(argv) < 5:
+            print(
+                "usage: check.py parallel-restart BASE_URL STATE_FILE TIMEOUT",
+                file=sys.stderr,
+            )
+            return 2
+        return run_parallel_restart(base, argv[3], seconds(argv[4], 600.0))
     if mode == "noflag":
         return run_noflag(base)
     print("unknown mode: %s" % mode, file=sys.stderr)
@@ -737,6 +1109,7 @@ echo "test_slot_archive: binary=$BIN"
 echo "test_slot_archive: server dir=$SERVER_DIR"
 echo "test_slot_archive: ports=$PORT and $PORT2"
 echo "test_slot_archive: temporary archive dir=$ARCHIVE"
+echo "test_slot_archive: temporary parallel archive dir=$ARCHIVE2"
 echo
 
 echo "starting archive server on 127.0.0.1:$PORT"
@@ -761,6 +1134,30 @@ fi
 run_py restart "http://127.0.0.1:$PORT" "$STATE" "$REQUEST_TIMEOUT" || FAILED=1
 stop_server "$PID1"
 PID1=""
+
+echo
+echo "starting --parallel 2 archive server on 127.0.0.1:$PORT"
+start_server "$PORT" "$LOG4" parallel
+PID3=$SERVER_PID
+if ! run_py wait "http://127.0.0.1:$PORT" "$LOG4" "$PID3" "$LOAD_TIMEOUT"; then
+  fail "parallel archive server did not become ready"
+fi
+
+run_py parallel "http://127.0.0.1:$PORT" "$STATE2" "$ARCHIVE2" "$REQUEST_TIMEOUT" || FAILED=1
+stop_server "$PID3"
+PID3=""
+
+echo
+echo "restarting --parallel 2 archive server on 127.0.0.1:$PORT with the same directory"
+start_server "$PORT" "$LOG5" parallel
+PID3=$SERVER_PID
+if ! run_py wait "http://127.0.0.1:$PORT" "$LOG5" "$PID3" "$LOAD_TIMEOUT"; then
+  fail "restarted parallel archive server did not become ready"
+fi
+
+run_py parallel-restart "http://127.0.0.1:$PORT" "$STATE2" "$REQUEST_TIMEOUT" || FAILED=1
+stop_server "$PID3"
+PID3=""
 
 echo
 echo "starting server without --slot-archive-dir on 127.0.0.1:$PORT2"
