@@ -463,7 +463,7 @@ def run(base, archive_dir, target_tokens, repeats, chars_per_token, timeout):
     report.check(
         "archive reports entries and a positive budget",
         is_number(archive.get("used_bytes"))
-        and as_int(archive.get("entries")) >= 1
+        and len(archive.get("entries") or []) >= 1
         and is_number(archive.get("budget_bytes"))
         and archive.get("budget_bytes") > 0,
         "body=%s" % brief(archive),
