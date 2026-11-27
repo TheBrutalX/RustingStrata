@@ -11,7 +11,8 @@ that operators need.
 
 ## Implementation status (phase 2 subset)
 
-Landed on `feat/archive-phase2`:
+Landed on `feat/archive-phase2`; the phase-3 wave below adds resumable I/O, durable manifests, shutdown/GC and
+fault/perf harnesses.
 
 - **v2 segmented entries.** New checkpoints are format 2: one `STRSTATE` state file holds the token list and the
   recurrent/DeltaNet/MTP/PLE/QSA snapshot (`STRRSEG` payload), and an ordered chain of content-addressed KV
@@ -55,7 +56,7 @@ Measured results on the integration branch:
 | archive E2E (`tools/test_slot_archive.sh`) | 106/106: 28 single, 10 restart, 21 parallel, 15 parallel-restart, 30 lifecycle, 2 no-flag |
 | dedup E2E (`tools/test_slot_archive_dedup.sh`) | 88/88: 63 full, 25 restart |
 | explicit slot-save E2E (`tools/test_slot_save.sh`) | 43/43 |
-| lib unit tests | 252/252 |
+| lib unit tests | 265 passed, 1 ignored (phase-3 wave) |
 | GPU archive tests | `slot_archive_` 3/3, `slot_segment_` 2/2 |
 | GPU slot/prefill regressions | `slot_` suite (async owner/equivalence included), `unified_`, `prefill_cached_reuses_history`, `prefill_matches_reference` |
 
