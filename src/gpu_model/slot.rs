@@ -519,7 +519,9 @@ impl GpuModel<'_> {
             owner: self.owner,
             flags: (self.rope_offset != 0).then_some(slot_file::FLAG_IMAGE).unwrap_or(0)
                 | (self.kv_budget > 0).then_some(slot_file::FLAG_UNIFIED).unwrap_or(0)
-                | (self.slot().len() > 0 || self.ple_ring.is_some() || self.qsa.is_some()).then_some(slot_file::FLAG_AUX).unwrap_or(0),
+                // Informational: the model has MTP/PLE/QSA buffers, not whether `saved` happens to be allocated
+                // yet. Computing this from `slot()` made the flags depend on whether an earlier save had run.
+                | (self.mtp.is_some() || self.ple_ring.is_some() || self.qsa.is_some()).then_some(slot_file::FLAG_AUX).unwrap_or(0),
             n_parts: self.parts().count() as u32,
         };
         Ok((tokens, header))
