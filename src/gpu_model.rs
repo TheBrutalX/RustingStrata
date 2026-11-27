@@ -621,6 +621,28 @@ fn copy_rate(gpu: &dyn Backend) -> anyhow::Result<f64> {
     Ok(64.0 / secs)
 }
 
+/// Slots a unified growth of `s` to `new` positions would reclaim, in the order it drops them: the inactive slots
+/// with more than one KV position, largest capacity first, stopping once the total capacity fits `budget`. Pure:
+/// reads only its arguments, so the reclaim plan and the growth itself cannot drift. `budget == 0` (not unified)
+/// means no plan.
+fn reclaim_plan(caps: &[usize], active: &[bool], budget: usize, s: usize, new: usize) -> Vec<usize> {
+    if budget == 0 || s >= caps.len() { return Vec::new(); }
+    let fits = |caps: &[usize]| caps.iter().sum::<usize>() - caps[s] + new <= budget;
+    if fits(caps) { return Vec::new(); }
+    let mut caps = caps.to_vec();
+    let mut order: Vec<usize> = (0..caps.len())
+        .filter(|&i| i != s && !active.get(i).copied().unwrap_or(false) && caps[i] > 1)
+        .collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(caps[i]));
+    let mut victims = Vec::new();
+    for i in order {
+        if fits(&caps) { break; }
+        victims.push(i);
+        caps[i] = 1;
+    }
+    victims
+}
+
 impl<'a> GpuModel<'a> {
     /// `chunk`: prefill batch in tokens (0 = no batched prefill). `mtp`: load the MTP draft head (needs `nextn`).
     pub fn load(m: &'a Model<'a>, gpu: Box<dyn Backend>, ctx: usize, chunk: usize, vram_margin: usize, k: usize) -> anyhow::Result<GpuModel<'a>> {
@@ -1531,23 +1553,7 @@ impl<'a> GpuModel<'a> {
     /// Slots `kv_grow_unified(s, new)` would reclaim, in the order it drops them. Pure: reads capacities and
     /// `active`, changes nothing. The archive uses it to checkpoint the victims before their caches are dropped.
     pub fn kv_reclaim_plan(&self, s: usize, new: usize) -> Vec<usize> {
-        if self.kv_budget == 0 || s >= self.kv_cap.len() { return Vec::new(); }
-        let caps = self.kv_cap.clone();
-        // The same test as `kv_grow_unified`: total capacity, with `s` at `new`, fits the budget.
-        let fits = |caps: &[usize], s: usize| caps.iter().sum::<usize>() - caps[s] + new <= self.kv_budget;
-        if fits(&caps, s) { return Vec::new(); }
-        let mut caps = caps;
-        let mut order: Vec<usize> = (0..caps.len())
-            .filter(|&i| i != s && !self.active.get(i).copied().unwrap_or(false) && caps[i] > 1)
-            .collect();
-        order.sort_by_key(|&i| std::cmp::Reverse(caps[i]));
-        let mut victims = Vec::new();
-        for i in order {
-            if fits(&caps, s) { break; }
-            victims.push(i);
-            caps[i] = 1;
-        }
-        victims
+        reclaim_plan(&self.kv_cap, &self.active, self.kv_budget, s, new)
     }
 
     /// Grow slot `s` within the total budget, reclaiming the KV of inactive slots (largest first) down to KV_MIN.
@@ -1555,7 +1561,7 @@ impl<'a> GpuModel<'a> {
         let budget = self.kv_budget;
         let fits = |used: usize, cap: usize| used - cap + new <= budget;
         if !fits(self.kv_used(), self.kv_cap[s]) {
-            let victims = self.kv_reclaim_plan(s, new);
+            let victims = reclaim_plan(&self.kv_cap, &self.active, budget, s, new);
             for i in victims {
                 self.drop_slot_cache(i);
                 self.kv_resize(i, 1, false)?;
@@ -3976,7 +3982,7 @@ impl<'a> GpuModel<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GpuModel, split_ends, split_shares, tally};
+    use super::{GpuModel, reclaim_plan, split_ends, split_shares, tally};
 
     /// Layer counts given as shares come back as the same counts: a calibrated split loads as it was measured.
     #[test]
@@ -4015,6 +4021,66 @@ mod tests {
     #[test]
     fn no_cache_has_no_fast_path_bytes() {
         fn _uses(g: &GpuModel) -> (bool, usize) { (g.expert_fast_path(), g.expert_bytes_per_token()) }
+    }
+
+    /// A growth the budget already holds reclaims nothing.
+    #[test]
+    fn reclaim_plan_already_fits() {
+        assert_eq!(reclaim_plan(&[4, 4], &[false, false], 16, 0, 6), Vec::<usize>::new());
+    }
+
+    /// One oversized slot: only that slot is reclaimed.
+    #[test]
+    fn reclaim_plan_one_victim() {
+        assert_eq!(reclaim_plan(&[4, 4], &[false, false], 8, 0, 6), vec![1]);
+    }
+
+    /// Victims go largest capacity first, whatever the slot order.
+    #[test]
+    fn reclaim_plan_largest_first() {
+        assert_eq!(reclaim_plan(&[2, 8, 4], &[false, false, false], 12, 0, 9), vec![1, 2]);
+    }
+
+    /// A held (active) slot is never a victim, even when it is the largest.
+    #[test]
+    fn reclaim_plan_active_excluded() {
+        let victims = reclaim_plan(&[2, 3, 8], &[false, true, false], 10, 0, 5);
+        assert_eq!(victims, vec![2]);
+        assert!(!victims.contains(&1));
+    }
+
+    /// A slot already at the one-position floor is not worth reclaiming.
+    #[test]
+    fn reclaim_plan_cap_one_excluded() {
+        let victims = reclaim_plan(&[2, 1, 8], &[false, false, false], 10, 0, 5);
+        assert_eq!(victims, vec![2]);
+        assert!(!victims.contains(&1));
+    }
+
+    /// The target slot is never its own victim.
+    #[test]
+    fn reclaim_plan_target_excluded() {
+        let victims = reclaim_plan(&[8, 4, 4], &[false, false, false], 10, 0, 9);
+        assert_eq!(victims, vec![1, 2]);
+        assert!(!victims.contains(&0));
+    }
+
+    /// No candidate left: the plan is empty even though the growth does not fit.
+    #[test]
+    fn reclaim_plan_budget_exhausted_without_candidates() {
+        assert_eq!(reclaim_plan(&[4, 1], &[false, false], 4, 0, 5), Vec::<usize>::new());
+    }
+
+    /// Reclaiming stops as soon as the total lands exactly on the budget.
+    #[test]
+    fn reclaim_plan_exact_boundary() {
+        assert_eq!(reclaim_plan(&[4, 4], &[false, false], 8, 0, 7), vec![1]);
+    }
+
+    /// Without a unified budget there is no reclaim plan.
+    #[test]
+    fn reclaim_plan_without_budget_is_empty() {
+        assert_eq!(reclaim_plan(&[4, 4], &[false, false], 0, 0, 6), Vec::<usize>::new());
     }
 }
 
