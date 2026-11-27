@@ -45,3 +45,4 @@ pub mod raon;
 pub mod kv_turbo;
 pub mod slot_file;
 pub mod slot_archive;
+pub mod slot_segments;
