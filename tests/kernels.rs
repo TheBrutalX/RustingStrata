@@ -1184,6 +1184,17 @@ fn norm_rope_and_gate_ops_match_cpu() {
         let got = down::<f32>(gpu, &dx);
         close(&got, &want, "rope_neox");
         report("rope_neox", "hd 128, 64 rotated, pos 30000", &got, &want);
+        // rope_neox with a YaRN plan: same shapes at position 500000, where the ramp differs from plain.
+        let yarn = RopeParams::yarn(1e7, n_rot, 262_144, 2.0, 32.0, 1.0).unwrap();
+        let ypos = 500_000usize;
+        let dx = up(gpu, &x[..6 * hd]);
+        let step = up(gpu, &[ypos as i32, 0]);
+        gpu.rope_neox(dx.addr(), hd, 6, 2, n_rot, step.addr(), &yarn).unwrap();
+        let mut want = x[..6 * hd].to_vec();
+        for (h, v) in want.chunks_mut(hd).enumerate() { yarn.apply_neox(v, ypos + h / 2) }
+        let got = down::<f32>(gpu, &dx);
+        close(&got, &want, "rope_neox_yarn");
+        report("rope_neox_yarn", "hd 128, 64 rotated, pos 500000, yarn x2", &got, &want);
         // rope_mrope: one token, 2 heads, sections [11, 11, 10, 0] of the 32 pairs at positions [t, y, x, z].
         let (mpos, sec) = ([40, 7, 13, 5], [11, 11, 10, 0]);
         let dx = up(gpu, &x[..2 * hd]);
