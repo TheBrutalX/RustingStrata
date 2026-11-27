@@ -703,6 +703,8 @@ Done: matching rule, triggers, budget and owner semantics agreed.
 
 ### Phase 2 — operational polish
 
+Detailed analysis and sizing correction: [SLOT-ARCHIVE-PHASE2.md](SLOT-ARCHIVE-PHASE2.md).
+
 - host staging + writer thread; restore read on a worker;
 - TTL, per-key quota, admin pin route;
 - multi-version branching and explicit branch ids;
