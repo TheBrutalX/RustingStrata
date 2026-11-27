@@ -221,9 +221,37 @@ impl SegmentStore {
         Ok(segment)
     }
 
+    /// True when `id` names a row in the manifest. The row was validated against its file at open/put time; this
+    /// does not read the file, so it is cheap enough for startup entry validation and GC.
+    pub fn contains(&self, id: &str) -> bool {
+        valid_id(id) && self.segments.contains_key(id)
+    }
+
+    /// The manifest row for `id`, without reading its file.
+    pub fn segment(&self, id: &str) -> Option<&Segment> {
+        self.segments.get(id)
+    }
+
     /// Read and validate a segment file, returning its payload. Does not change `refs`; updates the in-memory
     /// `last_used_ms` only (persisted with the next structural change).
     pub fn get(&mut self, id: &str) -> Result<Vec<u8>> {
+        Ok(self.load(id)?.1)
+    }
+
+    /// [`SegmentStore::get`] with an additional proof that the segment holds exactly `tokens`. The archive v2 entry
+    /// stores the expected range, so a segment that content-addresses to a different token list (a colliding id, a
+    /// hand-edited manifest or a swapped file) is rejected before its payload is installed.
+    pub fn get_checked(&mut self, id: &str, tokens: &[u32]) -> Result<Vec<u8>> {
+        let (info, payload) = self.load(id)?;
+        ensure!(
+            info.tokens == tokens,
+            "segment {id} does not contain the expected token range"
+        );
+        Ok(payload)
+    }
+
+    /// Read, validate and return the parsed header plus payload of one segment.
+    fn load(&mut self, id: &str) -> Result<(FileInfo, Vec<u8>)> {
         ensure!(valid_id(id), "invalid segment id {id:?}");
         let Some(segment) = self.segments.get(id).cloned() else {
             bail!("unknown segment {id}");
@@ -249,7 +277,7 @@ impl SegmentStore {
         if let Some(segment) = self.segments.get_mut(id) {
             segment.last_used_ms = now_ms();
         }
-        Ok(payload)
+        Ok((info, payload))
     }
 
     /// Drop one reference. When the count reaches zero the file and row are removed; a missing id is a no-op.
@@ -329,6 +357,29 @@ impl SegmentStore {
     /// All segments, sorted by id.
     pub fn list(&self) -> Vec<Segment> {
         self.segments.values().cloned().collect()
+    }
+
+    /// Replace every row's `refs` with the count in `counts` (ids absent from `counts` become zero).
+    ///
+    /// The archive entries are the source of truth for v2 references, while a rebuilt manifest can only adopt
+    /// orphan files with `refs = 1`. Reconciling at startup makes two entries that share a segment keep it after
+    /// either is deleted, and lets `gc` drop orphan segments. Ids unknown to the store are ignored (the caller
+    /// validates that each entry's segments are present).
+    pub fn sync_refs(&mut self, counts: &BTreeMap<String, u64>) -> Result<()> {
+        let mut changed = false;
+        for id in self.segments.keys().cloned().collect::<Vec<_>>() {
+            let want = counts.get(&id).copied().unwrap_or(0);
+            if let Some(segment) = self.segments.get_mut(&id) {
+                if segment.refs != want {
+                    segment.refs = want;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.persist()?;
+        }
+        Ok(())
     }
 
     fn persist(&self) -> Result<()> {
