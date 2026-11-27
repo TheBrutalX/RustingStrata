@@ -11,24 +11,30 @@
 # directory, sends A and B into different slots, sends a third conversation C
 # that must evict one of them, checks the evicted state reached the archive,
 # restarts the parallel server, and checks that the continuation of the
-# evicted conversation restores its prefix from disk (cached_tokens). Finally,
-# it starts a server without --slot-archive-dir and checks that the archive
-# routes answer 501.
+# evicted conversation restores its prefix from disk (cached_tokens). It then
+# starts a lifecycle server (TTL 1s, pin cap 1 GiB) on another archive
+# directory, creates one divergence entry, pins it, checks that a TTL GC
+# leaves it in place, unpins it, checks that the next GC expires it, and
+# checks that pinning the deleted id answers 404. Finally, it starts a server
+# without --slot-archive-dir and checks that the archive routes answer 501.
 #
 # Usage: tools/test_slot_archive.sh MODEL BIN SERVER_DIR [PORT]
 #
 #   MODEL       GGUF model to serve.
 #   BIN         rustingstrata binary (a path, or a name on PATH).
 #   SERVER_DIR  directory the server runs in.
-#   PORT        port of the archive-enabled servers (default 8080); PORT + 1
-#               is used by the server without --slot-archive-dir.
+#   PORT        port of the archive-enabled servers (default 8080), shared in
+#               turn by the single-slot, parallel and lifecycle servers;
+#               PORT + 1 is used by the server without --slot-archive-dir.
 #
 # Environment:
 #   LOAD_TIMEOUT     seconds to wait for a model load (default 600).
 #   REQUEST_TIMEOUT  seconds per HTTP test request (default 600).
 #
 # Requires python3 (stdlib urllib only), a CUDA GPU, and enough VRAM for
-# --parallel 1 and --parallel 2 with a 64k q8 KV cache.
+# --parallel 1 and --parallel 2 with a 64k q8 KV cache. Per-key quota is not
+# covered here: it needs API keys and is exercised by the unit tests in
+# src/slot_archive.rs.
 
 set -uo pipefail
 
@@ -40,8 +46,8 @@ Usage: tools/test_slot_archive.sh MODEL BIN SERVER_DIR [PORT]
   BIN         rustingstrata binary (path or name on PATH)
   SERVER_DIR  directory the server runs in
   PORT        archive-enabled server port (default 8080), shared in turn by
-              the single-slot, parallel and no-flag servers; PORT + 1 is
-              used by the server without --slot-archive-dir
+              the single-slot, parallel and lifecycle servers, and by the
+              no-flag server on PORT + 1
 
 Environment: LOAD_TIMEOUT (default 600), REQUEST_TIMEOUT (default 600)
 EOF
@@ -88,6 +94,7 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/strata-slot-archive.XXXXXX") \
   || fail "could not create a temporary directory"
 ARCHIVE="$WORK/archive"
 ARCHIVE2="$WORK/archive-parallel"
+ARCHIVE3="$WORK/archive-lifecycle"
 STATE="$WORK/state.json"
 STATE2="$WORK/parallel-state.json"
 LOG1="$WORK/server-archive.log"
@@ -95,10 +102,12 @@ LOG2="$WORK/server-restart.log"
 LOG3="$WORK/server-noflag.log"
 LOG4="$WORK/server-parallel.log"
 LOG5="$WORK/server-parallel-restart.log"
+LOG6="$WORK/server-lifecycle.log"
 
 PID1=""
 PID2=""
 PID3=""
+PID4=""
 SERVER_PID=""
 
 alive() {
@@ -123,6 +132,7 @@ cleanup() {
   stop_server "${PID1:-}"
   stop_server "${PID2:-}"
   stop_server "${PID3:-}"
+  stop_server "${PID4:-}"
   rm -rf -- "$WORK"
 }
 trap cleanup EXIT
@@ -154,6 +164,17 @@ start_server() {
           --model "$MODEL" --gpu --backend cuda --parallel 2 --ctx 65536 \
           --kv q8 --slot-archive-dir "$ARCHIVE2" --slot-archive-gb 5 \
           --slot-archive-min-tokens 64 --slot-archive-min-delta 1 \
+          --addr "127.0.0.1:$port" ) >"$log" 2>&1 &
+      ;;
+    lifecycle)
+      # A one-second TTL makes the expiry deterministic; the pin cap keeps
+      # the test entry (well under 1 GiB) pinnable. GC applies the TTL; a
+      # checkpoint prefers expired entries only when it needs room.
+      ( cd "$SERVER_DIR" && exec "$BIN" serve \
+          --model "$MODEL" --gpu --backend cuda --parallel 1 --ctx 65536 \
+          --kv q8 --slot-archive-dir "$ARCHIVE3" --slot-archive-gb 5 \
+          --slot-archive-min-tokens 64 --slot-archive-min-delta 1 \
+          --slot-archive-ttl 1s --slot-archive-pin-gb 1 \
           --addr "127.0.0.1:$port" ) >"$log" 2>&1 &
       ;;
     *)
@@ -341,6 +362,13 @@ def entries_of(body):
 
 def ids_of(body):
     return [entry.get("id") for entry in entries_of(body)]
+
+
+def entry_by_id(body, entry_id):
+    return next(
+        (entry for entry in entries_of(body) if entry.get("id") == entry_id),
+        None,
+    )
 
 
 def check_metadata(report, obj, archive_dir=None):
@@ -967,6 +995,215 @@ def run_parallel_restart(base, state_path, timeout):
     return report.summary()
 
 
+def run_lifecycle(base, archive_dir, timeout):
+    report = Report()
+    prompt_a = long_prompt(PARAGRAPH_A)
+    prompt_b = long_prompt(PARAGRAPH_B)
+
+    status, body = chat(base, [{"role": "user", "content": prompt_a}], timeout)
+    reply_a = reply_of(as_obj(body))
+    report.check(
+        "lifecycle: prompt A answered",
+        status == 200 and bool(reply_a),
+        "status=%s reply=%s" % (status, brief(reply_a)),
+    )
+
+    # The only slot cannot extend A's history with B, so the scheduler must
+    # checkpoint A before it prefills B.
+    status, body = chat(base, [{"role": "user", "content": prompt_b}], timeout)
+    report.check(
+        "lifecycle: diverging prompt B answered",
+        status == 200,
+        "status=%s body=%s" % (status, brief(body)),
+    )
+
+    entry = None
+    archive_body = {}
+    last = "no response"
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        status, body = http(base, "GET", "/slots/archive", None, 5.0)
+        last = "status=%s body=%s" % (status, brief(body))
+        if status == 200:
+            archive_body = as_obj(body)
+            entries = entries_of(body)
+            if entries:
+                divergent = [e for e in entries if e.get("reason") == "divergence"]
+                pool = divergent or entries
+                entry = max(pool, key=lambda e: as_int(e.get("n_tokens")))
+                break
+        time.sleep(0.25)
+
+    report.check(
+        "lifecycle: GET /slots/archive returns 200",
+        last.startswith("status=200"),
+        last,
+    )
+    check_metadata(report, archive_body, archive_dir)
+    pinned_bytes = archive_body.get("pinned_bytes")
+    report.check(
+        "lifecycle: GET /slots/archive reports numeric pinned_bytes",
+        is_number(pinned_bytes) and pinned_bytes >= 0,
+        "pinned_bytes=%r body=%s" % (pinned_bytes, brief(archive_body)),
+    )
+
+    entries = entries_of(archive_body)
+    report.check(
+        "lifecycle: archive lists the checkpoint entry",
+        entry is not None and bool(entries),
+        last,
+    )
+    if entry is None:
+        return report.summary()
+    entry_id = entry.get("id")
+    report.check(
+        "lifecycle: checkpoint id is present",
+        isinstance(entry_id, str) and bool(entry_id),
+        "entry=%s" % brief(entry),
+    )
+    report.check(
+        "lifecycle: new entry is not pinned",
+        entry.get("pinned") is False,
+        "entry=%s" % brief(entry),
+    )
+    report.check(
+        "lifecycle: pinned_bytes starts at 0",
+        as_int(pinned_bytes) == 0,
+        "pinned_bytes=%r" % (pinned_bytes,),
+    )
+    if not isinstance(entry_id, str) or not entry_id:
+        return report.summary()
+
+    path = "/slots/archive/" + urllib.parse.quote(entry_id, safe="")
+
+    status, body = http(base, "POST", path + "?action=pin", {}, timeout)
+    obj = as_obj(body)
+    report.check(
+        "lifecycle: pin returns 200",
+        status == 200,
+        "status=%s body=%s" % (status, brief(obj)),
+    )
+    report.check(
+        "lifecycle: pin reports pinned=true",
+        obj.get("pinned") is True,
+        "body=%s" % brief(obj),
+    )
+    status, body = http(base, "GET", "/slots/archive", None, timeout)
+    archive_body = as_obj(body)
+    listed = entry_by_id(archive_body, entry_id)
+    report.check(
+        "lifecycle: GET /slots/archive returns 200 after pin",
+        status == 200,
+        "status=%s body=%s" % (status, brief(body)),
+    )
+    report.check(
+        "lifecycle: the entry is listed as pinned",
+        listed is not None and listed.get("pinned") is True,
+        "entry=%s" % brief(listed),
+    )
+    pinned_bytes = archive_body.get("pinned_bytes")
+    report.check(
+        "lifecycle: pinned_bytes > 0 after pin",
+        is_number(pinned_bytes) and pinned_bytes > 0,
+        "pinned_bytes=%r" % (pinned_bytes,),
+    )
+
+    # Neither GET nor pin refreshes last_used_ms, so after 2 s the entry is
+    # older than the 1 s TTL; only the pin keeps it alive.
+    time.sleep(2.0)
+    status, body = http(base, "POST", "/slots/archive/gc", {}, timeout)
+    obj = as_obj(body)
+    report.check(
+        "lifecycle: GC after the TTL returns 200",
+        status == 200,
+        "status=%s body=%s" % (status, brief(obj)),
+    )
+    report.check(
+        "lifecycle: GC reports numeric expired",
+        is_number(obj.get("expired")) and obj.get("expired") >= 0,
+        "expired=%r body=%s" % (obj.get("expired"), brief(obj)),
+    )
+    status, body = http(base, "GET", "/slots/archive", None, timeout)
+    archive_body = as_obj(body)
+    report.check(
+        "lifecycle: pinned entry survives a TTL GC",
+        status == 200 and entry_by_id(archive_body, entry_id) is not None,
+        "status=%s id=%r body=%s" % (status, entry_id, brief(archive_body)),
+    )
+
+    status, body = http(base, "POST", path + "?action=unpin", {}, timeout)
+    obj = as_obj(body)
+    report.check(
+        "lifecycle: unpin returns 200",
+        status == 200,
+        "status=%s body=%s" % (status, brief(obj)),
+    )
+    report.check(
+        "lifecycle: unpin reports pinned=false",
+        obj.get("pinned") is False,
+        "body=%s" % brief(obj),
+    )
+    status, body = http(base, "GET", "/slots/archive", None, timeout)
+    archive_body = as_obj(body)
+    listed = entry_by_id(archive_body, entry_id)
+    report.check(
+        "lifecycle: the entry is listed as unpinned",
+        listed is not None and listed.get("pinned") is False,
+        "entry=%s" % brief(listed),
+    )
+
+    time.sleep(2.0)
+    status, body = http(base, "POST", "/slots/archive/gc", {}, timeout)
+    obj = as_obj(body)
+    report.check(
+        "lifecycle: GC after unpin returns 200",
+        status == 200,
+        "status=%s body=%s" % (status, brief(obj)),
+    )
+    report.check(
+        "lifecycle: GC counts the TTL expiry",
+        is_number(obj.get("expired")) and obj.get("expired") >= 1,
+        "expired=%r body=%s" % (obj.get("expired"), brief(obj)),
+    )
+    status, body = http(base, "GET", "/slots/archive", None, timeout)
+    archive_body = as_obj(body)
+    report.check(
+        "lifecycle: unpinned entry is gone after a TTL GC",
+        status == 200 and entry_by_id(archive_body, entry_id) is None,
+        "status=%s id=%r body=%s" % (status, entry_id, brief(archive_body)),
+    )
+    pinned_bytes = archive_body.get("pinned_bytes")
+    report.check(
+        "lifecycle: pinned_bytes is numeric after the TTL GC",
+        is_number(pinned_bytes) and pinned_bytes >= 0,
+        "pinned_bytes=%r" % (pinned_bytes,),
+    )
+
+    # The id is now gone: the route must answer 404, not resurrect an entry.
+    status, body = http(base, "POST", path + "?action=pin", {}, timeout)
+    obj = as_obj(body)
+    report.check(
+        "lifecycle: pin of a deleted entry returns 404",
+        status == 404,
+        "status=%s body=%s" % (status, brief(obj)),
+    )
+
+    status, body = http(base, "GET", "/slots/archive", None, timeout)
+    archive_body = as_obj(body)
+    report.check(
+        "lifecycle: final GET /slots/archive returns 200",
+        status == 200,
+        "status=%s body=%s" % (status, brief(archive_body)),
+    )
+    pinned_bytes = archive_body.get("pinned_bytes")
+    report.check(
+        "lifecycle: final pinned_bytes is numeric",
+        is_number(pinned_bytes) and pinned_bytes >= 0,
+        "pinned_bytes=%r" % (pinned_bytes,),
+    )
+    return report.summary()
+
+
 def run_noflag(base):
     report = Report()
     status, body = http(base, "GET", "/slots/archive")
@@ -1091,6 +1328,14 @@ def main(argv):
             )
             return 2
         return run_parallel_restart(base, argv[3], seconds(argv[4], 600.0))
+    if mode == "lifecycle":
+        if len(argv) < 5:
+            print(
+                "usage: check.py lifecycle BASE_URL ARCHIVE_DIR TIMEOUT",
+                file=sys.stderr,
+            )
+            return 2
+        return run_lifecycle(base, argv[3], seconds(argv[4], 600.0))
     if mode == "noflag":
         return run_noflag(base)
     print("unknown mode: %s" % mode, file=sys.stderr)
@@ -1110,6 +1355,7 @@ echo "test_slot_archive: server dir=$SERVER_DIR"
 echo "test_slot_archive: ports=$PORT and $PORT2"
 echo "test_slot_archive: temporary archive dir=$ARCHIVE"
 echo "test_slot_archive: temporary parallel archive dir=$ARCHIVE2"
+echo "test_slot_archive: temporary lifecycle archive dir=$ARCHIVE3"
 echo
 
 echo "starting archive server on 127.0.0.1:$PORT"
@@ -1158,6 +1404,18 @@ fi
 run_py parallel-restart "http://127.0.0.1:$PORT" "$STATE2" "$REQUEST_TIMEOUT" || FAILED=1
 stop_server "$PID3"
 PID3=""
+
+echo
+echo "starting lifecycle (TTL 1s, pin cap 1 GiB) archive server on 127.0.0.1:$PORT"
+start_server "$PORT" "$LOG6" lifecycle
+PID4=$SERVER_PID
+if ! run_py wait "http://127.0.0.1:$PORT" "$LOG6" "$PID4" "$LOAD_TIMEOUT"; then
+  fail "lifecycle archive server did not become ready"
+fi
+
+run_py lifecycle "http://127.0.0.1:$PORT" "$ARCHIVE3" "$REQUEST_TIMEOUT" || FAILED=1
+stop_server "$PID4"
+PID4=""
 
 echo
 echo "starting server without --slot-archive-dir on 127.0.0.1:$PORT2"

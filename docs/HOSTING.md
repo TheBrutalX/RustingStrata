@@ -407,7 +407,8 @@ ExecStart=/usr/local/bin/rustingstrata serve --model /srv/models/Qwen3.6-35B-A3B
     --addr 127.0.0.1:8080 --api-keys /etc/strata/keys.txt --usage-log /var/lib/strata/usage.jsonl --max-tokens 4096 \
     --parallel 4 --kv q8 --max-per-key 4 --slot-save-path /var/lib/strata/slots \
     --slot-archive-dir /var/lib/strata/archive --slot-archive-gb 200 \
-    --slot-archive-min-tokens 256 --slot-archive-min-delta 1024
+    --slot-archive-min-tokens 256 --slot-archive-min-delta 1024 \
+    --slot-archive-ttl 30d --slot-archive-per-key-gb 20 --slot-archive-pin-gb 20
 ```
 
 The server creates a missing directory `0700` and writes entries and temp files `0600`, so the service user needs
@@ -424,19 +425,43 @@ the logical limit.
 
 **Eviction and lineage.** A checkpoint that would exceed `budget - 1 GiB` first prunes unpinned ancestors beyond
 `--slot-archive-versions`, then evicts entries with a foreign fingerprint, then the least recently used unpinned
-entries. Pinned entries are never evicted, but phase 1 has no route that sets `pinned`; that field is reserved.
-`POST /slots/archive/gc` drops rows whose file is missing, then applies the same lineage pruning and LRU eviction
-when the archive is over the target. Lineage pruning is lazy, so a parent and its continuation coexist while there
-is room. Keeping only the latest entry per lineage saves disk but removes rollback points: a longer child is not a
+entries. Pinned entries are never evicted. `POST /slots/archive/gc` drops unpinned entries older than
+`--slot-archive-ttl`, then rows whose file is missing, then applies the same lineage pruning and LRU eviction when
+the archive is over the target. Lineage pruning is lazy, so a parent and its continuation coexist while there is
+room. Keeping only the latest entry per lineage saves disk but removes rollback points: a longer child is not a
 substitute for its shorter parent, so raise `--slot-archive-versions` if earlier states matter. Foreign
 fingerprints are ordinary LRU candidates in manual GC, which has no current-fingerprint argument.
 
-**Checkpoint stalls.** In phase 1 a checkpoint is synchronous: the model thread copies the state and writes the
-file, and every stream pauses for the duration. At 0.5-1 GB/s a 1 GB state costs 1-2 s; a 10.9 GB 1M-token state
-costs 10-20 s. Expect a visible pause when a conversation switches or a unified slot is reclaimed. Keep
-`--slot-archive-min-tokens` and `--slot-archive-min-delta` high enough that small states and tiny extensions are
-not written on every turn. A restore has the same kind of stall for the read and the copy into the slot, after
-which only the prompt suffix is prefilled. Phase 2 moves the disk part off the model thread.
+**Lifecycle: TTL, quota and pin.** TTL, per-key quota and the pin cap are off or conservative by default so a
+phase-1 deployment keeps its behavior; on a shared server, tune all three:
+
+- `--slot-archive-ttl 30d` is the recommended TTL for a shared server (`0` is off). The TTL is lazy:
+  `POST /slots/archive/gc` applies it, and a checkpoint prefers expired entries when it needs room; there is no
+  timer, so an entry can outlive its TTL on an idle server. Run GC periodically if expiry must be prompt, for
+  example from a systemd timer or cron:
+
+  ```sh
+  curl -fsS -X POST -H 'Content-Type: application/json' -d '{}' \
+      http://127.0.0.1:8080/slots/archive/gc
+  ```
+  With `--api-keys`, use an admin key for that request.
+- `--slot-archive-per-key-gb` caps one owner's bytes. At a checkpoint the owner's own least recently used unpinned
+  entries are evicted first; the quota step never touches another owner's entries, and the global budget is
+  enforced afterwards. Owner 0 is a single bucket without API keys. 25% of the global budget or 20 GiB, whichever
+  is smaller, is a sensible shared-server value. An entry larger than the quota is refused, so a checkpoint can be
+  skipped; keep the quota above the largest expected conversation state.
+- `--slot-archive-pin-gb` caps what an admin may pin; the default is 10% of `--slot-archive-gb` (20 GiB at 200),
+  and `0` removes the cap. The pin cap is a safety valve, not a target: a pin that would exceed it answers `409`.
+  Pinning is an admin-only `POST /slots/archive/{id}?action=pin|unpin`; the entry's `pinned` flag is persisted in
+  the manifest, so a pin survives a restart and protects the entry from the TTL, the budget and lineage pruning.
+
+**Checkpoint stalls.** Checkpoints are synchronous in this wave: the model thread copies the state and writes the
+file, and every stream pauses for the duration. The chunked save/restore core exists, but the scheduler does not
+use it yet. At 0.5-1 GB/s a 1 GB state costs 1-2 s; a 10.9 GB 1M-token state costs 10-20 s. Expect a visible pause
+when a conversation switches or a unified slot is reclaimed. Keep `--slot-archive-min-tokens` and
+`--slot-archive-min-delta` high enough that small states and tiny extensions are not written on every turn. A
+restore has the same kind of stall for the read and the copy into the slot, after which only the prompt suffix is
+prefilled.
 
 **Restore behavior.** Automatic restore uses a free slot only and never takes a slot a request holds. It never
 uses the `force=1` of the explicit route. If the chosen free slot holds another conversation, the server
@@ -447,17 +472,20 @@ pinned until the request is admitted or `action=erase` clears it, so a reclaim c
 admission. The restored prefix is reported as `usage.prompt_tokens_details.cached_tokens`.
 
 **Shutdown.** A graceful stop or a crash only keeps the entries that were already checkpointed. The slots still in
-VRAM are not archived on shutdown in phase 1, and `SIGKILL` cannot be covered; a conversation is recovered at its
-last divergence or explicit checkpoint. `--slot-archive-on-shutdown` is an opt-in phase-2 option, not a phase-1
-behavior.
+VRAM are not archived on shutdown, and `SIGKILL` cannot be covered; a conversation is recovered at its last
+divergence or explicit checkpoint. This wave has no shutdown checkpoint and no async scheduler: `SIGTERM` does not
+save the resident slots, and every checkpoint still blocks the model thread. Keep the existing expert-profile
+`TimeoutStopSec` and rely on explicit `action=checkpoint` before a planned restart.
 
 **Security and backups.** Entries are plaintext: the full token history (prompt, system prompt, tools and
-generated tokens) and the KV/recurrent state. Treat the directory as a copy of the conversations: `0700`, files
-`0600`, no HTTP access, and include it in (or deliberately exclude it from) backups and retention. With
-`--api-keys` entries are owner-scoped and the archive routes are admin-only: `GET /slots/archive`,
-`DELETE /slots/archive/{id}`, `POST /slots/archive/gc` and `POST /slots/{id}?action=checkpoint` all answer `403`
-for a customer key. Without keys, owner 0 is shared by every client. A copied entry still restores only with the
-same model, `--kv`, YaRN/RoPE flags and split, because the fingerprint is checked first.
+generated tokens) and the KV/recurrent state. Pinning does not encrypt an entry; it only exempts it from the TTL,
+the budget and lineage pruning, so unpin an entry you no longer need. Treat the directory as a copy of the
+conversations: `0700`, files `0600`, no HTTP access, and include it in (or deliberately exclude it from) backups
+and retention. With `--api-keys` entries are owner-scoped and the archive routes are admin-only:
+`GET /slots/archive`, `DELETE /slots/archive/{id}`, `POST /slots/archive/{id}?action=pin|unpin`,
+`POST /slots/archive/gc` and `POST /slots/{id}?action=checkpoint` all answer `403` for a customer key. Without
+keys, owner 0 is shared by every client. A copied entry still restores only with the same model, `--kv`,
+YaRN/RoPE flags and split, because the fingerprint is checked first.
 
 **Troubleshooting.**
 
@@ -465,9 +493,11 @@ same model, `--kv`, YaRN/RoPE flags and split, because the fingerprint is checke
   has no token history or fewer than `--slot-archive-min-tokens` (the empty-slot rule is the same as `action=save`).
   A corrupt or foreign archive entry is not a `400` for a chat; it falls back to prefill.
 - `403`: a customer key on any archive route; those routes are admin-only.
-- `409`: automatic restore never returns it. An explicit `POST /slots/{id}?action=restore` through
-  `--slot-save-path` keeps its existing `409` when `--kv-unified` would evict a non-empty slot; retry with
-  `?force=1` only if that is intended.
+- `409`: a pin that would exceed `--slot-archive-pin-gb`, or `DELETE` of an entry leased by an in-flight restore
+  (retry after it completes). Automatic restore itself never returns it. An explicit
+  `POST /slots/{id}?action=restore` through `--slot-save-path` keeps its existing `409` when `--kv-unified` would
+  evict a non-empty slot; retry with `?force=1` only if that is intended.
+- `404`: `pin`/`unpin` of an id that is no longer in the manifest, for example after a TTL GC.
 - `501`: the server was started without `--slot-archive-dir`; the archive routes are off.
 - `503`: no model is loaded.
 - Startup: the manifest is validated against the shard files. A missing file drops its entry, an orphan file is
