@@ -5,7 +5,7 @@ archived conversation. This is the next layer above [SLOT-SAVE.md](SLOT-SAVE.md)
 `STRATASLOT` v1 file and the explicit save/restore API; this one defines the **policy, index, budget and matching**
 that make those files a cache the server manages on its own.
 
-**Status: implemented (phase 1) on `feat/slot-archive`.** The decisions below are the design that the phase-1
+**Status: implemented (phase 1).** The decisions below are the design that the phase-1
 code follows:
 
 - restore is automatic, by **exact token-prefix match** (no conversation id, no client change);
@@ -27,17 +27,20 @@ Code:
 - `src/main.rs`: `--slot-archive-*` flags, the checkpoint triggers in single-slot and `--parallel` serving,
   `GET /slots/archive`, `DELETE /slots/archive/{id}`, `POST /slots/archive/gc`,
   `POST /slots/{id}?action=checkpoint`, and the archive metrics.
-- `tools/test_slot_archive.sh`: single-slot end-to-end test (divergence/restore, explicit checkpoint, delete, GC,
-  restart, 501 without the flag).
+- `tools/test_slot_archive.sh`: end-to-end tests for single-slot and `--parallel 2` (divergence/restore, explicit
+  checkpoint, delete, GC, restart, parallel eviction/restore, 501 without the flag).
 
-Verified on `feat/slot-archive`:
+Verified:
 
 - `cargo check --locked` is clean.
 - `src/slot_archive.rs`: 17 unit tests.
 - GPU helpers: 9 pure `reclaim_plan` tests and the `slot_save_as_records_explicit_owner` GPU test.
 - GPU regression: `slot_` 4/4, `unified_` 2/2, `prefill_cached_reuses_history`, `prefill_matches_reference`.
-- `tools/test_slot_archive.sh`: 40/40 checks. A parallel-slot E2E is being added separately and is not part of
-  those 40 checks.
+- `tools/test_slot_archive.sh`: 76/76 checks (28 single + 10 restart + 21 parallel + 15 parallel-restart + 2
+  no-flag). The parallel run confirms A/B in two slots, C evicting one conversation, the archive entry matching
+  the evicted token count, and a restore from disk after a process restart.
+- Full lib suite: 205/205 (the 17 archive tests and 9 reclaim-plan tests included).
+- Existing explicit slot-save E2E: 43/43, unchanged.
 
 Not in phase 1 (see §17): asynchronous host staging and a writer thread, shutdown checkpoint, TTL and per-key
 quotas, explicit multi-version branching (the `--slot-archive-versions` flag exists and prunes lazily), an admin
@@ -660,17 +663,20 @@ the reason but never the prompt text.
 
 - `slot_` 4/4 and `unified_` 2/2, plus `prefill_cached_reuses_history` and `prefill_matches_reference`.
 
-### E2E (`tools/test_slot_archive.sh`, 40/40 checks)
+### E2E (`tools/test_slot_archive.sh`, 76/76 checks)
 
 - single-slot divergence: chat A, switch to B, return to A; the divergence entry is listed and the continuation
   restores the archived prefix (`cached_tokens > 0`);
 - explicit `POST /slots/0?action=checkpoint` response fields; `DELETE` removes an entry; manual GC;
 - restart on the same archive directory keeps the entry and restores from disk;
+- `--parallel 2`: A and B land in different slots, C evicts one conversation, the archive entry matches the
+  evicted token count, and after a process restart the evicted continuation restores from disk (`cached_tokens >
+  0`);
 - no `--slot-archive-dir`: `GET /slots/archive` and `action=checkpoint` answer `501`.
 
-A parallel-slot E2E is being added separately and was not part of the 40 checks. The 40 checks do not set API keys,
-so `403` for customer keys and cross-owner isolation are covered by the key guard and the unit tests, not by this
-script. The budget/LRU behavior is covered by the unit tests, not by filling a small archive over HTTP.
+The E2E does not set API keys, so `403` for customer keys and cross-owner isolation are covered by the key guard
+and the unit tests, not by this script. The budget/LRU behavior is covered by the unit tests, not by filling a
+small archive over HTTP.
 
 ### Performance
 
