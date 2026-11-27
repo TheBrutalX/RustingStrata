@@ -408,7 +408,8 @@ ExecStart=/usr/local/bin/rustingstrata serve --model /srv/models/Qwen3.6-35B-A3B
     --parallel 4 --kv q8 --max-per-key 4 --slot-save-path /var/lib/strata/slots \
     --slot-archive-dir /var/lib/strata/archive --slot-archive-gb 200 \
     --slot-archive-min-tokens 256 --slot-archive-min-delta 1024 \
-    --slot-archive-ttl 30d --slot-archive-per-key-gb 20 --slot-archive-pin-gb 20
+    --slot-archive-ttl 30d --slot-archive-per-key-gb 20 --slot-archive-pin-gb 20 \
+    --slot-archive-gc-interval 5m --slot-archive-on-shutdown --slot-archive-shutdown-timeout 30s
 ```
 
 The server creates a missing directory `0700` and writes entries and temp files `0600`, so the service user needs
@@ -429,9 +430,15 @@ writes only new segments; a shared system prompt/tools/document is charged once.
 the segment files by hand. Leave filesystem free space above the budget: a write needs room for its temp file, the
 manifest, the segment manifest and the reserve below the logical limit.
 
+**Manifests.** `manifest.json` and `segments.json` are compacted snapshots; mutations go to the append-only
+`manifest.log`/`segments.log` and `touch` updates are batched. A truncated last journal record is ignored, a
+corrupt snapshot is rebuilt from the logs/files, and compaction is adaptive/GC/Drop-driven. Back up the snapshots,
+both logs and `segments/` together; do not edit any of them by hand.
+
 **Eviction and lineage.** A checkpoint that would exceed `budget - 1 GiB` first prunes unpinned ancestors beyond
 `--slot-archive-versions`, then evicts entries with a foreign fingerprint, then the least recently used unpinned
-entries. Pinned entries are never evicted. `POST /slots/archive/gc` drops unpinned entries older than
+entries. Pinned entries are never evicted. The periodic `--slot-archive-gc-interval` (default 5 min, 0 off) applies
+TTL/quota/LRU in the background; `POST /slots/archive/gc` drops unpinned entries older than
 `--slot-archive-ttl`, then rows whose file is missing, then applies the same lineage pruning and LRU eviction when
 the archive is over the target. Lineage pruning is lazy, so a parent and its continuation coexist while there is
 room. Keeping only the latest entry per lineage saves disk but removes rollback points: a longer child is not a
@@ -461,13 +468,13 @@ phase-1 deployment keeps its behavior; on a shared server, tune all three:
   Pinning is an admin-only `POST /slots/archive/{id}?action=pin|unpin`; the entry's `pinned` flag is persisted in
   the manifest, so a pin survives a restart and protects the entry from the TTL, the budget and lineage pruning.
 
-**Checkpoint stalls.** Format-2 saves and restores are synchronous in this wave: the model thread copies the
-state, writes the new segments/state and commits the manifest, and every stream pauses for the duration. The GPU
-core also has `save_slot_to`/`restore_slot_from`, a bounded 256 MB writer/reader and `save_slot_file_async_as`;
-v1 entries restore through the async reader, but automatic v2 checkpoints do not use it yet and the scheduler does
-not interleave. A 1 GB state costs 1-2 s at 0.5-1 GB/s; a 10.9 GB 1M-token state costs 10-20 s. Expect a visible
-pause when a conversation switches or a unified slot is reclaimed. Keep `--slot-archive-min-tokens` and
-`--slot-archive-min-delta` high enough that small states and tiny extensions are not written on every turn.
+**Checkpoint stalls.** Format-2 saves and restores are still synchronous in this wave: the model thread copies
+the state, writes the new segments/state and commits the manifest, and every stream pauses for the duration. The
+GPU core now has resumable `_with` variants (a callback after each 64 MiB copy or segment) and a bounded 256 MB
+writer/reader, but the scheduler is not wired to them yet; automatic v2 checkpoints do not interleave. A 1 GB state
+costs 1-2 s at 0.5-1 GB/s; a 10.9 GB 1M-token state costs 10-20 s. Expect a visible pause when a conversation
+switches or a unified slot is reclaimed. Keep `--slot-archive-min-tokens` and `--slot-archive-min-delta` high
+enough that small states and tiny extensions are not written on every turn.
 
 **Restore behavior.** Automatic restore uses a free slot only and never takes a slot a request holds. It never
 uses the `force=1` of the explicit route. If the chosen free slot holds another conversation, the server
@@ -477,11 +484,12 @@ normally. A corrupt, foreign or owner-mismatched entry is a cache miss, not a fa
 pinned until the request is admitted or `action=erase` clears it, so a reclaim cannot take it between restore and
 admission. The restored prefix is reported as `usage.prompt_tokens_details.cached_tokens`.
 
-**Shutdown.** A graceful stop or a crash only keeps the entries that were already checkpointed. The slots still in
-VRAM are not archived on shutdown, and `SIGKILL` cannot be covered; a conversation is recovered at its last
-divergence or explicit checkpoint. This wave has no shutdown checkpoint and no async scheduler: `SIGTERM` does not
-save the resident slots, and every checkpoint still blocks the model thread. Keep the existing expert-profile
-`TimeoutStopSec` and rely on explicit `action=checkpoint` before a planned restart.
+**Shutdown.** With `--slot-archive-on-shutdown` (off by default), a graceful stop drains accepted requests and
+checkpoints every non-empty resident slot, most recently used first, within `--slot-archive-shutdown-timeout`
+(default 30 s). A slot still running at the deadline is skipped and logged; the process does not hang past the
+watchdog, and `SIGKILL`/crash cannot be covered. Without the flag, only entries checkpointed earlier survive, so
+call `action=checkpoint` before a planned restart. Set systemd `TimeoutStopSec` above the shutdown deadline plus
+the expert-profile save (the example above uses the default 300 s).
 
 **Security and backups.** Entries are plaintext: the full token history (prompt, system prompt, tools and
 generated tokens) and the KV/recurrent state. Format-2 entries keep the tokens/recurrent state in `STRSTATE`

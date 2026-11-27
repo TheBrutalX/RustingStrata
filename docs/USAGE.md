@@ -434,6 +434,12 @@ format-1 `STRATASLOT` entries remain listed and restorable.
 - `--slot-archive-pin-gb N`: cap on the bytes an admin may pin, in GiB. Absent, it is 10% of `--slot-archive-gb`
   (5 GiB at the default 50); `0` removes the cap. A pin that would exceed it answers `409`. The cap is a safety
   valve, not a target.
+- `--slot-archive-gc-interval DURATION`: run the TTL/quota/LRU GC in the background at this interval, default
+  `5m`; `0` disables the timer. `POST /slots/archive/gc` remains available.
+- `--slot-archive-on-shutdown`: checkpoint the resident slots on a graceful stop, off by default;
+  `--slot-archive-shutdown-timeout DURATION` (default `30s`) bounds it. The checkpoint is synchronous v2 and checks
+  the deadline between slots; slots still resident after the deadline are skipped and logged. `SIGKILL` cannot be
+  covered.
 
 `POST /slots/archive/gc` first drops unpinned entries older than `--slot-archive-ttl`, then rows whose file is
 missing, then applies the same lineage pruning and LRU eviction when the archive is over the target. It has no
@@ -506,14 +512,15 @@ curl -s -X POST -H 'Content-Type: application/json' -d '{}' \
   conversation, so it still needs a full prefill. The pre-compact entry is for rollback and audit; the compacted
   prompt is prefilled once and checkpointed as a new lineage, and that entry is the fast resume afterwards.
 - **Storage and dedup.** A format-2 entry references its ordered segment chain; deleting the entry unrefs those
-  segments, and a segment still referenced by another entry survives. `segments.json` and `segments/` are managed
-  by the server: do not edit them by hand. The budget counts a shared segment once; `bytes` for a new entry is its
-  state file plus the segments it actually created.
+  segments, and a segment still referenced by another entry survives. `segments.json`, `segments/`, `manifest.log`
+  and `segments.log` are managed by the server: do not edit them by hand. `touch` updates are batched and
+  journaled, with adaptive compaction; `Archive::flush`/`compact` are the explicit forms. The budget counts a
+  shared segment once; `bytes` for a new entry is its state file plus the segments it actually created.
 - **Restart.** The manifest, `segments.json`, segment files and entries (including each `pinned` flag) survive a
-  restart, and a continuation restores from disk without the old process. A server stop only keeps states that were
-  checkpointed earlier; phase 2 still has no shutdown checkpoint, so a conversation resident in VRAM at `SIGTERM`
-  is lost unless it was checkpointed explicitly. A lost `manifest.json` can rebuild v1 `.slot` entries only; v2
-  entries are not reconstructible from the segment files alone.
+  restart, and a continuation restores from disk without the old process. With `--slot-archive-on-shutdown` a
+  graceful stop checkpoints the resident slots within the deadline; without it, only states checkpointed earlier
+  survive, and `SIGKILL` cannot be covered. A lost `manifest.json` rebuilds v1 `.slot` entries and v2 entries from
+  `STRSTATE` v2 + the segment chain; a legacy v1 `STRSTATE` (no refs) is left in place rather than guessed.
 - **Privacy.** An entry is plaintext: a `STRSTATE` file plus `STRKVSEG` segment files (or a v1 `STRATASLOT` file),
   all created `0600` in a directory created `0700`. It holds the full token history (prompt, system prompt, tools
   and generated tokens) and the KV/recurrent state, not a compressed transcript. Segments are shared globally
