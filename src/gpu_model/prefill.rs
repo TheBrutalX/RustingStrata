@@ -146,8 +146,9 @@ impl GpuModel<'_> {
         // so the later chunks run with the placement the first ones showed (0 = off, the default; untested on real hardware).
         let every = std::env::var("STRATA_PF_ADAPT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
         let nchunks = tokens.len().div_ceil(chunk);
+        let cur = self.cur;
         for (i, ch) in tokens.chunks(chunk).enumerate() {
-            if i > 0 { between(self)?; }
+            if i > 0 { between(self)?; self.use_slot(cur); }
             self.prefill_chunk(ch, None, None)?;
             crate::term::prefilled(ch.len());
             if every > 0 && (i + 1) % every == 0 && i + 1 < nchunks { self.adapt_experts()?; }
@@ -200,7 +201,20 @@ impl GpuModel<'_> {
         anyhow::ensure!(sys <= keep && keep < tokens.len(), "prefill_cached: sys {sys}, keep {keep} of {} tokens", tokens.len());
         self.reset_shortlist();
         self.note_short_tokens(tokens);
-        let reused = self.cache_begin(tokens, keep)?;
+        // The first unified-KV version does not reuse a saved/stashed prompt prefix: its position lives in the
+        // slot's own KV, and a reclaimed slot would silently read rows another slot now owns. A full prefill keeps
+        // the slot's position and capacity consistent; the prompt cache can come back once the prefix ownership is
+        // tracked per slot.
+        let (sys, keep, reused) = if self.kv_budget > 0 {
+            self.reset()?;
+            (0, 0, 0)
+        } else {
+            let reused = self.cache_begin(tokens, keep)?;
+            // The restored/stashed state must leave the write cursor at the prefix it reused; a stale `pos` from the
+            // previous request would make `prefill_with` reserve `pos + remaining` instead of the prompt length.
+            self.pos = reused;
+            (sys, keep, reused)
+        };
         if sys > reused {
             self.prefill_with(&tokens[reused..sys], between)?;
             self.stash(&tokens[..sys])?;
@@ -214,7 +228,11 @@ impl GpuModel<'_> {
                 crate::say!("warning: could not save prompt cache: {e:#}");
             }
         }
-        let logits = self.prefill_with(&tokens[keep..], between)?;
+        // A restored state can be longer than the HTTP prompt-cache prefix (`keep`), e.g. a parked conversation or a
+        // stashed system block. Start at the further of the two, or the full state would be prefilled a second time.
+        let start = if reused >= tokens.len() { tokens.len() - 1 } else { keep.max(from) };
+        if reused >= tokens.len() { self.pos = start; }
+        let logits = self.prefill_with(&tokens[start..], between)?;
         self.ext_draft_sync_prompt(tokens)?;
         if let Some(ng) = self.ngram.as_mut() { ng.begin(tokens); }
         Ok((logits, reused))
