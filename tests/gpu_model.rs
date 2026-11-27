@@ -1672,3 +1672,169 @@ fn slot_archive_corrupt_v2_data_is_rejected_and_clears_the_slot() {
     }
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// The resumable whole-slot save/restore produces exactly the synchronous bytes and logits while running a step on
+/// another slot after every bounded chunk. (GPU integration test; not run by the CPU-only pass.)
+#[test]
+fn slot_resumable_io_matches_sync() {
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let ids = tok.encode("The quick brown fox jumps over the lazy dog. The capital of France is").unwrap();
+    let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).fold(0f32, |x, (p, q)| x.max((p - q).abs()));
+
+    for (bk, gpu) in common::backends() {
+        eprintln!("backend {bk}");
+        let mut gm = GpuModel::load_slots(&m, gpu, 1024, 64, 512 << 20, 2).unwrap();
+        gm.adapt_every = 0;
+        gm.use_slot(0);
+        gm.prefill(&ids).unwrap();
+        gm.step(42).unwrap();
+        gm.use_slot(1);
+        gm.prefill(&ids[..8]).unwrap();
+        gm.use_slot(0);
+
+        let saved_tokens = gm.slot_tokens(0).to_vec();
+        let mut sync = Vec::new();
+        let n_sync = gm.save_slot_to(0, &mut sync).unwrap();
+
+        let mut save_turns = 0usize;
+        let mut got = Vec::new();
+        let n_got = {
+            let mut between = |g: &mut GpuModel| -> anyhow::Result<()> {
+                save_turns += 1;
+                g.use_slot(1);
+                g.step(7)?;
+                Ok(())
+            };
+            gm.save_slot_to_with(0, &mut got, &mut between).unwrap()
+        };
+        assert_eq!(n_got, n_sync, "{bk}: resumable save size");
+        assert_eq!(got, sync, "{bk}: resumable save bytes");
+        assert!(save_turns > 0, "{bk}: resumable save never yielded");
+
+        // The reference logits are the continuation of the saved state; resuming must reproduce them.
+        let want = gm.step(99).unwrap();
+        gm.use_slot(0);
+        gm.reset().unwrap();
+
+        let mut restore_turns = 0usize;
+        let n_restored = {
+            let mut cur = std::io::Cursor::new(got);
+            let mut between = |g: &mut GpuModel| -> anyhow::Result<()> {
+                restore_turns += 1;
+                g.use_slot(1);
+                g.step(8)?;
+                Ok(())
+            };
+            gm.restore_slot_from_with(0, &mut cur, false, &mut between).unwrap()
+        };
+        assert_eq!(n_restored, n_sync, "{bk}: resumable restore size");
+        assert!(restore_turns > 0, "{bk}: resumable restore never yielded");
+        assert_eq!(gm.slot_tokens(0), &saved_tokens[..], "{bk}: resumable restore history");
+        let got_next = gm.step(99).unwrap();
+        let d = diff(&want, &got_next);
+        eprintln!("{bk}: resumable restore max |dlogit| {d:.3e}");
+        assert_eq!(ops::argmax(&want), ops::argmax(&got_next), "{bk}: resumable restore argmax");
+        assert!(d <= 1e-4, "{bk}: resumable restore logits differ by {d}");
+    }
+}
+
+/// The resumable segmented/recurrent variants yield after bounded copies and restore the same next-token logits as
+/// the uninterrupted run. (GPU integration test; not run by the CPU-only pass.)
+#[test]
+fn slot_resumable_segmented_io_round_trip() {
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let ids = tok.encode("The quick brown fox jumps over the lazy dog. The capital of France is").unwrap();
+    let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).fold(0f32, |x, (p, q)| x.max((p - q).abs()));
+
+    for (bk, gpu) in common::backends() {
+        eprintln!("backend {bk}");
+        let mut gm = GpuModel::load_slots(&m, gpu, 2048, 64, 512 << 20, 2).unwrap();
+        gm.adapt_every = 0;
+        gm.use_slot(0);
+        gm.prefill(&ids).unwrap();
+        gm.use_slot(1);
+        gm.prefill(&ids[..8]).unwrap();
+        gm.use_slot(0);
+        let n = ids.len();
+
+        // Synchronous reference payloads, then the resumable ones, which step slot 1 between copies.
+        let mut sync_kv = Vec::new();
+        gm.save_kv_segment(0, 0, n, &mut sync_kv).unwrap();
+        let mut save_turns = 0usize;
+        let mut got_kv = Vec::new();
+        {
+            let mut between = |g: &mut GpuModel| -> anyhow::Result<()> {
+                save_turns += 1;
+                g.use_slot(1);
+                g.step(7)?;
+                Ok(())
+            };
+            gm.save_kv_segment_with(0, 0, n, &mut got_kv, &mut between).unwrap();
+        }
+        assert_eq!(got_kv, sync_kv, "{bk}: resumable KV segment bytes");
+        assert!(save_turns > 0, "{bk}: resumable KV save never yielded");
+
+        let mut sync_recurrent = Vec::new();
+        gm.save_recurrent_to(0, &mut sync_recurrent).unwrap();
+        let mut recurrent_turns = 0usize;
+        let mut got_recurrent = Vec::new();
+        {
+            let mut between = |g: &mut GpuModel| -> anyhow::Result<()> {
+                recurrent_turns += 1;
+                g.use_slot(1);
+                g.step(7)?;
+                Ok(())
+            };
+            gm.save_recurrent_to_with(0, &mut got_recurrent, &mut between).unwrap();
+        }
+        assert_eq!(got_recurrent, sync_recurrent, "{bk}: resumable recurrent bytes");
+        assert!(recurrent_turns > 0, "{bk}: resumable recurrent save never yielded");
+
+        let want = gm.step(99).unwrap();
+
+        // Restore into slot 1, stepping slot 0 (the source) between copies.
+        gm.use_slot(1);
+        gm.reset().unwrap();
+        let mut kv_restore_turns = 0usize;
+        {
+            let mut cur = std::io::Cursor::new(got_kv);
+            let mut between = |g: &mut GpuModel| -> anyhow::Result<()> {
+                kv_restore_turns += 1;
+                g.use_slot(0);
+                g.step(8)?;
+                Ok(())
+            };
+            gm.restore_kv_segment_with(1, 0, n, &mut cur, &mut between).unwrap();
+        }
+        assert!(kv_restore_turns > 0, "{bk}: resumable KV restore never yielded");
+
+        let mut recurrent_restore_turns = 0usize;
+        {
+            let mut cur = std::io::Cursor::new(got_recurrent);
+            let mut between = |g: &mut GpuModel| -> anyhow::Result<()> {
+                recurrent_restore_turns += 1;
+                g.use_slot(0);
+                g.step(8)?;
+                Ok(())
+            };
+            gm.restore_recurrent_from_with(1, &mut cur, &mut between).unwrap();
+        }
+        assert!(recurrent_restore_turns > 0, "{bk}: resumable recurrent restore never yielded");
+        gm.finish_segmented_restore(1, &ids, 0, 0).unwrap();
+        gm.use_slot(1);
+        assert_eq!(gm.slot_tokens(1), &ids[..], "{bk}: resumable segmented history");
+        let got_next = gm.step(99).unwrap();
+        let d = diff(&want, &got_next);
+        eprintln!("{bk}: resumable segmented restore max |dlogit| {d:.3e}");
+        assert_eq!(ops::argmax(&want), ops::argmax(&got_next), "{bk}: resumable segmented argmax");
+        assert!(d <= 1e-4, "{bk}: resumable segmented logits differ by {d}");
+    }
+}
