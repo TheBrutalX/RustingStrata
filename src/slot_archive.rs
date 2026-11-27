@@ -10,15 +10,17 @@
 //! the budget. Owner is the conversation owner (`GpuModel::slot_owner`), not the request that triggered a
 //! checkpoint.
 
-use crate::gpu_model::GpuModel;
+use crate::gpu_model::{GpuModel, SegmentSource};
 use crate::slot_segments::{self, SegmentStore};
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// File name of the compacted manifest inside [`ArchiveConfig::dir`].
@@ -53,6 +55,18 @@ const STATE_V1_HEADER_LEN: u64 = 8 + 4 + 8 + 8 + 4 + 4;
 const STATE_HEADER_LEN: u64 = STATE_V1_HEADER_LEN + 4;
 /// Wire length of one ordered segment reference: 16-byte id, start u64, end u64.
 const STATE_SEGMENT_REF_LEN: u64 = 16 + 8 + 8;
+/// Depth of the segmented-restore reader channel: at most this many validated payloads are staged (see
+/// docs/SLOT-ARCHIVE-PHASE2.md §6).
+const RESTORE_RING: usize = 4;
+/// Granularity of one read call into a segment or state payload; a payload itself may be larger (the fixed
+/// recurrent snapshot is about 64 MiB on the 35B test model).
+const RESTORE_CHUNK: usize = 64 << 20;
+/// `STRATSEG` v1 fixed header/footer lengths. Kept local to the restore reader: the format is validated here without
+/// taking the archive/segment-store lock (see `slot_segments` for the authoritative writer).
+const SEGMENT_HEADER_LEN: u64 = 40;
+const SEGMENT_FOOTER_LEN: u64 = 16;
+/// Longest accepted `STRATSEG` parent id, mirroring `slot_segments`.
+const SEGMENT_MAX_PARENT_LEN: usize = 4096;
 /// Sanity bound on the token list in a `STRSTATE` file (16M ids, 64 MiB), far above any `--ctx`.
 const MAX_STATE_TOKENS: usize = 1 << 24;
 /// Sanity bound on the segment-ref list (1M refs, 32 MiB). Real 1024-token histories use far fewer.
@@ -207,6 +221,401 @@ impl Drop for Lease {
             table.remove(&self.id);
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Asynchronous segmented restore: plan under a short lock, read on a worker, install on the model thread
+// ---------------------------------------------------------------------------------------------------------
+
+/// One ordered KV segment of a [`SegmentedRestorePlan`].
+#[derive(Clone, Debug)]
+pub struct SegmentedRestoreSegment {
+    /// Content-addressed segment id (also used to validate the parent chain).
+    pub id: String,
+    /// First token position covered by this segment.
+    pub start: usize,
+    /// One past the last token position covered by this segment.
+    pub end: usize,
+    /// Absolute path of the `STRATSEG` file.
+    pub path: PathBuf,
+}
+
+/// Everything a v2 restore needs to address the state file and the segment files, captured under a short archive
+/// lock. It contains no payload bytes: the reader thread opens and validates the files.
+#[derive(Clone, Debug)]
+pub struct SegmentedRestorePlan {
+    pub entry_id: String,
+    pub owner: u64,
+    pub fingerprint: u64,
+    /// Exact token history, from the `STRSTATE` header; also the install length.
+    pub tokens: Vec<u32>,
+    pub rope_offset: i32,
+    /// The `STRSTATE` file (token list plus the `STRRSEG` recurrent payload).
+    pub state_path: PathBuf,
+    /// Ordered KV segments, a contiguous cover of `[0, tokens.len())`.
+    pub segments: Vec<SegmentedRestoreSegment>,
+}
+
+/// One message from the restore reader thread. Payloads are complete validated `STRKVSEG`/`STRRSEG` streams; the
+/// bounded channel is what limits how many are staged ahead of the model thread.
+enum RestoreMsg {
+    Segment { start: usize, end: usize, payload: Vec<u8> },
+    State { payload: Vec<u8> },
+}
+
+/// The model-side end of the bounded restore channel: a [`SegmentSource`] over validated payloads.
+///
+/// The reader sends exactly the plan's segments in order, then the recurrent state. No archive lock is involved here,
+/// and dropping this source aborts the reader (its next send fails) without leaving a temp file or partial entry.
+pub struct ChannelSegmentSource {
+    rx: Receiver<Result<RestoreMsg>>,
+    expected_segments: usize,
+    segments_seen: usize,
+    state_seen: bool,
+    error: Option<String>,
+}
+
+impl ChannelSegmentSource {
+    fn recv(&mut self, what: &str) -> Result<RestoreMsg> {
+        if let Some(error) = &self.error {
+            bail!("segmented restore reader failed: {error}");
+        }
+        match self.rx.recv() {
+            Ok(Ok(msg)) => Ok(msg),
+            Ok(Err(err)) => {
+                let message = format!("{err:#}");
+                self.error = Some(message.clone());
+                bail!("segmented restore reader failed while sending {what}: {message}");
+            }
+            Err(_) => {
+                let message = format!("segmented restore reader ended before {what}");
+                self.error = Some(message.clone());
+                bail!("{message}");
+            }
+        }
+    }
+}
+
+impl SegmentSource for ChannelSegmentSource {
+    fn next(&mut self) -> Result<Option<(usize, usize, Vec<u8>)>> {
+        if self.segments_seen >= self.expected_segments {
+            return Ok(None);
+        }
+        match self.recv("a KV segment")? {
+            RestoreMsg::Segment { start, end, payload } => {
+                self.segments_seen += 1;
+                Ok(Some((start, end, payload)))
+            }
+            RestoreMsg::State { .. } => {
+                bail!(
+                    "segmented restore sent the recurrent state after {} of {} KV segments",
+                    self.segments_seen,
+                    self.expected_segments
+                )
+            }
+        }
+    }
+
+    fn state(&mut self) -> Result<Vec<u8>> {
+        if self.state_seen {
+            bail!("segmented restore requested the recurrent state twice");
+        }
+        if self.segments_seen != self.expected_segments {
+            bail!(
+                "segmented restore requested the recurrent state after {} of {} KV segments",
+                self.segments_seen,
+                self.expected_segments
+            );
+        }
+        match self.recv("the recurrent state")? {
+            RestoreMsg::State { payload } => {
+                self.state_seen = true;
+                Ok(payload)
+            }
+            RestoreMsg::Segment { start, end, .. } => {
+                bail!("segmented restore sent an extra KV segment [{start}, {end}) after the plan")
+            }
+        }
+    }
+}
+
+/// Handle for an in-flight segmented restore reader. The entry lease (when any) is held here so the files cannot be
+/// deleted by `DELETE`/GC until the install has finished and the handle is joined or dropped.
+pub struct AsyncSegmentedRestore {
+    handle: Option<JoinHandle<Result<()>>>,
+    _lease: Option<Lease>,
+}
+
+impl AsyncSegmentedRestore {
+    /// Wait for the reader thread and expose any read/validation error it hit. Call this after the source has been
+    /// consumed by [`GpuModel::restore_segmented_from`]; joining while the source still exists but is not consumed can
+    /// wait for the model thread to drain the bounded channel.
+    pub fn join(mut self) -> Result<()> {
+        let Some(handle) = self.handle.take() else {
+            bail!("segmented restore already joined");
+        };
+        match handle.join() {
+            Ok(result) => result,
+            Err(_) => bail!("segmented restore reader thread panicked"),
+        }
+    }
+}
+
+/// Build the immutable restore plan under a short archive lock, then spawn a reader thread that owns the file
+/// handles. The model thread installs payloads from the returned [`ChannelSegmentSource`]; the archive mutex is not
+/// held during any disk read or host→GPU copy.
+pub fn start_async_segmented_restore(
+    archive: Arc<Mutex<Archive>>,
+    entry: ArchiveEntry,
+    lease: Option<Lease>,
+) -> Result<(ChannelSegmentSource, AsyncSegmentedRestore)> {
+    let plan = {
+        let guard = archive.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.segmented_restore_plan(&entry)?
+    };
+    let expected_segments = plan.segments.len();
+    let (tx, rx) = sync_channel::<Result<RestoreMsg>>(RESTORE_RING);
+    let handle = std::thread::Builder::new()
+        .name("slot-archive-restore".to_string())
+        .spawn(move || restore_reader_thread(plan, tx))
+        .context("spawning the segmented restore reader")?;
+    let source = ChannelSegmentSource {
+        rx,
+        expected_segments,
+        segments_seen: 0,
+        state_seen: false,
+        error: None,
+    };
+    Ok((source, AsyncSegmentedRestore { handle: Some(handle), _lease: lease }))
+}
+
+/// The reader thread body. A read/validation error is sent through the channel (so the model thread sees it at the
+/// point it expected data) and returned so [`AsyncSegmentedRestore::join`] reports it too. A dropped receiver is a
+/// clean abort: no error is surfaced and the thread exits without touching the archive.
+fn restore_reader_thread(plan: SegmentedRestorePlan, tx: SyncSender<Result<RestoreMsg>>) -> Result<()> {
+    match read_restore_stream(&plan, &tx) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if send_restore(&tx, Err(anyhow!("{err:#}"))) {
+                Err(err)
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Open and validate every segment file and the state file in plan order, sending one payload per message. Returns
+/// `Ok(())` when the whole stream was sent; a send failure (receiver dropped) also ends cleanly.
+fn read_restore_stream(
+    plan: &SegmentedRestorePlan,
+    tx: &SyncSender<Result<RestoreMsg>>,
+) -> Result<()> {
+    let mut parent: Option<String> = None;
+    for segment in &plan.segments {
+        let expected_tokens = &plan.tokens[segment.start..segment.end];
+        let payload = read_segment_payload(
+            &segment.path,
+            plan.fingerprint,
+            parent.as_deref(),
+            expected_tokens,
+            &segment.id,
+        )
+        .with_context(|| {
+            format!("reading segment {} at [{}, {}) of {}", segment.id, segment.start, segment.end, plan.entry_id)
+        })?;
+        if !send_restore(
+            tx,
+            Ok(RestoreMsg::Segment { start: segment.start, end: segment.end, payload }),
+        ) {
+            return Ok(());
+        }
+        parent = Some(segment.id.clone());
+    }
+
+    let (header, state_segments, tokens, payload) = read_state_file(&plan.state_path)
+        .with_context(|| format!("reading the state file of {}", plan.entry_id))?;
+    if header.fingerprint != plan.fingerprint {
+        bail!(
+            "state file fingerprint {:016x} does not match the plan {:016x}",
+            header.fingerprint,
+            plan.fingerprint
+        );
+    }
+    if header.owner != plan.owner {
+        bail!("state file owner {} does not match the plan {}", header.owner, plan.owner);
+    }
+    if header.rope_offset != plan.rope_offset {
+        bail!(
+            "state file rope offset {} does not match the plan {}",
+            header.rope_offset,
+            plan.rope_offset
+        );
+    }
+    if header.n_tokens != plan.tokens.len() || tokens != plan.tokens {
+        bail!(
+            "state file token history ({} tokens) does not match the plan ({} tokens)",
+            tokens.len(),
+            plan.tokens.len()
+        );
+    }
+    // A legacy v1 state file has no refs and relies on the manifest row; the plan already validated that row.
+    if !state_segments.is_empty() {
+        if state_segments.len() != plan.segments.len() {
+            bail!(
+                "state file has {} segment refs, the plan has {}",
+                state_segments.len(),
+                plan.segments.len()
+            );
+        }
+        for (found, planned) in state_segments.iter().zip(&plan.segments) {
+            if found.id != planned.id || found.start != planned.start || found.end != planned.end {
+                bail!("state file segment {:?} does not match the plan", found.id);
+            }
+        }
+    }
+    if !send_restore(tx, Ok(RestoreMsg::State { payload })) {
+        return Ok(());
+    }
+    Ok(())
+}
+
+fn send_restore(tx: &SyncSender<Result<RestoreMsg>>, msg: Result<RestoreMsg>) -> bool {
+    tx.send(msg).is_ok()
+}
+
+/// Read a segment payload on the reader thread, validating the complete `STRATSEG` v1 framing (magic, version, flags,
+/// length, parent, token range, content-addressed id and footer). This mirrors the writer in `slot_segments` and never
+/// takes the segment-store lock.
+fn read_segment_payload(
+    path: &Path,
+    fingerprint: u64,
+    parent: Option<&str>,
+    tokens: &[u32],
+    id: &str,
+) -> Result<Vec<u8>> {
+    let file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let meta = file.metadata().with_context(|| format!("stat {}", path.display()))?;
+    ensure_regular(&meta, path)?;
+
+    let mut r = BufReader::new(file);
+    let mut magic = [0u8; 8];
+    r.read_exact(&mut magic).with_context(|| format!("reading the segment magic of {}", path.display()))?;
+    if magic != slot_segments::MAGIC {
+        bail!("bad segment magic {magic:02x?} in {}", path.display());
+    }
+    let version = crate::slot_file::read_u32(&mut r).context("reading the segment version")?;
+    if version != slot_segments::VERSION {
+        bail!("unsupported segment version {version} in {}", path.display());
+    }
+    let flags = crate::slot_file::read_u32(&mut r).context("reading the segment flags")?;
+    if flags != 0 {
+        bail!("unknown segment flags {flags:#x} in {}", path.display());
+    }
+    let stored_fingerprint = crate::slot_file::read_u64(&mut r).context("reading the segment fingerprint")?;
+    if stored_fingerprint != fingerprint {
+        bail!(
+            "segment {} fingerprint {:016x} does not match the plan {:016x}",
+            path.display(),
+            stored_fingerprint,
+            fingerprint
+        );
+    }
+    let n_tokens = crate::slot_file::read_u32(&mut r)? as usize;
+    if n_tokens == 0 || n_tokens > slot_segments::MAX_TOKENS {
+        bail!("segment {} has {n_tokens} tokens, outside 1..={}", path.display(), slot_segments::MAX_TOKENS);
+    }
+    let parent_len = crate::slot_file::read_u32(&mut r)? as usize;
+    if parent_len > SEGMENT_MAX_PARENT_LEN {
+        bail!(
+            "segment {} parent id is {parent_len} bytes, the limit is {SEGMENT_MAX_PARENT_LEN}",
+            path.display()
+        );
+    }
+    let payload_len = crate::slot_file::read_u64(&mut r).context("reading the segment payload length")?;
+    if payload_len == 0 || payload_len > slot_segments::MAX_PAYLOAD_BYTES as u64 {
+        bail!(
+            "segment {} has a {payload_len}-byte payload, outside 1..={}",
+            path.display(),
+            slot_segments::MAX_PAYLOAD_BYTES
+        );
+    }
+    let total = SEGMENT_HEADER_LEN
+        .checked_add(parent_len as u64)
+        .and_then(|n| n.checked_add(4 * n_tokens as u64))
+        .and_then(|n| n.checked_add(payload_len))
+        .and_then(|n| n.checked_add(SEGMENT_FOOTER_LEN))
+        .context("segment length overflow")?;
+    if meta.len() != total {
+        bail!("segment file {} is {} bytes, the header describes {total}", path.display(), meta.len());
+    }
+
+    let stored_parent = if parent_len == 0 {
+        None
+    } else {
+        let mut buf = vec![0u8; parent_len];
+        r.read_exact(&mut buf).context("reading the segment parent id")?;
+        let parent = String::from_utf8(buf).context("segment parent id is not UTF-8")?;
+        if !valid_segment_id(&parent) {
+            bail!("invalid parent segment id {parent:?} in {}", path.display());
+        }
+        Some(parent)
+    };
+    if stored_parent.as_deref() != parent {
+        bail!(
+            "segment {} parent {:?} does not match the planned {:?}",
+            path.display(),
+            stored_parent,
+            parent
+        );
+    }
+    let mut saved_tokens = Vec::with_capacity(n_tokens);
+    for index in 0..n_tokens {
+        saved_tokens
+            .push(crate::slot_file::read_u32(&mut r).with_context(|| {
+                format!("reading segment token {index} of {n_tokens} from {}", path.display())
+            })?);
+    }
+    if saved_tokens != tokens {
+        bail!("segment {} does not contain the planned token range", path.display());
+    }
+    let computed = slot_segments::segment_id(fingerprint, parent, tokens);
+    if computed != id {
+        bail!("segment {} contains segment {computed}, not {id}", path.display());
+    }
+
+    let payload = read_chunked(&mut r, payload_len, path)?;
+    let mut footer = [0u8; SEGMENT_FOOTER_LEN as usize];
+    r.read_exact(&mut footer).with_context(|| format!("reading the footer of {}", path.display()))?;
+    let mut footer_magic = [0u8; 8];
+    footer_magic.copy_from_slice(&footer[..8]);
+    if footer_magic != slot_segments::FOOTER_MAGIC {
+        bail!("bad segment footer magic {footer_magic:02x?} in {}", path.display());
+    }
+    let stored = u64::from_le_bytes(footer[8..16].try_into().expect("8 bytes"));
+    let expected = total - SEGMENT_FOOTER_LEN;
+    if stored != expected {
+        bail!(
+            "segment {} footer length {stored} does not match the {expected} bytes before it",
+            path.display()
+        );
+    }
+    Ok(payload)
+}
+
+/// Read exactly `len` bytes, in at most [`RESTORE_CHUNK`]-sized calls. The full payload is assembled for the model
+/// thread; the bounded channel limits how many assembled payloads are staged.
+fn read_chunked<R: Read>(r: &mut R, len: u64, path: &Path) -> Result<Vec<u8>> {
+    let len = usize::try_from(len).context("segment payload does not fit in memory")?;
+    let mut out = vec![0u8; len];
+    let mut done = 0usize;
+    while done < len {
+        let n = (len - done).min(RESTORE_CHUNK);
+        r.read_exact(&mut out[done..done + n])
+            .with_context(|| format!("reading {} bytes of {}", n, path.display()))?;
+        done += n;
+    }
+    Ok(out)
 }
 
 impl Archive {
@@ -842,6 +1251,110 @@ impl Archive {
         // marker while writing the recurrent payload).
         g.mark_slot_saved(slot, &tokens, owner);
         Ok(entry)
+    }
+
+    /// Build the immutable addressing plan for a v2 restore under a short archive lock.
+    ///
+    /// This validates the entry and its `STRSTATE` header/token list/segment refs against the archive row, proves the
+    /// content-addressed segment chain, and resolves each segment id to its store path. It deliberately does not read
+    /// the recurrent payload or any segment payload: [`start_async_segmented_restore`] gives that work to a reader
+    /// thread so the archive mutex is never held across the disk reads or the model thread's host→GPU copies.
+    pub fn segmented_restore_plan(&self, entry: &ArchiveEntry) -> Result<SegmentedRestorePlan> {
+        if entry.format != 2 {
+            bail!(
+                "slot archive: entry {} is format {}, not a segmented (format 2) entry",
+                entry.id,
+                entry.format
+            );
+        }
+        if entry.n_tokens == 0 {
+            bail!("slot archive: entry {} has no tokens", entry.id);
+        }
+        let state_path = entry
+            .state_file
+            .as_deref()
+            .context("segmented entry has no state file")?
+            .to_path_buf();
+        let (header, state_segments, tokens) = read_state_manifest(&state_path)
+            .with_context(|| format!("validating the state file of entry {}", entry.id))?;
+        if header.fingerprint != entry.fingerprint {
+            bail!(
+                "slot archive: {} header fingerprint {:016x} does not match the entry {:016x}",
+                state_path.display(),
+                header.fingerprint,
+                entry.fingerprint
+            );
+        }
+        if header.owner != entry.owner {
+            bail!(
+                "slot archive: {} header owner {} does not match the entry owner {}",
+                state_path.display(),
+                header.owner,
+                entry.owner
+            );
+        }
+        if header.n_tokens != entry.n_tokens || tokens.len() != entry.n_tokens {
+            bail!(
+                "slot archive: {} has {} tokens, the entry has {}",
+                state_path.display(),
+                tokens.len(),
+                entry.n_tokens
+            );
+        }
+        // A v2 state file carries the ordered refs; a legacy v1 state file does not, so the manifest row is used.
+        if !state_segments.is_empty() && state_segments != entry.segments {
+            bail!(
+                "slot archive: {} segment refs do not match the manifest row",
+                state_path.display()
+            );
+        }
+        if !segments_cover(&entry.segments, entry.n_tokens) {
+            bail!(
+                "slot archive: entry {} segment ranges are not a contiguous cover of its history",
+                entry.id
+            );
+        }
+        validate_segment_chain(entry.fingerprint, &entry.segments, &tokens)
+            .with_context(|| format!("validating the segment chain of {}", entry.id))?;
+
+        let mut segments = Vec::with_capacity(entry.segments.len());
+        for segment in &entry.segments {
+            let row = self
+                .segments
+                .segment(&segment.id)
+                .with_context(|| format!("segment {} is missing from the store", segment.id))?;
+            if row.n_tokens != segment.end - segment.start {
+                bail!(
+                    "slot archive: segment {} has {} tokens, the entry range [{}, {}) needs {}",
+                    segment.id,
+                    row.n_tokens,
+                    segment.start,
+                    segment.end,
+                    segment.end - segment.start
+                );
+            }
+            let meta = fs::metadata(&row.file)
+                .with_context(|| format!("stat {}", row.file.display()))?;
+            if !meta.is_file() {
+                bail!("slot archive: segment {} is not a regular file", row.file.display());
+            }
+            segments.push(SegmentedRestoreSegment {
+                id: segment.id.clone(),
+                start: segment.start,
+                end: segment.end,
+                path: row.file.clone(),
+            });
+        }
+
+        Ok(SegmentedRestorePlan {
+            entry_id: entry.id.clone(),
+            owner: header.owner,
+            fingerprint: header.fingerprint,
+            tokens,
+            rope_offset: header.rope_offset,
+            state_path,
+            segments,
+        })
     }
 
     /// Restore a v2 entry into the idle slot `slot` and return the number of restored tokens.
@@ -4148,5 +4661,173 @@ mod tests {
         let archive = Archive::open(config(dir)).unwrap();
         assert_eq!(archive.stats().entries, 0);
         assert!(path.exists(), "the legacy state file is left for the operator");
+    }
+
+    #[test]
+    fn segmented_restore_plan_resolves_tokens_ranges_and_paths() {
+        let tmp = TempDir::new("segment-plan");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let tokens: Vec<u32> = (1..=14).collect();
+        let entry = v2_entry(&mut archive, 9, &tokens, "segmented");
+
+        let plan = archive.segmented_restore_plan(&entry).unwrap();
+        assert_eq!(plan.entry_id, entry.id);
+        assert_eq!(plan.owner, 9);
+        assert_eq!(plan.fingerprint, FP);
+        assert_eq!(plan.tokens, tokens);
+        assert_eq!(plan.rope_offset, 0);
+        assert_eq!(Some(&plan.state_path), entry.state_file.as_ref());
+        assert_eq!(plan.segments.len(), entry.segments.len());
+        let mut next = 0usize;
+        for (planned, reference) in plan.segments.iter().zip(&entry.segments) {
+            assert_eq!(planned.id, reference.id);
+            assert_eq!(planned.start, next);
+            assert_eq!(planned.end, reference.end);
+            assert_eq!(planned.path, archive.segments().segment(&reference.id).unwrap().file);
+            assert!(planned.path.is_file());
+            next = planned.end;
+        }
+        assert_eq!(next, tokens.len());
+
+        // Flipping a payload byte changes neither the header nor the token list. The plan must still succeed: it does
+        // not read the recurrent payload under the archive lock.
+        let mut state = fs::read(&plan.state_path).unwrap();
+        let last = state.len() - 1;
+        state[last] ^= 0xff;
+        fs::write(&plan.state_path, &state).unwrap();
+        assert!(
+            archive.segmented_restore_plan(&entry).is_ok(),
+            "the plan must not read the state payload"
+        );
+    }
+
+    #[test]
+    fn segmented_restore_plan_rejects_bad_format_owner_ranges_and_missing_files() {
+        let tmp = TempDir::new("segment-plan-bad");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let tokens: Vec<u32> = (1..=12).collect();
+        let entry = v2_entry(&mut archive, 3, &tokens, "segmented");
+
+        let mut v1 = entry.clone();
+        v1.format = 1;
+        assert!(archive.segmented_restore_plan(&v1).is_err(), "a v1 entry is not segmented");
+
+        let mut wrong_owner = entry.clone();
+        wrong_owner.owner += 1;
+        assert!(archive.segmented_restore_plan(&wrong_owner).is_err(), "owner must match the state header");
+
+        let mut wrong_fingerprint = entry.clone();
+        wrong_fingerprint.fingerprint ^= 1;
+        assert!(archive.segmented_restore_plan(&wrong_fingerprint).is_err(), "fingerprint must match");
+
+        let mut wrong_count = entry.clone();
+        wrong_count.n_tokens += 1;
+        assert!(archive.segmented_restore_plan(&wrong_count).is_err(), "token count must match");
+
+        let mut broken_ranges = entry.clone();
+        broken_ranges.segments[0].end -= 1;
+        assert!(archive.segmented_restore_plan(&broken_ranges).is_err(), "ranges must be contiguous");
+
+        let mut wrong_chain = entry.clone();
+        wrong_chain.segments[0].id = "0000000000000000".to_string();
+        assert!(archive.segmented_restore_plan(&wrong_chain).is_err(), "segment ids are content-addressed");
+
+        let segment_file = archive.segments().segment(&entry.segments[0].id).unwrap().file.clone();
+        fs::remove_file(&segment_file).unwrap();
+        assert!(archive.segmented_restore_plan(&entry).is_err(), "a missing segment file is rejected");
+    }
+
+    #[test]
+    fn channel_segment_source_streams_ordered_bounded_payloads() {
+        use crate::gpu_model::SegmentSource;
+        let tmp = TempDir::new("segment-channel");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let tokens: Vec<u32> = (100..=131).collect();
+        let entry = v2_entry(&mut archive, 5, &tokens, "segmented");
+        let state_path = entry.state_file.clone().unwrap();
+        let archive = Arc::new(Mutex::new(archive));
+        let (mut source, handle) =
+            start_async_segmented_restore(Arc::clone(&archive), entry.clone(), None).unwrap();
+
+        let mut next = 0usize;
+        let mut ranges = Vec::new();
+        while let Some((start, end, payload)) = source.next().unwrap() {
+            assert_eq!(start, next, "segments are delivered in order");
+            assert!(end > start && end <= tokens.len());
+            let expected: Vec<u8> = tokens[start..end].iter().flat_map(|t| t.to_le_bytes()).collect();
+            assert_eq!(payload, expected, "payload [{start}, {end})");
+            ranges.push((start, end));
+            next = end;
+        }
+        assert_eq!(next, tokens.len());
+        assert_eq!(ranges.len(), entry.segments.len());
+        assert_eq!(source.state().unwrap(), b"test-recurrent-payload");
+        assert!(source.state().is_err(), "the state can only be requested once");
+        handle.join().unwrap();
+        assert!(state_path.exists());
+    }
+
+    #[test]
+    fn channel_segment_source_reports_a_truncated_segment() {
+        use crate::gpu_model::SegmentSource;
+        let tmp = TempDir::new("segment-truncated");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let tokens: Vec<u32> = (1..=8).collect();
+        let entry = v2_entry(&mut archive, 1, &tokens, "segmented");
+        let file = archive.segments().segment(&entry.segments[0].id).unwrap().file.clone();
+        let data = fs::read(&file).unwrap();
+        fs::write(&file, &data[..data.len() - 1]).unwrap();
+
+        let archive = Arc::new(Mutex::new(archive));
+        let (mut source, handle) =
+            start_async_segmented_restore(Arc::clone(&archive), entry, None).unwrap();
+        let err = source.next().unwrap_err();
+        assert!(format!("{err:#}").contains("segment file"), "{err:#}");
+        assert!(handle.join().is_err(), "join must expose the reader error");
+    }
+
+    #[test]
+    fn channel_segment_source_reports_a_truncated_state() {
+        use crate::gpu_model::SegmentSource;
+        let tmp = TempDir::new("segment-state-truncated");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        // More segments than the bounded channel holds, so the reader is still sending segments when the state file
+        // is truncated; it cannot reach the state read until the receiver drains them.
+        let tokens: Vec<u32> = (1..=64).collect();
+        let entry = v2_entry(&mut archive, 1, &tokens, "segmented");
+        let state = entry.state_file.clone().unwrap();
+        let archive = Arc::new(Mutex::new(archive));
+        let (mut source, handle) =
+            start_async_segmented_restore(Arc::clone(&archive), entry, None).unwrap();
+
+        let data = fs::read(&state).unwrap();
+        fs::write(&state, &data[..data.len() - 1]).unwrap();
+        while source.next().unwrap().is_some() {}
+        let err = source.state().unwrap_err();
+        assert!(format!("{err:#}").contains("state file"), "{err:#}");
+        assert!(handle.join().is_err(), "join must expose the reader error");
+    }
+
+    #[test]
+    fn channel_segment_source_dropped_receiver_aborts_cleanly() {
+        use crate::gpu_model::SegmentSource;
+        let tmp = TempDir::new("segment-dropped");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        // 64 tokens at four per segment: more messages than the bounded channel holds, so the reader is blocked in a
+        // send when the receiver disappears.
+        let tokens: Vec<u32> = (1..=64).collect();
+        let entry = v2_entry(&mut archive, 1, &tokens, "segmented");
+        let archive = Arc::new(Mutex::new(archive));
+        let (mut source, handle) =
+            start_async_segmented_restore(Arc::clone(&archive), entry, None).unwrap();
+        assert!(source.next().unwrap().is_some());
+        drop(source);
+        handle.join().expect("a dropped receiver aborts the reader cleanly");
     }
 }

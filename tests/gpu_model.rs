@@ -1838,3 +1838,188 @@ fn slot_resumable_segmented_io_round_trip() {
         assert!(d <= 1e-4, "{bk}: resumable segmented logits differ by {d}");
     }
 }
+
+/// Reading a v2 entry on a background thread and installing it through `restore_segmented_from` produces the same
+/// tokens, owner, position and next-token logits as the synchronous `restore_segmented`, while the install callback
+/// runs on the model thread and can switch the current slot between copies. (GPU integration test; not run by the
+/// CPU-only pass.)
+#[test]
+fn slot_archive_async_segmented_restore_matches_sync() {
+    use rusting_strata::slot_archive::{
+        start_async_segmented_restore, Archive, ArchiveConfig,
+    };
+    use std::sync::{Arc, Mutex};
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let mut ids = tok
+        .encode(&"The quick brown fox jumps over the lazy dog. ".repeat(400))
+        .unwrap();
+    assert!(ids.len() > 2048, "{} tokens, need more than 2048", ids.len());
+    ids.truncate(3072);
+    let owner = 0x5151_0000_0000_0004u64;
+    let base = std::env::temp_dir().join(format!("strata-archive-async-restore-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).fold(0f32, |x, (p, q)| x.max((p - q).abs()));
+
+    for (bk, gpu) in common::backends() {
+        eprintln!("backend {bk}");
+        let dir = base.join(format!("async-{bk}"));
+        let archive = Arc::new(Mutex::new(
+            Archive::open(ArchiveConfig {
+                dir,
+                budget_bytes: 64 << 30,
+                min_tokens: 1,
+                min_delta: 0,
+                versions: 1,
+            })
+            .unwrap(),
+        ));
+        let mut gm = GpuModel::load_slots(&m, gpu, 4096, 256, 512 << 20, 2).unwrap();
+        gm.adapt_every = 0;
+        gm.owner = owner;
+        gm.use_slot(0);
+        gm.prefill(&ids).unwrap();
+        let entry = archive
+            .lock()
+            .unwrap()
+            .save_segmented(&mut gm, 0, owner, "test")
+            .unwrap();
+        assert_eq!(entry.format, 2, "{bk}: entry format");
+        let want = gm.step(43).unwrap();
+
+        // Reference: the synchronous v2 restore into slot 1.
+        let n_sync = archive.lock().unwrap().restore_segmented(&mut gm, 1, &entry).unwrap();
+        assert_eq!(n_sync, ids.len(), "{bk}: synchronous restore length");
+        assert_eq!(gm.slot_tokens(1), &ids[..], "{bk}: synchronous history");
+        assert_eq!(gm.slot_owner(1), owner, "{bk}: synchronous owner");
+        assert_eq!(gm.slot_pos(1), ids.len(), "{bk}: synchronous position");
+        gm.use_slot(1);
+        let sync_next = gm.step(43).unwrap();
+        gm.erase_slot(1).unwrap();
+
+        // Async: the reader thread owns the files, the model thread installs and yields through the callback.
+        let (mut source, handle) =
+            start_async_segmented_restore(Arc::clone(&archive), entry.clone(), None).unwrap();
+        gm.use_slot(0);
+        let mut install_turns = 0usize;
+        let mut callback_slots = Vec::new();
+        {
+            let mut between = |g: &mut GpuModel| -> anyhow::Result<()> {
+                install_turns += 1;
+                callback_slots.push(g.current_slot());
+                g.use_slot(0);
+                Ok(())
+            };
+            gm.restore_segmented_from(1, &ids, owner, 0, &mut source, &mut between).unwrap();
+        }
+        handle.join().unwrap();
+        assert!(install_turns > 0, "{bk}: async segmented restore never yielded");
+        assert!(
+            callback_slots.iter().all(|&slot| slot == 1),
+            "{bk}: the callback ran with the target selected: {callback_slots:?}"
+        );
+        assert_eq!(gm.current_slot(), 0, "{bk}: the caller's slot is restored");
+        assert_eq!(gm.slot_tokens(1), &ids[..], "{bk}: async history");
+        assert_eq!(gm.slot_owner(1), owner, "{bk}: async owner");
+        assert_eq!(gm.slot_pos(1), ids.len(), "{bk}: async position");
+        gm.use_slot(1);
+        let async_next = gm.step(43).unwrap();
+        for (what, a, b) in [
+            ("async vs uninterrupted", &want, &async_next),
+            ("async vs sync", &sync_next, &async_next),
+        ] {
+            let d = diff(a, b);
+            eprintln!("{bk} {what}: argmax {} vs {}, max |dlogit| {d:.3e}", ops::argmax(a), ops::argmax(b));
+            assert_eq!(ops::argmax(a), ops::argmax(b), "{bk}: {what}");
+            assert!(d <= 1e-4, "{bk}: {what} differs by {d}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A corrupt segment read by the background restore aborts the install, clears the target slot (no partial state) and
+/// surfaces the error through both the source and `AsyncSegmentedRestore::join`. (GPU integration test; not run by the
+/// CPU-only pass.)
+#[test]
+fn slot_archive_async_segmented_restore_corrupt_segment_resets_slot() {
+    use rusting_strata::slot_archive::{
+        start_async_segmented_restore, Archive, ArchiveConfig,
+    };
+    use std::sync::{Arc, Mutex};
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let mut ids = tok
+        .encode(&"The quick brown fox jumps over the lazy dog. ".repeat(400))
+        .unwrap();
+    assert!(ids.len() > 2048, "{} tokens, need more than 2048", ids.len());
+    ids.truncate(3072);
+    let owner = 0x5151_0000_0000_0005u64;
+    let base = std::env::temp_dir().join(format!("strata-archive-async-bad-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    for (bk, gpu) in common::backends() {
+        eprintln!("backend {bk}");
+        let dir = base.join(format!("bad-{bk}"));
+        let archive = Arc::new(Mutex::new(
+            Archive::open(ArchiveConfig {
+                dir,
+                budget_bytes: 64 << 30,
+                min_tokens: 1,
+                min_delta: 0,
+                versions: 1,
+            })
+            .unwrap(),
+        ));
+        let mut gm = GpuModel::load_slots(&m, gpu, 4096, 256, 512 << 20, 2).unwrap();
+        gm.adapt_every = 0;
+        gm.owner = owner;
+        gm.use_slot(0);
+        gm.prefill(&ids).unwrap();
+        let entry = archive
+            .lock()
+            .unwrap()
+            .save_segmented(&mut gm, 0, owner, "test")
+            .unwrap();
+
+        // Give the target a history, then corrupt the first segment's framing so the reader rejects it.
+        gm.use_slot(1);
+        gm.prefill(&ids[..64]).unwrap();
+        assert!(!gm.slot_tokens(1).is_empty());
+        let segment_file = archive
+            .lock()
+            .unwrap()
+            .segments()
+            .segment(&entry.segments[0].id)
+            .unwrap()
+            .file
+            .clone();
+        let mut data = std::fs::read(&segment_file).unwrap();
+        data[0] ^= 0xff;
+        std::fs::write(&segment_file, &data).unwrap();
+
+        let (mut source, handle) =
+            start_async_segmented_restore(Arc::clone(&archive), entry, None).unwrap();
+        gm.use_slot(0);
+        let mut between = |_: &mut GpuModel| -> anyhow::Result<()> { Ok(()) };
+        let err = gm
+            .restore_segmented_from(1, &ids, owner, 0, &mut source, &mut between)
+            .unwrap_err();
+        eprintln!("{bk}: corrupt async restore rejected: {err:#}");
+        assert!(
+            gm.slot_tokens(1).is_empty(),
+            "{bk}: a failed async restore must clear the target slot"
+        );
+        assert_eq!(gm.slot_pos(1), 0, "{bk}: cleared position");
+        assert_eq!(gm.current_slot(), 0, "{bk}: caller slot after failure");
+        assert!(handle.join().is_err(), "{bk}: join must expose the reader error");
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}

@@ -88,6 +88,19 @@ impl Drop for SlotGuard<'_, '_> {
     fn drop(&mut self) { self.model.use_slot(self.prev); }
 }
 
+/// A source of the pieces of a v2 segmented restore, independent of the archive and the filesystem.
+///
+/// The archive reader thread implements this over a bounded channel ([`crate::slot_archive::ChannelSegmentSource`]),
+/// but the model bridge only sees validated payloads. [`SegmentSource::next`] returns the ordered KV segments as
+/// `(start, end, STRKVSEG payload)`; `None` ends the segment stream. [`SegmentSource::state`] then returns the
+/// `STRRSEG` recurrent snapshot. An error from either method aborts the restore and clears the target slot.
+pub trait SegmentSource {
+    /// The next KV segment of the history, or `None` after the last one.
+    fn next(&mut self) -> Result<Option<(usize, usize, Vec<u8>)>>;
+    /// The recurrent/DeltaNet/MTP/PLE/QSA snapshot (`STRRSEG` payload) for the slot.
+    fn state(&mut self) -> Result<Vec<u8>>;
+}
+
 /// A writer that counts the bytes it passes through (the footer stores the payload length).
 struct Count<W> { w: W, n: u64 }
 impl<W> Count<W> {
@@ -1405,6 +1418,115 @@ impl GpuModel<'_> {
             q = p.next.as_deref_mut();
         }
         self.restore_state()
+    }
+
+    /// Restore a v2 entry from a [`SegmentSource`] into `slot`, yielding to `between` between bounded copies.
+    ///
+    /// This is the model-thread half of an asynchronous segmented restore: the source may be fed by a reader thread,
+    /// but every host→GPU copy and the install still run here. `prepare_segmented_restore(slot, tokens.len(), false)`
+    /// runs once before the first copy (an automatic restore never evicts a non-empty victim); the source must then
+    /// cover `[0, tokens.len())` with contiguous ranges, followed by the recurrent snapshot.
+    ///
+    /// `between(self)` runs after each at-most-64-MiB copy and must not modify the target slot. The target is selected
+    /// again before every copy because the callback may leave a different slot current; the caller's current slot is
+    /// restored when the method returns. Any error clears the target slot before returning, so no partial state is
+    /// ever left behind.
+    pub fn restore_segmented_from<S, F>(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        owner: u64,
+        rope_offset: i32,
+        source: &mut S,
+        between: &mut F,
+    ) -> Result<()>
+    where
+        S: SegmentSource,
+        F: FnMut(&mut GpuModel<'_>) -> Result<()>,
+    {
+        ensure!(slot < self.slots(), "slot {slot} of {}", self.slots());
+        ensure!(!tokens.is_empty(), "segmented restore has no tokens");
+        ensure!(
+            tokens.len() <= self.ctx,
+            "segmented restore has {} tokens, --ctx is {}",
+            tokens.len(),
+            self.ctx
+        );
+        let prev = self.current_slot();
+        self.use_slot(slot);
+        let guard = SlotGuard { model: self, prev };
+        let result = guard.model.restore_segmented_from_inner(
+            slot,
+            tokens,
+            owner,
+            rope_offset,
+            source,
+            between,
+        );
+        if result.is_err() {
+            // A partially installed state must never be used; the caller falls back to prefill.
+            if let Err(err) = guard.model.erase_slot(slot) {
+                crate::say!("slot {slot}: clearing after a failed segmented restore: {err:#}");
+            }
+        }
+        result
+    }
+
+    fn restore_segmented_from_inner<S, F>(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        owner: u64,
+        rope_offset: i32,
+        source: &mut S,
+        between: &mut F,
+    ) -> Result<()>
+    where
+        S: SegmentSource,
+        F: FnMut(&mut GpuModel<'_>) -> Result<()>,
+    {
+        // Capacity/unified growth first; never evicts. Tokens are already validated by the caller.
+        self.prepare_segmented_restore(slot, tokens.len(), false)?;
+
+        let mut next = 0usize;
+        while let Some((start, end, payload)) = source.next()? {
+            ensure!(
+                start == next,
+                "segmented source returned [{start}, {end}), expected it to start at {next}"
+            );
+            ensure!(end > start, "segmented source returned an empty range [{start}, {end})");
+            ensure!(
+                end <= tokens.len(),
+                "segmented source returned [{start}, {end}) past the {} restored tokens",
+                tokens.len()
+            );
+            self.use_slot(slot);
+            let mut inp = &payload[..];
+            let consumed = self.restore_kv_segment_with(slot, start, end, &mut inp, between)?;
+            ensure!(
+                consumed == payload.len() as u64,
+                "KV segment [{start}, {end}) is {} bytes, {consumed} were consumed",
+                payload.len()
+            );
+            next = end;
+        }
+        ensure!(
+            next == tokens.len(),
+            "segmented source covered {next} of {} tokens",
+            tokens.len()
+        );
+
+        let state = source.state()?;
+        self.use_slot(slot);
+        let mut inp = &state[..];
+        let consumed = self.restore_recurrent_from_with(slot, &mut inp, between)?;
+        ensure!(
+            consumed == state.len() as u64,
+            "recurrent payload is {} bytes, {consumed} were consumed",
+            state.len()
+        );
+        self.use_slot(slot);
+        self.finish_segmented_restore(slot, tokens, owner, rope_offset)
     }
 
     /// Allocate the per-part saved buffers if they were not allocated yet, without touching the saved marker.
