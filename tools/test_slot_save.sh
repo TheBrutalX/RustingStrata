@@ -3,16 +3,24 @@
 #
 # It starts the server, primes one slot with a long prompt, discovers which
 # slot the scheduler used, saves it, restores it into another slot, continues
-# the conversation there, erases it, checks the error cases, then starts a
-# second server without --slot-save-path to check the 501 response.
+# the conversation there, erases it, and checks the error cases. It then stops
+# the server, prepares a truncated and a corrupt copy of the saved file, starts
+# a fresh save-enabled server, and checks that a restart restores the good file
+# and rejects the bad ones before changing a slot. On that server it also saves
+# a slot while a chat is generating, to check that the control job is deferred
+# until the slot is idle. It then starts a third server with --kv-unified and
+# checks save, the 409 for a restore that would evict a used slot, and the
+# forced restore with its pin. Last, it starts a second server without
+# --slot-save-path to check the 501 response.
 #
 # Usage: tools/test_slot_save.sh MODEL BIN SERVER_DIR [PORT]
 #
 #   MODEL       GGUF model to serve.
 #   BIN         rustingstrata binary (a path, or a name on PATH).
 #   SERVER_DIR  directory the server runs in.
-#   PORT        port of the save-enabled server (default 8080); the second,
-#               no-flag server uses PORT + 1.
+#   PORT        port of the save-enabled server (default 8080); PORT + 1 is
+#               used first by the --kv-unified server and then, after that one
+#               stops, by the no-flag server.
 #
 # Environment:
 #   LOAD_TIMEOUT     seconds to wait for a model load (default 600).
@@ -30,8 +38,8 @@ Usage: tools/test_slot_save.sh MODEL BIN SERVER_DIR [PORT]
   MODEL       GGUF model to serve
   BIN         rustingstrata binary (path or name on PATH)
   SERVER_DIR  directory the server runs in
-  PORT        save-enabled server port (default 8080); the no-flag
-              server uses PORT + 1
+  PORT        save-enabled server port (default 8080); the --kv-unified
+              server and then the no-flag server use PORT + 1
 
 Environment: LOAD_TIMEOUT (default 600), REQUEST_TIMEOUT (default 600)
 EOF
@@ -79,10 +87,12 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/strata-slot-save.XXXXXX") \
 SAVE_DIR="$WORK/slots"
 LOG1="$WORK/server-save.log"
 LOG2="$WORK/server-noflag.log"
+LOG3="$WORK/server-unified.log"
 mkdir -p "$SAVE_DIR" || fail "could not create $SAVE_DIR"
 
 PID1=""
 PID2=""
+PID3=""
 SERVER_PID=""
 
 alive() {
@@ -106,6 +116,7 @@ stop_server() {
 cleanup() {
   stop_server "${PID1:-}"
   stop_server "${PID2:-}"
+  stop_server "${PID3:-}"
   rm -rf -- "$WORK"
 }
 trap cleanup EXIT
@@ -113,17 +124,29 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 start_server() {
-  local port=$1 log=$2 with_slots=$3
-  if [[ "$with_slots" == "yes" ]]; then
-    ( cd "$SERVER_DIR" && exec "$BIN" serve \
-        --model "$MODEL" --gpu --backend cuda --parallel 2 --ctx 65536 \
-        --kv q8 --slot-save-path "$SAVE_DIR" \
-        --addr "127.0.0.1:$port" ) >"$log" 2>&1 &
-  else
-    ( cd "$SERVER_DIR" && exec "$BIN" serve \
-        --model "$MODEL" --gpu --backend cuda --parallel 2 --ctx 65536 \
-        --kv q8 --addr "127.0.0.1:$port" ) >"$log" 2>&1 &
-  fi
+  local port=$1 log=$2 mode=$3
+  case "$mode" in
+    yes)
+      ( cd "$SERVER_DIR" && exec "$BIN" serve \
+          --model "$MODEL" --gpu --backend cuda --parallel 2 --ctx 65536 \
+          --kv q8 --slot-save-path "$SAVE_DIR" \
+          --addr "127.0.0.1:$port" ) >"$log" 2>&1 &
+      ;;
+    unified)
+      ( cd "$SERVER_DIR" && exec "$BIN" serve \
+          --model "$MODEL" --gpu --backend cuda --parallel 2 --ctx 8192 \
+          --kv q8 --kv-unified --slot-save-path "$SAVE_DIR" \
+          --addr "127.0.0.1:$port" ) >"$log" 2>&1 &
+      ;;
+    no)
+      ( cd "$SERVER_DIR" && exec "$BIN" serve \
+          --model "$MODEL" --gpu --backend cuda --parallel 2 --ctx 65536 \
+          --kv q8 --addr "127.0.0.1:$port" ) >"$log" 2>&1 &
+      ;;
+    *)
+      fail "unknown server mode: $mode"
+      ;;
+  esac
   SERVER_PID=$!
 }
 
@@ -133,6 +156,7 @@ run_py() {
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -249,6 +273,18 @@ def long_prompt():
     parts = []
     size = 0
     while size < 8000:  # roughly 2000 tokens
+        parts.append(PARAGRAPH)
+        size += len(PARAGRAPH)
+    return "".join(parts) + "\n\nAnswer with one short sentence."
+
+
+def unified_prompt():
+    # --ctx 8192 is the total budget and each slot starts at 4096. About
+    # 20000 characters is roughly 5000 tokens, which grows one slot past its
+    # base share while still fitting the budget with the generated tokens.
+    parts = []
+    size = 0
+    while size < 20000:
         parts.append(PARAGRAPH)
         size += len(PARAGRAPH)
     return "".join(parts) + "\n\nAnswer with one short sentence."
@@ -430,6 +466,278 @@ def run_full(base, timeout):
     return report.summary()
 
 
+def run_restart(base, save_dir, timeout):
+    report = Report()
+
+    def note(name):
+        path = os.path.join(save_dir, name)
+        try:
+            return "%s (%d bytes)" % (path, os.path.getsize(path))
+        except OSError as err:
+            return "%s (%s)" % (path, err)
+
+    # A fresh process restored the file written by the first server. This is
+    # the cross-restart half of the contract, not just a same-process copy.
+    status, body = http(
+        base, "POST", "/slots/0?action=restore", {"filename": "slot0.bin"}, timeout
+    )
+    obj = as_obj(body)
+    report.check(
+        "restart restore slot0.bin returns 200",
+        status == 200,
+        "status=%s file=%s body=%s" % (status, note("slot0.bin"), brief(obj)),
+    )
+    report.check(
+        "restart restore n_restored > 0",
+        as_int(obj.get("n_restored")) > 0,
+        "n_restored=%r file=%s" % (obj.get("n_restored"), note("slot0.bin")),
+    )
+    report.check(
+        "restart restore n_read > 0",
+        as_int(obj.get("n_read")) > 0,
+        "n_read=%r file=%s" % (obj.get("n_read"), note("slot0.bin")),
+    )
+
+    # A half file and a file with a broken magic/fingerprint are rejected
+    # before the target slot is touched.
+    expect_status(
+        report,
+        base,
+        "restart restore truncated file returns 400",
+        "/slots/1?action=restore",
+        {"filename": "truncated.bin"},
+        400,
+        timeout,
+    )
+    expect_status(
+        report,
+        base,
+        "restart restore corrupt file returns 400",
+        "/slots/1?action=restore",
+        {"filename": "corrupt.bin"},
+        400,
+        timeout,
+    )
+
+    status, body = http(base, "GET", "/slots", None, timeout)
+    report.check(
+        "restart GET /slots still returns 200",
+        status == 200,
+        "status=%s body=%s" % (status, brief(body)),
+    )
+    return report.summary()
+
+
+def run_busy(base, timeout):
+    report = Report()
+    prompt = long_prompt()
+    outcome = {}
+
+    def chat():
+        status, body = http(
+            base,
+            "POST",
+            "/v1/chat/completions",
+            {
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 128,
+                "temperature": 0,
+                "stream": False,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+            timeout,
+        )
+        outcome["status"] = status
+        outcome["body"] = body
+
+    thread = threading.Thread(target=chat, daemon=True)
+    thread.start()
+
+    # Wait until the scheduler reports the slot as held or prefilling, then
+    # queue the save. The save reply only comes back once generation ends and
+    # the slot is idle, so it must be sent from this thread while the chat
+    # thread keeps consuming the response.
+    busy_slot = None
+    last = None
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        status, body = http(base, "GET", "/slots", None, 5.0)
+        last = "status=%s body=%s" % (status, brief(body))
+        if status == 200:
+            for slot in as_obj(body).get("slots", []):
+                if isinstance(slot, dict) and slot.get("is_processing") is True:
+                    busy_slot = as_int(slot.get("id"))
+                    break
+        if busy_slot is not None:
+            break
+        time.sleep(0.02)
+
+    report.check(
+        "busy slot observed via GET /slots",
+        busy_slot is not None,
+        last or "no response",
+    )
+    if busy_slot is None:
+        # Do not wait the whole request timeout: a missing busy slot already
+        # failed the check, and the thread is a daemon.
+        thread.join(5.0)
+        return report.summary()
+
+    status, body = http(
+        base,
+        "POST",
+        "/slots/%d?action=save" % busy_slot,
+        {"filename": "busy.bin"},
+        timeout,
+    )
+    obj = as_obj(body)
+    report.check(
+        "busy save returns 200",
+        status == 200,
+        "status=%s body=%s" % (status, brief(obj)),
+    )
+    report.check(
+        "busy save n_saved > 0",
+        as_int(obj.get("n_saved")) > 0,
+        "n_saved=%r" % (obj.get("n_saved"),),
+    )
+    report.check(
+        "busy save n_written > 0",
+        as_int(obj.get("n_written")) > 0,
+        "n_written=%r" % (obj.get("n_written"),),
+    )
+
+    thread.join(timeout)
+    report.check(
+        "busy chat returns 200",
+        outcome.get("status") == 200,
+        "status=%s body=%s" % (outcome.get("status"), brief(outcome.get("body"))),
+    )
+    return report.summary()
+
+
+def run_unified(base, timeout):
+    report = Report()
+    prompt = unified_prompt()
+    status, body = http(
+        base,
+        "POST",
+        "/v1/chat/completions",
+        {
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 16,
+            "temperature": 0,
+            "stream": False,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+        timeout,
+    )
+    report.check(
+        "unified long chat returns 200",
+        status == 200,
+        "status=%s chars=%d body=%s" % (status, len(prompt), brief(body)),
+    )
+
+    # Discover the filled slot and prove the prompt grew it past 8192 / 2.
+    status, body = http(base, "GET", "/slots", None, timeout)
+    slots = as_obj(body).get("slots", [])
+    used = [s for s in slots if isinstance(s, dict) and as_int(s.get("n_past")) > 0]
+    src = max(used, key=lambda s: as_int(s.get("n_past"))) if used else None
+    n_past = as_int(src.get("n_past")) if src else 0
+    report.check(
+        "unified chat fills past one slot's base share",
+        n_past > 4096,
+        "n_past=%d slots=%s" % (n_past, brief(slots)),
+    )
+    if src is None or n_past <= 4096:
+        return report.summary()
+
+    save_slot = as_int(src.get("id"))
+    other_slot = 0 if save_slot != 0 else 1
+    status, body = http(
+        base,
+        "POST",
+        "/slots/%d?action=save" % save_slot,
+        {"filename": "unified.bin"},
+        timeout,
+    )
+    obj = as_obj(body)
+    n_saved = as_int(obj.get("n_saved"))
+    report.check(
+        "unified save returns 200",
+        status == 200,
+        "status=%s body=%s" % (status, brief(obj)),
+    )
+    report.check(
+        "unified save n_saved > 4096",
+        n_saved > 4096,
+        "n_saved=%d" % n_saved,
+    )
+    if status != 200 or n_saved <= 4096:
+        return report.summary()
+
+    # The other slot is empty but was shrunk below n_saved when the source
+    # grew. Restoring into it would evict the non-empty source, so the server
+    # must refuse until the caller asks for force.
+    status, body = http(
+        base,
+        "POST",
+        "/slots/%d?action=restore" % other_slot,
+        {"filename": "unified.bin"},
+        timeout,
+    )
+    obj = as_obj(body)
+    report.check(
+        "unified restore that would evict a used slot returns 409",
+        status == 409,
+        "status=%s body=%s" % (status, brief(obj)),
+    )
+
+    status, body = http(
+        base,
+        "POST",
+        "/slots/%d?action=restore&force=1" % other_slot,
+        {"filename": "unified.bin"},
+        timeout,
+    )
+    obj = as_obj(body)
+    n_restored = as_int(obj.get("n_restored"))
+    report.check(
+        "unified forced restore returns 200",
+        status == 200,
+        "status=%s body=%s" % (status, brief(obj)),
+    )
+    report.check(
+        "unified forced restore n_restored == n_saved",
+        n_restored == n_saved and n_restored > 0,
+        "n_restored=%d n_saved=%d" % (n_restored, n_saved),
+    )
+    report.check(
+        "unified forced restore n_read > 0",
+        as_int(obj.get("n_read")) > 0,
+        "n_read=%r" % (obj.get("n_read"),),
+    )
+
+    status, body = http(base, "GET", "/slots", None, timeout)
+    slots = as_obj(body).get("slots", [])
+    target = next(
+        (s for s in slots if isinstance(s, dict) and as_int(s.get("id")) == other_slot),
+        {},
+    )
+    report.check(
+        "unified restored slot is pinned",
+        target.get("pinned") is True,
+        "target=%s" % brief(target),
+    )
+    report.check(
+        "unified restored slot n_past == n_saved",
+        as_int(target.get("n_past")) == n_saved,
+        "n_past=%r n_saved=%d target=%s"
+        % (target.get("n_past"), n_saved, brief(target)),
+    )
+    return report.summary()
+
+
 def run_noflag(base):
     report = Report()
     status, body = http(
@@ -521,6 +829,18 @@ def main(argv):
     if mode == "full":
         timeout = seconds(argv[3], 600.0) if len(argv) > 3 else 600.0
         return run_full(base, timeout)
+    if mode == "restart":
+        if len(argv) < 4:
+            print("usage: check.py restart BASE_URL SAVE_DIR [TIMEOUT]", file=sys.stderr)
+            return 2
+        timeout = seconds(argv[4], 600.0) if len(argv) > 4 else 600.0
+        return run_restart(base, argv[3], timeout)
+    if mode == "busy":
+        timeout = seconds(argv[3], 600.0) if len(argv) > 3 else 600.0
+        return run_busy(base, timeout)
+    if mode == "unified":
+        timeout = seconds(argv[3], 600.0) if len(argv) > 3 else 600.0
+        return run_unified(base, timeout)
     if mode == "noflag":
         return run_noflag(base)
     print("unknown mode: %s" % mode, file=sys.stderr)
@@ -551,6 +871,53 @@ fi
 run_py full "http://127.0.0.1:$PORT" "$REQUEST_TIMEOUT" || FAILED=1
 stop_server "$PID1"
 PID1=""
+
+echo
+SLOT0="$SAVE_DIR/slot0.bin"
+if [[ -s "$SLOT0" ]]; then
+  SIZE=$(wc -c < "$SLOT0" | tr -d '[:space:]')
+  HALF=$((SIZE / 2))
+  if (( HALF <= 0 )); then
+    echo "test_slot_save: slot0.bin is too small to truncate: $SIZE bytes" >&2
+    FAILED=1
+  else
+    echo "preparing truncated.bin (${HALF} of ${SIZE} bytes) and corrupt.bin"
+    head -c "$HALF" "$SLOT0" > "$SAVE_DIR/truncated.bin" \
+      || fail "could not write truncated.bin"
+    cp "$SLOT0" "$SAVE_DIR/corrupt.bin" || fail "could not write corrupt.bin"
+    printf 'XXXX' | dd of="$SAVE_DIR/corrupt.bin" bs=1 count=4 conv=notrunc 2>/dev/null \
+      || fail "could not corrupt corrupt.bin"
+
+    echo
+    echo "restarting save-enabled server on 127.0.0.1:$PORT"
+    start_server "$PORT" "$LOG1" yes
+    PID1=$SERVER_PID
+    if ! run_py wait "http://127.0.0.1:$PORT" "$LOG1" "$PID1" "$LOAD_TIMEOUT"; then
+      fail "restarted save-enabled server did not become ready"
+    fi
+
+    run_py restart "http://127.0.0.1:$PORT" "$SAVE_DIR" "$REQUEST_TIMEOUT" || FAILED=1
+    run_py busy "http://127.0.0.1:$PORT" "$REQUEST_TIMEOUT" || FAILED=1
+    stop_server "$PID1"
+    PID1=""
+  fi
+else
+  echo "test_slot_save: $SLOT0 was not written; skipping restart and busy checks" >&2
+  FAILED=1
+fi
+
+echo
+echo "starting --kv-unified save server on 127.0.0.1:$PORT2"
+start_server "$PORT2" "$LOG3" unified
+PID3=$SERVER_PID
+if ! run_py wait "http://127.0.0.1:$PORT2" "$LOG3" "$PID3" "$LOAD_TIMEOUT"; then
+  echo "test_slot_save: --kv-unified server did not become ready; skipping unified checks" >&2
+  FAILED=1
+else
+  run_py unified "http://127.0.0.1:$PORT2" "$REQUEST_TIMEOUT" || FAILED=1
+fi
+stop_server "$PID3"
+PID3=""
 
 echo
 echo "starting server without --slot-save-path on 127.0.0.1:$PORT2"
