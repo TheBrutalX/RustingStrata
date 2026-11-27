@@ -575,6 +575,10 @@ pub struct GpuModel<'a> {
     kv_cap: Vec<usize>,
     /// Positions a growing slot starts with and shrinks back to (`KV_START` or `KV_MIN`).
     kv0: usize,
+    /// Total token budget shared by the slots (`--kv-unified`); 0 when `ctx` is per slot.
+    kv_budget: usize,
+    /// Slots a request holds (`serve`), so growth reclaims only from idle ones.
+    active: Vec<bool>,
     /// The (slot, position) of each token of the `step_rows` forward being run (empty otherwise).
     rows: Vec<(usize, usize)>,
     /// Tokens `step_rows` ran, for the placement cadence.
@@ -615,13 +619,18 @@ fn copy_rate(gpu: &dyn Backend) -> anyhow::Result<f64> {
 impl<'a> GpuModel<'a> {
     /// `chunk`: prefill batch in tokens (0 = no batched prefill). `mtp`: load the MTP draft head (needs `nextn`).
     pub fn load(m: &'a Model<'a>, gpu: Box<dyn Backend>, ctx: usize, chunk: usize, vram_margin: usize, k: usize) -> anyhow::Result<GpuModel<'a>> {
-        Self::load_part(m, gpu, ctx, chunk, vram_margin, k, 0..m.cfg.n_layer, 1)
+        Self::load_part(m, gpu, ctx, chunk, vram_margin, k, 0..m.cfg.n_layer, 1, false)
     }
 
     /// `load` with `n` slots: sequences with their own KV cache and recurrent state each (`ctx` tokens a slot), which
     /// `step_rows` decodes together. No MTP draft head; not for hyper-connection, PLE or QSA models.
     pub fn load_slots(m: &'a Model<'a>, gpu: Box<dyn Backend>, ctx: usize, chunk: usize, vram_margin: usize, n: usize) -> anyhow::Result<GpuModel<'a>> {
-        Self::load_part(m, gpu, ctx, chunk, vram_margin, 0, 0..m.cfg.n_layer, n)
+        Self::load_slots_kv(m, gpu, ctx, chunk, vram_margin, n, false)
+    }
+
+    /// `load_slots` with the slots sharing one `ctx` token budget (`--kv-unified`).
+    pub fn load_slots_kv(m: &'a Model<'a>, gpu: Box<dyn Backend>, ctx: usize, chunk: usize, vram_margin: usize, n: usize, unified: bool) -> anyhow::Result<GpuModel<'a>> {
+        Self::load_part(m, gpu, ctx, chunk, vram_margin, 0, 0..m.cfg.n_layer, n, unified)
     }
 
     /// `load_split` with the same VRAM margin on every device.
@@ -635,13 +644,19 @@ impl<'a> GpuModel<'a> {
     /// of its VRAM with expert slots, keeping its entry of `vram_margin` free), and `ns` slots as in `load_slots`.
     /// One device: `load` or `load_slots`.
     pub fn load_split_margins(m: &'a Model<'a>, gpus: Vec<Box<dyn Backend>>, ctx: usize, chunk: usize, vram_margin: &[usize], split: Option<&[f64]>, k: usize, ns: usize) -> anyhow::Result<GpuModel<'a>> {
+        Self::load_split_margins_kv(m, gpus, ctx, chunk, vram_margin, split, k, ns, false)
+    }
+
+    /// `load_split_margins` with `--kv-unified` (one device only for now).
+    pub fn load_split_margins_kv(m: &'a Model<'a>, gpus: Vec<Box<dyn Backend>>, ctx: usize, chunk: usize, vram_margin: &[usize], split: Option<&[f64]>, k: usize, ns: usize, unified: bool) -> anyhow::Result<GpuModel<'a>> {
+        ensure!(!unified || gpus.len() == 1, "--kv-unified: one GPU only for now (the layer split has a per-part KV budget)");
         ensure!(vram_margin.len() == gpus.len(), "{} VRAM margin(s) for {} device(s)", vram_margin.len(), gpus.len());
         ensure!(split.is_none_or(|s| s.len() == gpus.len()), "{} layer share(s) for {} device(s)", split.map_or(0, |s| s.len()), gpus.len());
         let n = m.cfg.n_layer;
         if gpus.len() == 1 {
             let g = gpus.into_iter().next().unwrap();
             let margin = vram_margin[0];
-            return if ns > 1 { Self::load_slots(m, g, ctx, chunk, margin, ns) } else { Self::load(m, g, ctx, chunk, margin, k) };
+            return if ns > 1 { Self::load_slots_kv(m, g, ctx, chunk, margin, ns, unified) } else { Self::load(m, g, ctx, chunk, margin, k) };
         }
         let rates = gpus.iter().map(|g| copy_rate(g.as_ref())).collect::<anyhow::Result<Vec<_>>>()?;
         let free = gpus.iter().map(|g| Ok(g.mem_info()?.0 as f64)).collect::<anyhow::Result<Vec<_>>>()?;
@@ -660,7 +675,7 @@ impl<'a> GpuModel<'a> {
             ensure!(!r.is_empty(), "device {i} gets no layers ({:.0}% of {n}, free VRAM {:.0} MB; see --split)", 100.0 * share[i] / total, free[i] / 1048576.0);
             ensure!(ple.iter().all(|il| r.contains(il)) || !ple.iter().any(|il| r.contains(il)), "the PLE layers would be split across devices");
             crate::say!("device {i} ({}): layers {}..{}, host-to-VRAM copy {:.0} MB/s", gpu.name(), r.start, r.end, rates[i]);
-            parts.push(Self::load_part(m, gpu, ctx, chunk, vram_margin[i], k, r, ns)?);
+            parts.push(Self::load_part(m, gpu, ctx, chunk, vram_margin[i], k, r, ns, false)?);
         }
         // Every part holds the state of every slot (a part short of VRAM takes fewer).
         let fit: Vec<usize> = parts.iter().map(|p| p.slots()).collect();
@@ -675,7 +690,7 @@ impl<'a> GpuModel<'a> {
         Ok(acc)
     }
 
-    fn load_part(m: &'a Model<'a>, gpu: Box<dyn Backend>, ctx: usize, chunk: usize, vram_margin: usize, k: usize, range: std::ops::Range<usize>, ns: usize) -> anyhow::Result<GpuModel<'a>> {
+    fn load_part(m: &'a Model<'a>, gpu: Box<dyn Backend>, ctx: usize, chunk: usize, vram_margin: usize, k: usize, range: std::ops::Range<usize>, ns: usize, unified: bool) -> anyhow::Result<GpuModel<'a>> {
         let c = &m.cfg;
         ensure!(ns == 1 || c.hc_n == 0 && c.n_embd_ple == 0 && c.idx_top_k == 0, "--parallel: not supported for this model (hyper-connections, PLE or QSA)");
         ensure!((1..=255).contains(&ns), "--parallel {ns}: 1 to 255 slots");
@@ -729,9 +744,14 @@ impl<'a> GpuModel<'a> {
         // Several slots of a model without experts: each slot's attention KV starts at KV_START positions and doubles
         // when a request needs more (`kv_need`), up to `ctx`, so that short requests do not each hold `ctx` of VRAM.
         // ponytail: an MoE keeps `ctx` a slot, as its expert slots take the VRAM the KV would grow into.
+        // `--kv-unified`: `ctx` is the total budget, each slot starts at `ctx / ns`, and `kv_need` moves capacity
+        // between slots without changing the total.
         // A host-RAM KV layer (STRATA_KV_HOST) keeps its `ctx`: growing allocates in VRAM.
-        let grow = ns > 1 && !c.is_moe() && ctx > KV_START && !(0..c.n_layer).any(crate::host_attn::on_host);
-        let mut kv0 = if grow { KV_START } else { ctx };
+        ensure!(!unified || ns > 1, "--kv-unified needs --parallel greater than 1");
+        ensure!(!unified || !(0..c.n_layer).any(crate::host_attn::on_host), "--kv-unified does not combine with STRATA_KV_HOST");
+        let grow = ns > 1 && (unified || !c.is_moe()) && (unified || ctx > KV_START) && !(0..c.n_layer).any(crate::host_attn::on_host);
+        let base = if unified { (ctx / ns).max(KV_MIN) } else { ctx };
+        let mut kv0 = if unified { base } else if grow { KV_START } else { ctx };
         // The slots' live state stays in VRAM; more slots than fit would end the load out of memory. A dense model's
         // state may take the VRAM its weights leave (less 512 MB of scratch); an MoE's at most half, so that the other
         // half holds experts. A request past the slots waits for one (`serve_slots`).
@@ -741,11 +761,19 @@ impl<'a> GpuModel<'a> {
             let per = |kv0: usize| lay.iter().map(|&k| if k == LayerKind::Delta { 4 * ((c.ssm_conv - 1) * channels + nv * c.ssm_dv() * dk) } else { 2 * (gpu.kv_words(kv0 * kv) + gpu.kv_words_v(kv0 * kv)) }).sum::<usize>();
             let w: usize = m.w.g.tensors.values().filter(|t| !t.name.contains("_exps.")).map(|t| m.w.g.bytes(t).len()).sum();
             let room = free0.saturating_sub(w + vram_margin + (1 << 29)) / if c.is_moe() { 2 } else { 1 };
-            // Short of VRAM for every slot (a BF16 4B on 12 GB): start at KV_MIN positions, which holds a short chat.
-            if grow && room / per(kv0).max(1) < ns { kv0 = KV_MIN; }
-            let fit = (room / per(kv0).max(1)).clamp(1, ns);
-            if fit < ns { crate::say!("--parallel {ns}: the state of {fit} slots fits in VRAM; the other requests wait for a free slot"); }
-            fit
+            if unified {
+                // The whole budget is reserved now: base per slot, so every slot can start without a reallocation.
+                let total = per(kv0).saturating_mul(ns);
+                ensure!(total <= room, "--kv-unified: a {ctx}-token budget needs {:.0} MB for the slots' KV and state,                     over the {:.0} MB this card leaves; lower --ctx or use --kv q8", total as f64 / 1048576.0, room as f64 / 1048576.0);
+                crate::say!("--kv-unified: {} tokens total, {} base per slot ({} slots)", ctx, kv0, ns);
+                ns
+            } else {
+                // Short of VRAM for every slot (a BF16 4B on 12 GB): start at KV_MIN positions, which holds a short chat.
+                if grow && room / per(kv0).max(1) < ns { kv0 = KV_MIN; }
+                let fit = (room / per(kv0).max(1)).clamp(1, ns);
+                if fit < ns { crate::say!("--parallel {ns}: the state of {fit} slots fits in VRAM; the other requests wait for a free slot"); }
+                fit
+            }
         } else { ns };
         let qsa_on = c.idx_top_k > 0 && (0..c.n_layer).any(|il| m.w.layer(il, "indexer.k_proj.weight").is_ok());
         if qsa_on { ensure!(c.idx_head_dim == QSA_D && c.idx_n_head == QSA_H, "QSA indexer: {} heads of {} (the GPU kernels take {QSA_H} of {QSA_D})", c.idx_n_head, c.idx_head_dim); }
@@ -1114,7 +1142,7 @@ impl<'a> GpuModel<'a> {
         let mut ext_draft = if k > 0 && last && ns == 1 && m.draft_model.is_some() {
             let dm = m.draft_model.as_deref().unwrap();
             let d_gpu = gpu.share()?;
-            let mut dg = Self::load_part(dm, d_gpu, ctx, chunk, vram_margin, 0, 0..dm.cfg.n_layer, 1)?;
+            let mut dg = Self::load_part(dm, d_gpu, ctx, chunk, vram_margin, 0, 0..dm.cfg.n_layer, 1, false)?;
             dg.graph_tag = 1u64 << 62;
             if dg.saved.is_empty() {
                 dg.saved = alloc_saved(&*dg.gpu, &dg.layers, false)?;
@@ -1166,11 +1194,16 @@ impl<'a> GpuModel<'a> {
         let prefetch = c.is_moe() && gpu.moe_prefetch_supported() && want_prefetch;
         let pids = if prefetch { Some(gpu.zeros::<i32>((c.n_layer + 1) * c.n_expert_used)?) } else { None };
         let mb = |b: usize| b as f64 / 1048576.0;
+        let kv_one = mb((gpu.kv_words(kv0 * kv) + gpu.kv_words_v(kv0 * kv)) * 2 * c.layers[range.clone()].iter().filter(|&&k| k == LayerKind::Attn).count());
+        let (kv_mb, kv_tokens, kv_note, grow_note) = if unified {
+            (kv_one * ns as f64, ctx, format!(" total, {kv0} per slot in {ns} slots"), format!(", each slot up to {ctx}"))
+        } else {
+            (kv_one, kv0, if ns > 1 { format!(" in each of {ns} slots") } else { String::new() },
+             if grow { format!(", growing to {ctx} on demand") } else { String::new() })
+        };
         crate::say!(
-            "plan: weights+state+scratch {:.0} MB (KV {:.0} MB for {kv0} tokens{}{}, prefill {:.0} MB), expert slots {:.0} MB, resident experts {}/{}",
-            mb(free0.saturating_sub(free1)), mb((gpu.kv_words(kv0 * kv) + gpu.kv_words_v(kv0 * kv)) * 2 * c.layers[range.clone()].iter().filter(|&&k| k == LayerKind::Attn).count()),
-            if ns > 1 { format!(" in each of {ns} slots") } else { String::new() },
-            if grow { format!(", growing to {ctx} on demand") } else { String::new() }, mb(pf.as_ref().map_or(0, |p| p.bytes())),
+            "plan: weights+state+scratch {:.0} MB (KV {:.0} MB for {kv_tokens} tokens{}{}, prefill {:.0} MB), expert slots {:.0} MB, resident experts {}/{}",
+            mb(free0.saturating_sub(free1)), kv_mb, kv_note, grow_note, mb(pf.as_ref().map_or(0, |p| p.bytes())),
             mb(cache.as_ref().map_or(0, |x| x.slot_bytes_total())),
             cache.as_ref().map_or(0, |x| x.resident_count()), cache.as_ref().map_or(0, |x| x.total_experts()),
         );
@@ -1190,7 +1223,7 @@ impl<'a> GpuModel<'a> {
         let _ = &mut ext_draft;
         crate::weights::trim_working_set();
         Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], ple_undo: ([-1, -1], vec![]), bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, hada, mrope: false, mrope_buf: gpu_mrope, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every, adapt_swaps, reset_counts_after_prefill, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, nsnap, short: 32, pf, prompt_cache_path: None, bt, mtp, dflash, ext_draft, ext_draft_pend: Vec::new(), mhc_ones, graph_tag: 0, ngram: None, first: range.start, next: None,
-                      cur: 0, seqs, kv_cap: if grow { vec![kv0; ns] } else { vec![] }, kv0, rows: vec![], row_tokens: 0, kv_stage })
+                      cur: 0, seqs, kv_cap: if grow { vec![kv0; ns] } else { vec![] }, kv0, kv_budget: if unified { ctx } else { 0 }, active: vec![false; ns], rows: vec![], row_tokens: 0, kv_stage })
     }
 
     /// Clear KV and recurrent state (and forget the `prefill_cached` prefix, whose KV this zeroes).
@@ -1388,13 +1421,102 @@ impl<'a> GpuModel<'a> {
         if let Some(n) = self.next.as_mut() { n.kv_need(s, upto)?; }
         let Some(&cap) = self.kv_cap.get(s) else { return Ok(()) };
         if upto <= cap || upto > self.ctx { return Ok(()) }
-        self.kv_resize(s, upto.max(2 * cap).next_multiple_of(self.kv0).min(self.ctx), true)
+        let mut new = upto.max(2 * cap).next_multiple_of(self.kv0).min(self.ctx);
+        if self.kv_budget > 0 {
+            // One token per other slot stays reserved, so the sum of the capacities never exceeds the budget.
+            let max = self.kv_budget.saturating_sub(self.kv_cap.len().saturating_sub(1));
+            anyhow::ensure!(upto <= max, "unified KV budget full: a slot can hold {max} tokens with the other slots reserved");
+            new = new.min(max);
+            self.kv_grow_unified(s, new)
+        } else {
+            self.kv_resize(s, new, true)
+        }
+    }
+
+    /// Publish which slots a request holds (`serve`), so `kv_need` never reclaims from a decoding slot.
+    pub fn set_active(&mut self, active: &[bool]) {
+        if self.kv_budget == 0 { return; }
+        if let Some(n) = self.next.as_mut() { n.set_active(active); }
+        self.active.resize(self.kv_cap.len(), false);
+        for (a, b) in self.active.iter_mut().zip(active) { *a = *b; }
+    }
+
+    fn kv_used(&self) -> usize { self.kv_cap.iter().sum() }
+
+    /// Forget what a slot's KV prefix was, before its cache is reclaimed for another slot. The token history, the
+    /// DeltaNet snapshots and the system-prompt stash all describe rows that are about to be zeroed.
+    fn drop_slot_cache(&mut self, i: usize) {
+        if i == self.cur {
+            self.pos = 0; self.rope_offset = 0;
+            self.saved_ids.clear(); self.saved.clear(); self.saved_pos = 0;
+            self.sys = None; self.saved_owner = 0; self.sys_owner = 0;
+        } else {
+            let q = &mut self.seqs[i];
+            q.pos = 0; q.rope = 0;
+            q.saved_ids.clear(); q.saved.clear(); q.saved_pos = 0;
+            q.sys = None; q.saved_owner = 0; q.sys_owner = 0;
+        }
+    }
+
+    /// Grow slot `s` within the total budget, reclaiming the KV of inactive slots (largest first) down to KV_MIN.
+    fn kv_grow_unified(&mut self, s: usize, new: usize) -> anyhow::Result<()> {
+        let budget = self.kv_budget;
+        let fits = |used: usize, cap: usize| used - cap + new <= budget;
+        if !fits(self.kv_used(), self.kv_cap[s]) {
+            let mut order: Vec<usize> = (0..self.kv_cap.len())
+                .filter(|&i| i != s && !self.active.get(i).copied().unwrap_or(false) && self.kv_cap[i] > 1)
+                .collect();
+            order.sort_by_key(|&i| std::cmp::Reverse(self.kv_cap[i]));
+            for i in order {
+                self.drop_slot_cache(i);
+                self.kv_resize(i, 1, false)?;
+                if fits(self.kv_used(), self.kv_cap[s]) { break; }
+            }
+        }
+        anyhow::ensure!(fits(self.kv_used(), self.kv_cap[s]),
+            "unified KV budget exhausted: slot {s} needs {new} tokens, {} of {} are in use", self.kv_used(), self.kv_budget);
+        crate::say!("unified KV: slot {s} grows to {new} tokens ({} of {} in use before the copy)", self.kv_used(), self.kv_budget);
+        self.kv_resize(s, new, true)
     }
 
     /// Give slot `s` attention KV caches of `new` positions (zeroed; `keep`: with the old caches' rows). Either all
     /// of them change or, out of VRAM, none. The recorded graphs, which hold the old caches' addresses, go.
     fn kv_resize(&mut self, s: usize, new: usize, keep: bool) -> anyhow::Result<()> {
         let (g, cap) = (&*self.gpu, self.kv_cap[s]);
+        // A unified slot growing to 1M would need old + new rows at once. Stage the old rows in host RAM, free
+        // them, then allocate the new size and put them back: the card only ever holds the new rows.
+        if keep && self.kv_budget > 0 && new > cap && cap > 0 {
+            let mut staged: Vec<(usize, Vec<u8>, Vec<u8>)> = vec![];
+            for (i, l) in self.layers.iter().enumerate() {
+                if let Mixer::Attn { kc, vc, .. } = &l.mixer {
+                    let k = g.get::<u8>(&kc[s], 0, kc[s].len())?;
+                    let v = g.get::<u8>(&vc[s], 0, vc[s].len())?;
+                    staged.push((i, k, v));
+                }
+            }
+            for l in &mut self.layers {
+                if let Mixer::Attn { kc, vc, .. } = &mut l.mixer {
+                    let _ = std::mem::replace(&mut kc[s], g.alloc(1)?);
+                    let _ = std::mem::replace(&mut vc[s], g.alloc(1)?);
+                }
+            }
+            g.sync()?;
+            for (i, khost, vhost) in staged {
+                let Mixer::Attn { kc, vc, .. } = &mut self.layers[i].mixer else { unreachable!() };
+                let kn = g.alloc(khost.len() / cap * new).map_err(|e| anyhow::anyhow!(
+                    "no VRAM for the {new}-token unified KV (lower --ctx or use --kv q8): {e:#}"))?;
+                let vn = g.alloc(vhost.len() / cap * new).map_err(|e| anyhow::anyhow!(
+                    "no VRAM for the {new}-token unified KV (lower --ctx or use --kv q8): {e:#}"))?;
+                g.put(&khost, &kn, 0)?;
+                g.put(&vhost, &vn, 0)?;
+                kc[s] = kn;
+                vc[s] = vn;
+            }
+            self.kv_cap[s] = new;
+            g.sync()?;
+            g.graph_clear()?;
+            return Ok(());
+        }
         let mut fresh = vec![];
         for l in &self.layers {
             if let Mixer::Attn { kc, vc, .. } = &l.mixer {
