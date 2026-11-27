@@ -3678,8 +3678,9 @@ impl Serving {
                 // Prefill between decode steps, in the free slot whose saved state the prompt extends the furthest, else
                 // the least recently used one.
                 s.chats.retain(|j| !matches!(j, Job::Chat { gone, .. } | Job::Image { gone, .. } if gone.load(Relaxed)));
-                // Models with a batched forward prefill the queued prompts together, one free slot each.
-                let lim = g.batch_cap().max(1);
+                // Models with a batched forward prefill the queued prompts together, one free slot each. A unified
+                // KV budget grows one slot at a time, so its prompts are prefilled one at a time (decode still batches).
+                let lim = if g.kv_unified() { 1 } else { g.batch_cap().max(1) };
                 let fits = |c: &Job| matches!(c, Job::Chat { ids, .. } if ids.len() <= g.ctx());
                 let mut adm: Vec<(usize, Job)> = vec![];
                 // An image prompt runs alone, in the least recently used free slot.
