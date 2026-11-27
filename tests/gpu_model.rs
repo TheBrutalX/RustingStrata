@@ -1027,3 +1027,101 @@ fn unified_kv_budget_grows_one_slot() {
         gm.reset().unwrap();
     }
 }
+
+/// The new per-slot token history follows prefill, decode, verify and rollback, and reset clears it.
+#[test]
+fn slot_history_tracks_prefill_step_verify_and_rollback() {
+    let _gpu = common::gpu_lock();
+    // A verify/rollback with no draft length still needs the DeltaNet snapshots.
+    unsafe { std::env::set_var("STRATA_SPEC_SNAP", "1") }
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let ids = tok.encode("The capital of France is Paris and the capital of Italy is").unwrap();
+    for (bk, gpu) in common::backends() {
+        eprintln!("backend {bk}");
+        let mut gm = GpuModel::load(&m, gpu, 512, 48, 512 << 20, 0).unwrap();
+        gm.adapt_every = 0;
+        gm.prefill(&ids).unwrap();
+        assert_eq!(gm.slot_tokens(0), &ids[..], "{bk}: prefill history");
+        gm.step_rows(&[(0, 42, true)]).unwrap();
+        let mut want = ids.clone();
+        want.push(42);
+        assert_eq!(gm.slot_tokens(0), &want[..], "{bk}: step_rows history");
+        let start = want.len();
+        gm.verify(&[1, 2, 3]).unwrap();
+        want.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(gm.slot_tokens(0), &want[..], "{bk}: verify history");
+        gm.rollback(start, 1).unwrap();
+        want.truncate(start + 1);
+        assert_eq!(gm.slot_tokens(0), &want[..], "{bk}: rollback history");
+        gm.reset().unwrap();
+        assert!(gm.slot_tokens(0).is_empty(), "{bk}: reset clears history");
+    }
+}
+
+/// `--kv-unified` reuses the prefix saved by a previous request and updates the saved prefix for the next one.
+#[test]
+fn unified_cache_reuses_the_saved_prefix() {
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let ids = tok.encode(&"The quick brown fox jumps over the lazy dog. ".repeat(40)).unwrap();
+    if ids.len() < 340 { eprintln!("SKIP: {} tokens, need 340", ids.len()); return }
+    for (bk, gpu) in common::backends() {
+        eprintln!("backend {bk}");
+        let mut gm = GpuModel::load_slots_kv(&m, gpu, 1024, 64, 512 << 20, 4, true).unwrap();
+        gm.owner = 7;
+        gm.use_slot(0);
+        let first = &ids[..320];
+        gm.prefill_cached(first, 0, 300).unwrap();
+        assert_eq!(gm.slot_tokens(0), first, "{bk}: first history");
+        let mut second = first.to_vec();
+        second.extend_from_slice(&ids[320..340]);
+        let (_, reused) = gm.prefill_cached(&second, 0, 320).unwrap();
+        assert_eq!(reused, 300, "{bk}: reused prefix");
+        assert_eq!(gm.slot_tokens(0), &second[..], "{bk}: second history");
+        gm.reset().unwrap();
+    }
+}
+
+/// Save a slot, reset, restore it, and continue: the next-token logits are the same as an uninterrupted run.
+#[test]
+fn slot_save_restore_round_trip() {
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let ids = tok.encode("The quick brown fox jumps over the lazy dog. The capital of France is").unwrap();
+    for (bk, gpu) in common::backends() {
+        eprintln!("backend {bk}");
+        let mut gm = GpuModel::load(&m, gpu, 1024, 64, 512 << 20, 0).unwrap();
+        gm.adapt_every = 0;
+        gm.prefill(&ids).unwrap();
+        gm.step(42).unwrap();
+        let path = std::env::temp_dir().join(format!("strata-slot-{}-{bk}.bin", std::process::id()));
+        let written = gm.save_slot_file(0, &path).unwrap();
+        assert!(written > 0, "{bk}: empty slot file");
+        let mut want = ids.clone();
+        want.push(42);
+        assert_eq!(gm.slot_tokens(0), &want[..], "{bk}: saved history");
+        let n = want.len();
+        let first = gm.step(43).unwrap();
+        gm.reset().unwrap();
+        assert!(gm.slot_tokens(0).is_empty(), "{bk}: reset before restore");
+        gm.restore_slot_file(0, &path, false).unwrap();
+        assert_eq!(gm.slot_tokens(0), &want[..], "{bk}: restored history");
+        let second = gm.step(43).unwrap();
+        let diff = first.iter().zip(&second).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+        eprintln!("{bk}: restored next-token max |dlogit| {diff:.3e}");
+        assert_eq!(ops::argmax(&first), ops::argmax(&second), "{bk}: restored argmax");
+        assert!(diff <= 1e-4, "{bk}: restored logits differ by {diff}");
+        assert_eq!(gm.erase_slot(0).unwrap(), n + 1, "{bk}: erased count");
+        assert!(gm.slot_tokens(0).is_empty(), "{bk}: erase clears history");
+        let _ = std::fs::remove_file(&path);
+    }
+}
