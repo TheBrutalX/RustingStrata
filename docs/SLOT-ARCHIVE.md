@@ -703,7 +703,10 @@ Done: matching rule, triggers, budget and owner semantics agreed.
 
 ### Phase 2 — operational polish
 
+Detailed analysis and sizing correction: [SLOT-ARCHIVE-PHASE2.md](SLOT-ARCHIVE-PHASE2.md).
+
 - host staging + writer thread; restore read on a worker;
+- segment-level deduplication of shared prefixes (content-addressed KV segments, v2 entries);
 - TTL, per-key quota, admin pin route;
 - multi-version branching and explicit branch ids;
 - park/LRU eviction checkpoints; optional shutdown checkpoint;
@@ -712,8 +715,7 @@ Done: matching rule, triggers, budget and owner semantics agreed.
 
 ### Phase 3 — scale
 
-- content-addressed segment store to avoid rewriting unchanged KV rows;
-- optional compression of the token history (KV is high-entropy; expect little);
+- optional compression of the token history (KV is high-entropy; expect little; measured 6–8% on q8);
 - shared archive across servers with the same fingerprint (network filesystem or object store);
 - UI for browsing/deleting entries.
 
