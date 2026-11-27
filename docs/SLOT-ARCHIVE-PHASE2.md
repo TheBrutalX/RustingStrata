@@ -24,22 +24,69 @@ that operators need.
 - No TTL, no per-key quota, no shutdown checkpoint.
 - `--cache-ram` defaults to 2 GiB (and is clamped to the host's free RAM); the archive has its own disk budget.
 
-## 2. Measured cost and a sizing correction
+## 2. Measured cost, compression and quantization
 
-The archive E2E wrote a 1,695-token state as **84,312,796 bytes**, about **49.7 KB/token** for the 35B-A3B test
-model at `--kv q8`. That makes a 1M-token state roughly **50 GB**, a 100k state roughly **5 GB**, and a 32k state
-roughly **1.6 GB** for that model. The current docs' "10.9 GB per 1M tokens on the 35B-A3B layout" is a different
-KV layout/model and must not be used to size host staging or the 200 GB budget.
+A direct measurement on the 35B-A3B test model (`--ctx 8192`, 1,380-token prompt) separates the file into its
+fixed per-slot state and its per-token KV:
 
-Implications:
+| `--kv` | file bytes | fixed slot state | KV bytes | KV bytes/token | 1M-token KV |
+|---|---:|---:|---:|---:|---:|
+| q8 | 80,884,336 | 65,863,680 | 15,014,400 | 10,880 | ~10.9 GB |
+| q4 | 73,818,736 | 65,863,680 | 7,948,800 | 5,760 | ~5.8 GB |
+| q2 | 71,169,136 | 65,863,680 | 5,299,200 | 3,840 | ~3.9 GB |
 
-- A **full host snapshot is not viable** for 1M-token states: it is tens of GB, while the default host cache is
-  2 GiB. Phase 2 must use a bounded chunk ring, not "copy the whole slot to a `Vec<u8>`".
-- A 200 GB archive is about 4M tokens (not 18M) for that layout: roughly 40 conversations of 100k or 4 of 1M.
-  The budget is still useful, but the operator-facing sizing must be per model/KV, based on `bytes / n_tokens`
-  from a real checkpoint.
-- A synchronous 1M checkpoint can block the model for tens of seconds (disk) plus a few seconds (PCIe). That is
-  the main phase-2 problem.
+The fixed slot state (recurrent/DeltaNet, MTP draft, PLE/QSA rings) is ~66 MB **per slot and does not scale with
+tokens**. The header and token list are 4 bytes/token (5.5 KB here). Consequences:
+
+- The current docs' **10.9 GB per 1M tokens** is the **q8 KV** figure and is correct for this model; the total is
+  ~10.9 GB + 66 MB per slot, and the model's KV layout can change the constant. The earlier conclusion that a 1M
+  state was ~50 GB was wrong: it divided the whole file (fixed state included) by the token count.
+- A **full host snapshot is still not viable** for 1M-token states: ~11 GB q8, ~6 GB q4, ~4 GB q2, against a
+  default 2 GiB host cache. Phase 2 must use a bounded chunk ring.
+- A 200 GB archive is about **18M tokens at q8**, ~34M at q4, ~52M at q2, before subtracting the fixed ~66 MB
+  per conversation. Sizing should still be based on a measured file (`bytes / n_tokens` after subtracting the
+  fixed state), not a universal constant.
+- A synchronous 1M checkpoint can block the model for tens of seconds (disk) plus a few seconds (PCIe); the q4/q2
+  files halve/third the KV but not the fixed state. Async I/O is the main phase-2 lever; quantization is the main
+  storage lever.
+
+### 2.1 Quantization
+
+`--kv` already supports `f16`, `q8`, `q4`, `q2` (and turbo types); the archive stores whatever representation the
+running model uses, so:
+
+- q8 is the default storage/quality trade-off (half of f16);
+- q4 halves the KV again (~5.8 GB/1M here) and q2 is ~3.9 GB/1M, with different numerics;
+- the fixed ~66 MB state is not affected by `--kv`; shrinking it needs a new format that stores f32 state as
+  f16/bf16 (lossy) or compresses it;
+- an **archive-only** re-quantization (save q8 as q4 and dequantize on restore) is possible but lossy and not
+  bit-exact: it changes the continuation. Do not do it silently. If approximate resume is acceptable, expose it
+  as an explicit mode and document the divergence; otherwise the operator chooses `--kv q4/q2` for the whole
+  server, and the archive inherits it.
+
+Recommendation: no new quantization layer in phase 2. Document the q4/q2 sizing options; add a quality note.
+Revisit an archive-only q4 mode only if users ask for it and accept non-identical output.
+
+### 2.2 Lossless compression
+
+On the same q8 file:
+
+| codec | bytes | ratio | time |
+|---|---:|---:|---:|
+| zstd -3 | 75,707,073 | 93.6% | 0.18 s |
+| zstd -19 | 75,654,119 | 93.5% | 11.9 s |
+| gzip -9 | 75,826,442 | 93.8% | 3.5 s |
+| xz -9 | 74,505,592 | 92.1% | 41.5 s |
+
+Split by region: the fixed state compresses to 94.4%, the q8 KV to 89.9%. The KV is high-entropy quantized data;
+the fixed state is mostly f32 but still not very compressible. A 6-8% saving is not worth a new codec dependency,
+CPU cost on save/restore and a format flag in phase 2. Token history is compressible but is 4 bytes/token (a few
+MB per 1M), negligible next to the KV.
+
+Recommendation: **do not compress in phase 2**. If disk is tight, q4/q2 is a 2-3x lever with a known quality
+trade-off; zstd at -3 could be an optional later flag, not a default. The real large win is cross-conversation
+deduplication of shared prefixes (same system prompt/tools/RAG) via a content-addressed segment store, which is
+phase 3 and changes the storage layout, not a codec.
 
 ## 3. Goals and non-goals
 
@@ -325,6 +372,34 @@ documented states first. Keep the phase-1 E2E (`test_slot_archive.sh`, `test_slo
 9. Do we need restore read-ahead depth > 1? Benchmark on NVMe.
 10. Compression: not in phase 2; revisit only for token history, not KV.
 
+### Proposed defaults (tuning)
+
+These are the values I would ship unless a benchmark says otherwise:
+
+| setting | default | rationale |
+|---|---|---|
+| `--slot-archive-gb` | 50 GiB | phase-1 default; 200 GiB for a large NVMe |
+| `--slot-archive-min-tokens` | 256 | skip trivial states |
+| `--slot-archive-min-delta` | 1024 | one checkpoint per meaningful growth, not per turn |
+| `--slot-archive-versions` | 1 | latest per lineage; pin pre-compact/branch points |
+| `--slot-archive-stage-mb` | 256 (4 × 64 MB) | bounded host RAM; enough to hide disk latency |
+| in-flight jobs | 1 save + 1 restore | bound memory/IO; prioritize restore |
+| save timeout | 60 s | abort a stuck save; slot returns to idle |
+| restore timeout | 30 s | fall back to prefill rather than hang admission |
+| admission wait for a saving slot | 2 s | then use another slot or prefill; never fail the chat |
+| `--slot-archive-on-shutdown` | off | phase-1 choice; opt-in, recommended for overnight use |
+| shutdown deadline | 30 s | most-recent slots first; skip/log the rest |
+| `--slot-archive-ttl` | 0 (off) | do not delete a user's long-lived session silently; 30d recommended on shared servers |
+| `--slot-archive-per-key-gb` | 0 (off) | single-tenant default; 25% of global or 20 GB on hosting |
+| `--slot-archive-pin-gb` | 10% of budget (5 GiB at 50) | cap admin pins; pin route admin-only |
+| periodic GC | every 5 min + on commit | TTL/quota settle without a request |
+| alert thresholds | warn 80%, critical 90% of budget | leave room for a new checkpoint/temp |
+| compression | off | 6-8% saving, CPU/dependency cost; q4/q2 is the real lever |
+| explicit `action=checkpoint` | synchronous | deterministic response; automatic triggers async |
+
+TTL and per-key quota are off by default to preserve phase-1 behavior; HOSTING should recommend 30 days and a
+per-key fraction for multi-tenant servers. The pin cap is a safety valve, not a target.
+
 ## 16. Recommendation
 
 Do phase 2 in this order:
@@ -338,6 +413,7 @@ Do phase 2 in this order:
 4. **Manifest batching**; journal/SQLite only if a real 10k+ workload justifies it.
 5. **Metrics, fault injection, soak**, then reconsider branching/version retention.
 
-The sizing finding in §2 should be fixed in USAGE/HOSTING before phase 2 ships: the 10.9 GB/1M figure is not true
-for every model. Operators should size from a measured checkpoint (`bytes / n_tokens`), and the 200 GB example
-should be presented as ~4M tokens for the tested layout, not ~18M.
+USAGE/HOSTING should add the measured decomposition: the 10.9 GB/1M figure is q8 **KV**, correct for this model,
+and a checkpoint also carries ~66 MB of fixed slot state; q4/q2 reduce the KV to ~5.8/3.9 GB per 1M. A 200 GB
+archive is about 18M/34M/52M tokens at q8/q4/q2 before the fixed state per conversation. Do not promise lossless
+compression: measured zstd/gzip/xz savings are 6–8% on q8 KV and not worth the CPU/dependency in phase 2.
