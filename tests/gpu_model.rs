@@ -924,3 +924,27 @@ fn prefill_slots_matches_single() {
     eprintln!("prefill_slots_matches_single {bk}: largest logit difference {worst}");
     }
 }
+
+/// `--kv-unified`: a small total budget, one slot growing past its base share and taking the KV of the idle ones.
+#[test]
+fn unified_kv_budget_grows_one_slot() {
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let ids = tok.encode(&"The quick brown fox jumps over the lazy dog. ".repeat(40)).unwrap();
+    assert!(ids.len() >= 300, "{} tokens for the 300-token prompt", ids.len());
+    for (bk, gpu) in common::backends() {
+        eprintln!("backend {bk}");
+        let mut gm = GpuModel::load_slots_kv(&m, gpu, 1024, 64, 512 << 20, 4, true).unwrap();
+        assert_eq!(gm.kv_caps(), &[256, 256, 256, 256], "{bk}: base share");
+        gm.use_slot(0);
+        gm.prefill(&ids[..300]).unwrap();
+        let caps = gm.kv_caps();
+        assert!(caps[0] >= 300, "{bk}: slot 0 holds {} positions", caps[0]);
+        assert!(caps.iter().sum::<usize>() <= 1024, "{bk}: capacities {caps:?} over the 1024 budget");
+        eprintln!("caps {caps:?}");
+        gm.reset().unwrap();
+    }
+}

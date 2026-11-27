@@ -52,6 +52,11 @@ What changes with `--parallel N`:
   35B model kept 7008 of its 10240 experts resident. A long `--ctx` costs the most here, and `--kv q8` gets much of
   it back. `--parallel 4`, 4 short requests at once on the 3060:
 
+  `--kv-unified` makes `--ctx` the total budget instead: each slot starts at `ctx / N`, and a slot that needs
+  more takes the KV of idle slots (down to one token each), so a 1M budget is four 256k slots or one near-1M
+  slot. The reclaim drops that slot's VRAM prefix cache and saved state. It is one GPU only, and the budget is
+  reserved at load: a 1M q8 budget is 10.9 GB of KV with every expert resident on a 32 GB card. Unified mode
+  prefills prompts one at a time and does not reuse a saved prompt prefix (each request starts at position 0).
   | `--ctx` | `--kv` | KV for 4 slots | Resident experts | Total |
   |---|---|---|---|---|
   | 16384 | f16 | 1280 MB | 6876 of 10240 | 160 tok/s |
