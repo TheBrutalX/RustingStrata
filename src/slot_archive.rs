@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufReader, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// File name of the manifest inside [`ArchiveConfig::dir`].
@@ -97,6 +98,46 @@ pub struct Archive {
     cfg: ArchiveConfig,
     entries: BTreeMap<String, ArchiveEntry>,
     stats: ArchiveStats,
+    /// Transient in-flight references, keyed by entry id. Shared with [`Lease`] guards so a guard can release
+    /// the lease after the `Archive` borrow has ended.
+    leases: Arc<Mutex<BTreeMap<String, usize>>>,
+}
+
+/// A transient reference to an archive entry, held while a restore or save is in flight.
+///
+/// [`Archive::delete`] refuses to remove a leased entry and [`Archive::gc`] skips it, so the file cannot
+/// disappear between [`Archive::lookup_leased`] and the restore that reads it. Dropping the guard releases the
+/// lease; a guard whose entry has already disappeared is harmless.
+#[must_use = "the lease is released when the guard is dropped"]
+pub struct Lease {
+    id: String,
+    leases: Arc<Mutex<BTreeMap<String, usize>>>,
+}
+
+impl Lease {
+    /// The id of the leased entry.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        // A poisoned lock only happens after a panic while the table was locked; Drop cannot panic, so recover
+        // the guard and still release the lease.
+        let mut table = self
+            .leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(count) = table.get_mut(&self.id) else {
+            // The entry disappeared while leased (or the lease was never registered): nothing to do.
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            table.remove(&self.id);
+        }
+    }
 }
 
 impl Archive {
@@ -147,7 +188,12 @@ impl Archive {
             }
         }
 
-        let archive = Archive { cfg, entries, stats: ArchiveStats::default() };
+        let archive = Archive {
+            cfg,
+            entries,
+            stats: ArchiveStats::default(),
+            leases: Arc::new(Mutex::new(BTreeMap::new())),
+        };
         if changed {
             archive.persist()?;
         }
@@ -343,6 +389,57 @@ impl Archive {
     /// Longest entry whose token history is an exact prefix of `tokens[..keep]`, with the same owner and
     /// fingerprint and `n_tokens <= ctx`. Increments the hit/miss counters.
     pub fn lookup(&mut self, owner: u64, tokens: &[u32], keep: usize, fingerprint: u64, ctx: usize) -> Result<Option<ArchiveEntry>> {
+        let found = self.lookup_match(owner, tokens, keep, fingerprint, ctx)?;
+        if found.is_some() {
+            self.stats.hits += 1;
+        } else {
+            self.stats.misses += 1;
+        }
+        Ok(found)
+    }
+
+    /// Same exact lookup as [`Archive::lookup`], but also takes a transient [`Lease`] on the match before
+    /// returning it. The lease protects the entry from `DELETE` and GC until the guard is dropped.
+    ///
+    /// A miss increments the same counter as [`Archive::lookup`].
+    pub fn lookup_leased(&mut self, owner: u64, tokens: &[u32], keep: usize, fingerprint: u64, ctx: usize) -> Result<Option<(ArchiveEntry, Lease)>> {
+        let Some(entry) = self.lookup_match(owner, tokens, keep, fingerprint, ctx)? else {
+            self.stats.misses += 1;
+            return Ok(None);
+        };
+        self.stats.hits += 1;
+        let lease = self.add_lease(&entry.id);
+        Ok(Some((entry, lease)))
+    }
+
+    /// Take a lease on an existing entry. `None` when no entry with `id` is currently indexed.
+    pub fn lease(&mut self, id: &str) -> Option<Lease> {
+        if !self.entries.contains_key(id) {
+            return None;
+        }
+        Some(self.add_lease(id))
+    }
+
+    /// Number of live leases on `id` (0 when the entry is unleased or unknown).
+    pub fn leases(&self, id: &str) -> usize {
+        self.lease_table().get(id).copied().unwrap_or(0)
+    }
+
+    fn lease_table(&self) -> MutexGuard<'_, BTreeMap<String, usize>> {
+        self.leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Register one lease. Drop ignores missing ids, so registering before the entry is inserted is harmless.
+    fn add_lease(&self, id: &str) -> Lease {
+        *self.lease_table().entry(id.to_string()).or_insert(0) += 1;
+        Lease { id: id.to_string(), leases: Arc::clone(&self.leases) }
+    }
+
+    /// The shared body of [`Archive::lookup`] and [`Archive::lookup_leased`]: exact prefix match and LRU
+    /// touch, without hit/miss accounting.
+    fn lookup_match(&mut self, owner: u64, tokens: &[u32], keep: usize, fingerprint: u64, ctx: usize) -> Result<Option<ArchiveEntry>> {
         let n_max = keep.min(ctx).min(tokens.len());
         let mut candidates: Vec<(usize, String)> = self
             .entries
@@ -377,12 +474,10 @@ impl Archive {
             let used = now_ms();
             if let Some(entry) = self.entries.get_mut(&id) {
                 entry.last_used_ms = used;
-                self.stats.hits += 1;
                 return Ok(Some(entry.clone()));
             }
         }
 
-        self.stats.misses += 1;
         Ok(None)
     }
 
@@ -418,8 +513,17 @@ impl Archive {
     }
 
     /// Delete an entry and its file. Returns the freed bytes.
+    ///
+    /// An entry with live [`Lease`]s is not deleted: the caller gets an error and should retry after the restore
+    /// or save that holds it completes.
     pub fn delete(&mut self, id: &str) -> Result<u64> {
         let Some(entry) = self.entries.get(id) else { return Ok(0) };
+        let held = self.leases(id);
+        if held > 0 {
+            bail!(
+                "slot archive: entry {id} is leased by {held} in-flight operation(s); retry after it completes"
+            );
+        }
         let file = entry.file.clone();
         let bytes = entry.bytes;
         match fs::remove_file(&file) {
@@ -506,8 +610,12 @@ impl Archive {
         self.entries.values().map(|e| e.bytes).sum()
     }
 
-    /// Remove an entry and its file. `None` when the file could not be unlinked (the entry is kept).
+    /// Remove an entry and its file. `None` when the file could not be unlinked (the entry is kept) or when the
+    /// entry is leased (GC must never pull a file out from under an in-flight restore).
     fn evict_entry(&mut self, id: &str) -> Option<u64> {
+        if self.leases(id) > 0 {
+            return None;
+        }
         let entry = self.entries.get(id)?;
         let file = entry.file.clone();
         let bytes = entry.bytes;
@@ -1516,5 +1624,134 @@ mod tests {
         assert_eq!(archive.list(None, 0)[0].id, b.id);
         // The manifest was rewritten without the dead row.
         assert_eq!(manifest_json(dir)["entries"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn lease_blocks_delete_and_gc() {
+        let tmp = TempDir::new("leased");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let entry = save(&mut archive, 1, &(1..=8).collect::<Vec<_>>());
+
+        let lease = archive.lease(&entry.id).unwrap();
+        assert_eq!(lease.id(), entry.id);
+        assert_eq!(archive.leases(&entry.id), 1);
+        let err = archive.delete(&entry.id).unwrap_err();
+        assert!(err.to_string().contains("leased"), "{err}");
+        assert!(entry.file.exists());
+        assert_eq!(archive.stats().entries, 1);
+        drop(lease);
+        assert_eq!(archive.leases(&entry.id), 0);
+        assert_eq!(archive.delete(&entry.id).unwrap(), entry.bytes);
+        assert!(!entry.file.exists());
+
+        // GC skips a leased entry even when the budget is over the target.
+        let entry = save(&mut archive, 2, &(20..=28).collect::<Vec<_>>());
+        drop(archive);
+        let mut cfg = config(dir);
+        cfg.budget_bytes = RESERVE_BYTES + 1;
+        let mut archive = Archive::open(cfg).unwrap();
+        let lease = archive.lease(&entry.id).unwrap();
+        let report = archive.gc().unwrap();
+        assert_eq!(report.evicted, 0);
+        assert_eq!(report.freed_bytes, 0);
+        assert!(entry.file.exists());
+        assert_eq!(archive.leases(&entry.id), 1);
+
+        drop(lease);
+        let report = archive.gc().unwrap();
+        assert_eq!(report.evicted, 1);
+        assert_eq!(report.freed_bytes, entry.bytes);
+        assert!(!entry.file.exists());
+        assert_eq!(archive.stats().entries, 0);
+    }
+
+    #[test]
+    fn double_lease_needs_two_drops() {
+        let tmp = TempDir::new("double-lease");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let entry = save(&mut archive, 1, &(1..=7).collect::<Vec<_>>());
+
+        let first = archive.lease(&entry.id).unwrap();
+        let second = archive.lease(&entry.id).unwrap();
+        assert_eq!(archive.leases(&entry.id), 2);
+        drop(first);
+        assert_eq!(archive.leases(&entry.id), 1);
+        assert!(
+            archive.delete(&entry.id).is_err(),
+            "one lease must still block delete"
+        );
+        drop(second);
+        assert_eq!(archive.leases(&entry.id), 0);
+        assert_eq!(archive.delete(&entry.id).unwrap(), entry.bytes);
+
+        // Unknown ids cannot be leased; a stale guard is harmless.
+        assert!(archive.lease("0000000000000000").is_none());
+        assert_eq!(archive.leases("no-such-entry"), 0);
+    }
+
+    #[test]
+    fn lookup_leased_matches_lookup_and_counts() {
+        let tmp = TempDir::new("lookup-leased");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let tokens: Vec<u32> = (1..=8).collect();
+        let short = save(&mut archive, 1, &tokens[..4]);
+        let long = save(&mut archive, 1, &tokens[..6]);
+
+        let (hit, lease) = archive.lookup_leased(1, &tokens, 8, FP, 100).unwrap().unwrap();
+        assert_eq!(hit.id, long.id);
+        assert_eq!(hit.n_tokens, 6);
+        assert_eq!(archive.leases(&long.id), 1);
+        assert_eq!(archive.leases(&short.id), 0);
+        assert_eq!(archive.stats().hits, 1);
+
+        // Same exact match as the unleased lookup.
+        let unleased = archive.lookup(1, &tokens, 8, FP, 100).unwrap().unwrap();
+        assert_eq!(unleased.id, long.id);
+        assert_eq!(archive.stats().hits, 2);
+
+        // A miss increments the miss counter and takes no lease.
+        assert!(archive.lookup_leased(2, &tokens, 8, FP, 100).unwrap().is_none());
+        assert_eq!(archive.stats().misses, 1);
+        assert_eq!(archive.leases(&long.id), 1);
+        // `keep`/`ctx` behave exactly as in `lookup`.
+        let (hit, short_lease) = archive.lookup_leased(1, &tokens, 4, FP, 100).unwrap().unwrap();
+        assert_eq!(hit.id, short.id);
+        assert_eq!(archive.stats().hits, 3);
+        assert_eq!(archive.leases(&short.id), 1);
+        drop(short_lease);
+
+        // The lookup lease protects the entry from DELETE.
+        assert!(archive.delete(&long.id).is_err());
+        drop(lease);
+        assert_eq!(archive.leases(&long.id), 0);
+        assert_eq!(archive.delete(&long.id).unwrap(), long.bytes);
+    }
+
+    #[test]
+    fn leases_do_not_leak_after_drop() {
+        let tmp = TempDir::new("lease-leak");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let entry = save(&mut archive, 1, &(1..=9).collect::<Vec<_>>());
+
+        for _ in 0..64 {
+            let lease = archive.lease(&entry.id).unwrap();
+            assert_eq!(archive.leases(&entry.id), 1);
+            drop(lease);
+        }
+        assert_eq!(archive.leases(&entry.id), 0);
+
+        // A guard can outlive the Archive: dropping it must not panic or leak into a reopened store.
+        let lease = archive.lease(&entry.id).unwrap();
+        drop(archive);
+        drop(lease);
+
+        let mut archive = Archive::open(config(dir)).unwrap();
+        assert_eq!(archive.leases(&entry.id), 0);
+        assert_eq!(archive.delete(&entry.id).unwrap(), entry.bytes);
+        assert!(archive.list(None, 0).is_empty());
     }
 }
