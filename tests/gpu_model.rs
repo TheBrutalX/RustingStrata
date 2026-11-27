@@ -1,5 +1,5 @@
 mod common;
-use rusting_strata::{gguf::Gguf, gpu_model::GpuModel, model::{Model, State}, ops, tokenizer::Tokenizer};
+use rusting_strata::{gguf::Gguf, gpu_model::{GpuModel, SegmentSink}, model::{Model, State}, ops, tokenizer::Tokenizer};
 
 /// GPU forward matches the CPU reference per position, with all routed experts on the CPU and with the default placement.
 #[test]
@@ -1837,4 +1837,249 @@ fn slot_resumable_segmented_io_round_trip() {
         assert_eq!(ops::argmax(&want), ops::argmax(&got_next), "{bk}: resumable segmented argmax");
         assert!(d <= 1e-4, "{bk}: resumable segmented logits differ by {d}");
     }
+}
+
+/// A memory sink for [`GpuModel::save_segmented_to`]: collects the exact payloads and ids the archive side would
+/// receive. `delay` simulates a writer that is slower than the GPU copies.
+struct CollectingSink {
+    begin: Option<(Vec<u32>, u64, u64, i32)>,
+    fingerprint: u64,
+    segments: Vec<(Option<String>, Vec<u32>, Vec<u8>)>,
+    state: Option<(Vec<u32>, Vec<u8>)>,
+    finished: bool,
+    delay: std::time::Duration,
+}
+
+impl CollectingSink {
+    fn new(delay: std::time::Duration) -> Self {
+        Self {
+            begin: None,
+            fingerprint: 0,
+            segments: Vec::new(),
+            state: None,
+            finished: false,
+            delay,
+        }
+    }
+}
+
+impl SegmentSink for CollectingSink {
+    fn begin(
+        &mut self,
+        tokens: &[u32],
+        owner: u64,
+        fingerprint: u64,
+        rope_offset: i32,
+    ) -> anyhow::Result<()> {
+        self.fingerprint = fingerprint;
+        self.begin = Some((tokens.to_vec(), owner, fingerprint, rope_offset));
+        Ok(())
+    }
+
+    fn put(
+        &mut self,
+        parent: Option<&str>,
+        tokens: &[u32],
+        payload: &[u8],
+    ) -> anyhow::Result<String> {
+        if !self.delay.is_zero() {
+            std::thread::sleep(self.delay);
+        }
+        let id = rusting_strata::slot_archive::segment_id(self.fingerprint, parent, tokens);
+        self.segments.push((parent.map(str::to_string), tokens.to_vec(), payload.to_vec()));
+        Ok(id)
+    }
+
+    fn state(&mut self, tokens: &[u32], payload: &[u8]) -> anyhow::Result<()> {
+        if !self.delay.is_zero() {
+            std::thread::sleep(self.delay);
+        }
+        self.state = Some((tokens.to_vec(), payload.to_vec()));
+        Ok(())
+    }
+
+    fn finish(&mut self) -> anyhow::Result<()> {
+        self.finished = true;
+        Ok(())
+    }
+}
+
+/// `save_segmented_to` hands the archive exactly the bytes the synchronous `save_segmented` writes, and the slot is
+/// reusable after a slow sink finishes (a step on another slot still works). (GPU integration test; not run by the
+/// CPU-only pass.)
+#[test]
+fn slot_archive_segmented_save_to_matches_sync_path() {
+    use rusting_strata::slot_archive::{Archive, ArchiveConfig};
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let mut ids = tok
+        .encode(&"The quick brown fox jumps over the lazy dog. ".repeat(400))
+        .unwrap();
+    assert!(ids.len() > 2048, "{} tokens, need more than 2048", ids.len());
+    ids.truncate(3072);
+    let owner = 0x5151_0000_0000_0005u64;
+    let base = std::env::temp_dir().join(format!("strata-archive-save-to-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    for (bk, gpu) in common::backends() {
+        eprintln!("backend {bk}");
+        let cfg = |name: &str| ArchiveConfig {
+            dir: base.join(format!("{name}-{bk}")),
+            budget_bytes: 64 << 30,
+            min_tokens: 1,
+            min_delta: 0,
+            versions: 1,
+        };
+        let mut phased_archive = Archive::open(cfg("phased")).unwrap();
+        let mut sync_archive = Archive::open(cfg("sync")).unwrap();
+        let mut gm = GpuModel::load_slots(&m, gpu, 4096, 256, 512 << 20, 2).unwrap();
+        gm.adapt_every = 0;
+        gm.owner = owner;
+        gm.use_slot(0);
+        gm.prefill(&ids).unwrap();
+        gm.use_slot(1);
+        gm.prefill(&ids[..8]).unwrap();
+        gm.use_slot(0);
+
+        let mut sink = CollectingSink::new(std::time::Duration::from_millis(2));
+        let mut turns = 0usize;
+        {
+            let mut between = |g: &mut GpuModel| -> anyhow::Result<()> {
+                turns += 1;
+                g.use_slot(1);
+                g.step(7)?;
+                Ok(())
+            };
+            gm.save_segmented_to(0, owner, &mut sink, &mut between).unwrap();
+        }
+        assert!(turns > 0, "{bk}: save_segmented_to never yielded");
+        assert_eq!(gm.current_slot(), 0, "{bk}: save_segmented_to restored the caller's slot");
+        assert!(sink.finished, "{bk}: the sink was not finished");
+        assert_eq!(sink.segments.len(), ids.len().div_ceil(1024), "{bk}: segment count");
+        let (tokens, begin_owner, fingerprint, rope) = sink.begin.clone().unwrap();
+        assert_eq!(tokens, ids);
+        assert_eq!(begin_owner, owner);
+        assert_eq!(rope, gm.slot_rope_offset(0));
+        assert_eq!(gm.slot_saved(0), (&ids[..], owner), "{bk}: the slot is reusable after the save");
+
+        // The collected payloads are replayable through the archive phases and produce the same entry/bytes as
+        // the synchronous GPU path.
+        let mut save = phased_archive
+            .begin_segmented(&tokens, begin_owner, fingerprint, rope, "collect")
+            .unwrap();
+        for (parent, chunk, payload) in &sink.segments {
+            phased_archive
+                .put_segment(&mut save, parent.as_deref(), chunk, payload)
+                .unwrap();
+        }
+        let (state_tokens, state_payload) = sink.state.clone().unwrap();
+        phased_archive.put_state(&mut save, &state_tokens, &state_payload).unwrap();
+        let phased = phased_archive.finish_segmented(&mut save).unwrap();
+        let sync = sync_archive.save_segmented(&mut gm, 0, owner, "sync").unwrap();
+        assert_eq!(phased.id, sync.id);
+        assert_eq!(phased.segments, sync.segments);
+        assert_eq!(phased.bytes, sync.bytes);
+        assert_eq!(phased.n_tokens, sync.n_tokens);
+        assert_eq!(
+            std::fs::read(phased.state_file.as_ref().unwrap()).unwrap(),
+            std::fs::read(sync.state_file.as_ref().unwrap()).unwrap(),
+            "{bk}: the phase state file differs from the synchronous one"
+        );
+
+        // The slot was released before the writer finished: another slot can decode immediately, and slot 0 can
+        // still continue from its saved history.
+        gm.use_slot(1);
+        gm.step(11).unwrap();
+        gm.use_slot(0);
+        let after = gm.step(43).unwrap();
+        assert!(!after.is_empty(), "{bk}: the saved slot is not usable after a slow sink");
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The async channel sink commits an entry that `restore_segmented` accepts and that reproduces the uninterrupted
+/// continuation. (GPU integration test; not run by the CPU-only pass.)
+#[test]
+fn slot_archive_async_segmented_save_restores() {
+    use rusting_strata::slot_archive::{start_async_segmented_save, Archive, ArchiveConfig};
+    use std::sync::{Arc, Mutex};
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let mut ids = tok
+        .encode(&"The quick brown fox jumps over the lazy dog. ".repeat(400))
+        .unwrap();
+    assert!(ids.len() > 2048, "{} tokens, need more than 2048", ids.len());
+    ids.truncate(2048);
+    let owner = 0x5151_0000_0000_0006u64;
+    let base = std::env::temp_dir().join(format!("strata-archive-async-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).fold(0f32, |x, (p, q)| x.max((p - q).abs()));
+
+    for (bk, gpu) in common::backends() {
+        eprintln!("backend {bk}");
+        let archive = Arc::new(Mutex::new(
+            Archive::open(ArchiveConfig {
+                dir: base.join(format!("async-{bk}")),
+                budget_bytes: 64 << 30,
+                min_tokens: 1,
+                min_delta: 0,
+                versions: 1,
+            })
+            .unwrap(),
+        ));
+        let mut gm = GpuModel::load_slots(&m, gpu, 4096, 256, 512 << 20, 2).unwrap();
+        gm.adapt_every = 0;
+        gm.owner = owner;
+        gm.use_slot(0);
+        gm.prefill(&ids).unwrap();
+        gm.use_slot(1);
+        gm.prefill(&ids[..8]).unwrap();
+        gm.use_slot(0);
+
+        let (mut sink, handle) =
+            start_async_segmented_save(Arc::clone(&archive), owner, "async").unwrap();
+        {
+            let mut between = |g: &mut GpuModel| -> anyhow::Result<()> {
+                g.use_slot(1);
+                g.step(7)?;
+                Ok(())
+            };
+            gm.save_segmented_to(0, owner, &mut sink, &mut between).unwrap();
+        }
+        drop(sink);
+        let entry = handle.join().unwrap();
+        assert_eq!(entry.format, 2, "{bk}: async entry format");
+        assert_eq!(entry.n_tokens, ids.len(), "{bk}: async entry tokens");
+        assert_eq!(entry.owner, owner, "{bk}: async entry owner");
+        assert_eq!(entry.segments.len(), ids.len().div_ceil(1024), "{bk}: async segments");
+        assert_eq!(
+            entry.segments.iter().map(|s| s.end - s.start).sum::<usize>(),
+            ids.len()
+        );
+        assert_eq!(gm.slot_saved(0), (&ids[..], owner), "{bk}: async save slot marker");
+
+        let want = gm.step(43).unwrap();
+        {
+            let mut archive = archive.lock().unwrap();
+            let n = archive.restore_segmented(&mut gm, 1, &entry).unwrap();
+            assert_eq!(n, ids.len(), "{bk}: restored token count");
+        }
+        assert_eq!(gm.slot_tokens(1), &ids[..], "{bk}: async restore history");
+        assert_eq!(gm.slot_owner(1), owner, "{bk}: async restore owner");
+        gm.use_slot(1);
+        let got = gm.step(43).unwrap();
+        let d = diff(&want, &got);
+        eprintln!("{bk}: async segmented restore max |dlogit| {d:.3e}");
+        assert_eq!(ops::argmax(&want), ops::argmax(&got), "{bk}: async restore argmax");
+        assert!(d <= 1e-4, "{bk}: async restore logits differ by {d}");
+    }
+    let _ = std::fs::remove_dir_all(&base);
 }

@@ -88,6 +88,39 @@ impl Drop for SlotGuard<'_, '_> {
     fn drop(&mut self) { self.model.use_slot(self.prev); }
 }
 
+/// Tokens per content-addressed KV segment. This mirrors `crate::slot_archive::SEGMENT_TOKENS`; the GPU core does
+/// not depend on the archive module, so the constant is repeated here. [`GpuModel::save_segmented_to`] is the only
+/// place that uses it.
+const SEGMENT_TOKENS: usize = 1024;
+
+/// Receives the pieces of a segmented v2 save while the model thread still owns the GPU copies.
+///
+/// The trait deliberately knows nothing about files, archives or manifests: an implementation may collect the
+/// pieces in memory (tests), or hand them to a writer thread over a bounded channel (`slot_archive`). `begin` is
+/// called once before the first segment, `put` once per 1024-token KV range in history order, `state` once with the
+/// recurrent/DeltaNet/MTP/PLE/QSA snapshot, and `finish` once last.
+///
+/// `put` returns the content id of the segment it accepted; the next call passes that id as `parent`, so the chain
+/// is built exactly as the synchronous archive path builds it. The payload bytes are opaque
+/// (`STRKVSEG`/`STRRSEG` v1); the sink must not interpret them.
+///
+/// A sink may block (for example on a bounded channel). The model thread keeps doing the GPU→host copies; the sink
+/// is responsible for moving the bytes to disk. An implementation must not make the model thread hold an archive
+/// lock: the writer thread owns that lock.
+pub trait SegmentSink {
+    /// Start a save of `tokens` for `owner`. `fingerprint` is the model/KV fingerprint and `rope_offset` the
+    /// slot's M-RoPE offset, both captured before the first copy.
+    fn begin(&mut self, tokens: &[u32], owner: u64, fingerprint: u64, rope_offset: i32) -> Result<()>;
+    /// Accept one KV segment payload. `parent` is the previous segment id (the chain root uses `None`); returns
+    /// this segment's id.
+    fn put(&mut self, parent: Option<&str>, tokens: &[u32], payload: &[u8]) -> Result<String>;
+    /// Accept the entry's recurrent snapshot payload. `tokens` is the full history, not a segment range.
+    fn state(&mut self, tokens: &[u32], payload: &[u8]) -> Result<()>;
+    /// Finish the save. Implementations that own a writer thread must report a commit failure here; the slot is
+    /// only reusable once this returns `Ok`.
+    fn finish(&mut self) -> Result<()>;
+}
+
 /// A writer that counts the bytes it passes through (the footer stores the payload length).
 struct Count<W> { w: W, n: u64 }
 impl<W> Count<W> {
@@ -1231,6 +1264,71 @@ impl GpuModel<'_> {
         self.use_slot(slot);
         let guard = SlotGuard { model: self, prev };
         guard.model.write_recurrent_segment_with(slot, out, between)
+    }
+
+    /// Stream a v2 segmented save into `sink` without touching the archive or the disk from the model thread.
+    ///
+    /// The history is split into [`SEGMENT_TOKENS`]-token ranges. Each range is copied from the GPU with
+    /// [`Self::save_kv_segment_with`] and handed to [`SegmentSink::put`]; the recurrent snapshot is copied with
+    /// [`Self::save_recurrent_to_with`] and handed to [`SegmentSink::state`]; [`SegmentSink::finish`] commits. The
+    /// sink (and any writer thread behind it) owns the disk I/O and the archive lock. `between(self)` is invoked
+    /// after every bounded GPU→host copy exactly as the two `_with` methods describe, so a scheduler can service
+    /// another slot while the target is being copied.
+    ///
+    /// `owner` is the conversation owner stored in the archive entry and in the slot's saved marker, not the
+    /// current request owner. On success the slot is marked reusable at its full history, mirroring
+    /// [`crate::slot_archive::Archive::save_segmented`].
+    ///
+    /// The caller's current slot is restored when this returns, on error and on unwind: the target slot is selected
+    /// for each copy, and a `between` callback that selects another slot is followed by selecting the target again
+    /// before the next copy. The callback must not change `slot`'s buffers, `pos` or `history` while the save runs.
+    pub fn save_segmented_to<S: SegmentSink, F: FnMut(&mut GpuModel<'_>) -> Result<()>>(
+        &mut self,
+        slot: usize,
+        owner: u64,
+        sink: &mut S,
+        between: &mut F,
+    ) -> Result<()> {
+        ensure!(slot < self.slots(), "slot {slot} of {}", self.slots());
+        let prev = self.current_slot();
+        self.use_slot(slot);
+        let guard = SlotGuard { model: self, prev };
+        guard.model.save_segmented_to_owned(slot, owner, sink, between)
+    }
+
+    fn save_segmented_to_owned<S: SegmentSink, F: FnMut(&mut GpuModel<'_>) -> Result<()>>(
+        &mut self,
+        slot: usize,
+        owner: u64,
+        sink: &mut S,
+        between: &mut F,
+    ) -> Result<()> {
+        let tokens = self.slot_tokens(slot).to_vec();
+        ensure!(!tokens.is_empty(), "slot {slot} has no token history to save");
+        ensure!(
+            self.slot_pos(slot) == tokens.len(),
+            "slot {slot}: pos {} but {} tokens in its history",
+            self.slot_pos(slot),
+            tokens.len()
+        );
+        sink.begin(&tokens, owner, self.slot_fingerprint(), self.slot_rope_offset(slot))?;
+
+        let mut parent: Option<String> = None;
+        for (index, chunk) in tokens.chunks(SEGMENT_TOKENS).enumerate() {
+            let start = index * SEGMENT_TOKENS;
+            let end = start + chunk.len();
+            let mut payload = Vec::new();
+            self.save_kv_segment_with(slot, start, end, &mut payload, between)?;
+            parent = Some(sink.put(parent.as_deref(), chunk, &payload)?);
+        }
+
+        let mut state = Vec::new();
+        self.save_recurrent_to_with(slot, &mut state, between)?;
+        sink.state(&tokens, &state)?;
+        sink.finish()?;
+        // The sink has committed (or a collecting sink has everything); the slot is reusable at this history.
+        self.mark_slot_saved(slot, &tokens, owner);
+        Ok(())
     }
 
     /// Restore a `STRRSEG` v1 payload into `slot`'s saved buffers and return the bytes consumed.
