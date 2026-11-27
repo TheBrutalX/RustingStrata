@@ -10,12 +10,15 @@
 //! the budget. Owner is the conversation owner (`GpuModel::slot_owner`), not the request that triggered a
 //! checkpoint.
 
+use crate::gpu_model::GpuModel;
+use crate::slot_segments::{self, SegmentStore};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// File name of the manifest inside [`ArchiveConfig::dir`].
@@ -24,6 +27,17 @@ pub const MANIFEST: &str = "manifest.json";
 pub const RESERVE_BYTES: u64 = 1 << 30;
 /// Manifest schema version written and understood by this module.
 const MANIFEST_VERSION: u32 = 1;
+
+/// Tokens per content-addressed KV segment (docs/SLOT-ARCHIVE-PHASE2.md §2.3 and §15).
+pub const SEGMENT_TOKENS: usize = 1024;
+/// Magic of a v2 entry state file (`STRSTATE`): the token list plus the entry's recurrent snapshot.
+pub const STATE_MAGIC: [u8; 8] = *b"STRSTATE";
+/// Version of the `STRSTATE` format understood here.
+pub const STATE_VERSION: u32 = 1;
+/// Fixed `STRSTATE` header length: magic, version, fingerprint, owner, rope offset, token count.
+const STATE_HEADER_LEN: u64 = 8 + 4 + 8 + 8 + 4 + 4;
+/// Sanity bound on the token list in a `STRSTATE` file (16M ids, 64 MiB), far above any `--ctx`.
+const MAX_STATE_TOKENS: usize = 1 << 24;
 
 /// Archive policy and location. Built from the `--slot-archive-*` flags.
 #[derive(Clone, Debug)]
@@ -35,13 +49,30 @@ pub struct ArchiveConfig {
     pub versions: usize,
 }
 
-/// One immutable `STRATASLOT` file and its manifest row.
+/// One ordered KV segment of a v2 entry: the content-addressed segment id and the token range it covers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SegmentRef {
+    pub id: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// One immutable archive entry and its manifest row.
+///
+/// Format 1 is a single `STRATASLOT` v1 file in [`ArchiveEntry::file`]. Format 2 is a `STRSTATE` state file in
+/// [`ArchiveEntry::state_file`] plus an ordered list of content-addressed KV segments in
+/// [`ArchiveEntry::segments`]; `file` points at the same state file so a v1-only reader still has a path, but it is
+/// not a `STRATASLOT` file and must only be restored with [`Archive::restore_segmented`].
 #[derive(Clone, Debug)]
 pub struct ArchiveEntry {
     /// Stable content identity; also the dedupe key.
     pub id: String,
-    /// Absolute path to the `.slot` file. Never accepted from a client.
+    /// Absolute path to the `.slot` file (v1) or to the `.state` file (v2). Never accepted from a client.
     pub file: PathBuf,
+    /// v2 only: the `STRSTATE` file holding the token list and the recurrent snapshot.
+    pub state_file: Option<PathBuf>,
+    /// v2 only: the ordered KV segments, covering `[0, n_tokens)` contiguously.
+    pub segments: Vec<SegmentRef>,
     /// Apparent file size, used for the logical budget.
     pub bytes: u64,
     /// Number of tokens in the saved history (also the number of restored KV rows).
@@ -60,7 +91,7 @@ pub struct ArchiveEntry {
     pub pinned: bool,
     /// `divergence`, `evict`, `checkpoint`, ...; for logs and diagnostics.
     pub reason: String,
-    /// `STRATASLOT` version (1).
+    /// `STRATASLOT` version (1) or the segmented entry version (2).
     pub format: u32,
 }
 
@@ -74,6 +105,8 @@ pub struct ArchiveStats {
     pub misses: u64,
     pub restores: u64,
     pub evictions: u64,
+    /// Entries removed by the TTL policy (also counted in `evictions`).
+    pub expired: u64,
     pub failures: u64,
 }
 
@@ -81,6 +114,8 @@ pub struct ArchiveStats {
 #[derive(Clone, Debug, Default)]
 pub struct GcReport {
     pub evicted: usize,
+    /// Entries removed by the TTL policy (a subset of `evicted`).
+    pub expired: usize,
     pub freed_bytes: u64,
 }
 
@@ -96,7 +131,53 @@ pub enum SaveSlot {
 pub struct Archive {
     cfg: ArchiveConfig,
     entries: BTreeMap<String, ArchiveEntry>,
+    /// Content-addressed KV segments shared by v2 entries; `<dir>/segments.json` + `<dir>/segments/`.
+    segments: SegmentStore,
     stats: ArchiveStats,
+    /// Transient in-flight references, keyed by entry id. Shared with [`Lease`] guards so a guard can release
+    /// the lease after the `Archive` borrow has ended.
+    leases: Arc<Mutex<BTreeMap<String, usize>>>,
+    /// Lifecycle policy; all zero means off. Set with [`Archive::set_policy`], not persisted in the manifest.
+    ttl_ms: u64,
+    per_key_bytes: u64,
+    pin_bytes: u64,
+}
+
+/// A transient reference to an archive entry, held while a restore or save is in flight.
+///
+/// [`Archive::delete`] refuses to remove a leased entry and [`Archive::gc`] skips it, so the file cannot
+/// disappear between [`Archive::lookup_leased`] and the restore that reads it. Dropping the guard releases the
+/// lease; a guard whose entry has already disappeared is harmless.
+#[must_use = "the lease is released when the guard is dropped"]
+pub struct Lease {
+    id: String,
+    leases: Arc<Mutex<BTreeMap<String, usize>>>,
+}
+
+impl Lease {
+    /// The id of the leased entry.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        // A poisoned lock only happens after a panic while the table was locked; Drop cannot panic, so recover
+        // the guard and still release the lease.
+        let mut table = self
+            .leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(count) = table.get_mut(&self.id) else {
+            // The entry disappeared while leased (or the lease was never registered): nothing to do.
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            table.remove(&self.id);
+        }
+    }
 }
 
 impl Archive {
@@ -134,20 +215,51 @@ impl Archive {
             }
         };
 
+        // The segment store lives in the same directory (`segments.json`, `segments/`). Missing state is created
+        // lazily; a v1-only archive opens with an empty store and behaves exactly as before.
+        let mut segments = SegmentStore::open(cfg.dir.clone())?;
+
         // Startup validation: stat every file and compare the header with the manifest row. Missing or
-        // inconsistent entries are dropped (the file, if any, stays on disk for a later rebuild).
+        // inconsistent entries are dropped (the file, if any, stays on disk for a later rebuild). A v2 entry is
+        // dropped when its state file or any referenced segment is missing/inconsistent.
         let mut changed = rebuilt;
         let ids: Vec<String> = entries.keys().cloned().collect();
         for id in ids {
-            let entry = &entries[&id];
-            if let Err(err) = validate_entry(entry) {
+            let entry = entries[&id].clone();
+            if let Err(err) = validate_entry(&entry, &segments) {
                 crate::say!("slot archive: dropping {id}: {err:#}");
                 entries.remove(&id);
                 changed = true;
             }
         }
 
-        let archive = Archive { cfg, entries, stats: ArchiveStats::default() };
+        // The surviving v2 entries are the source of truth for segment refcounts: a rebuilt manifest adopts orphan
+        // files with `refs = 1`, and a dropped entry may have released or lost references. Reconciling makes a
+        // shared segment survive the deletion of one of its entries.
+        let mut refs: BTreeMap<String, u64> = BTreeMap::new();
+        for entry in entries.values().filter(|entry| entry.format == 2) {
+            for segment in &entry.segments {
+                *refs.entry(segment.id.clone()).or_insert(0) += 1;
+            }
+        }
+        if let Err(err) = segments.sync_refs(&refs) {
+            crate::say!("slot archive: segment refcount reconciliation failed: {err:#}");
+        }
+        // Orphan segment files from a crashed save or a dropped entry are not referenced by any valid entry.
+        if let Err(err) = segments.gc() {
+            crate::say!("slot archive: segment cleanup at open failed: {err:#}");
+        }
+
+        let archive = Archive {
+            cfg,
+            entries,
+            segments,
+            stats: ArchiveStats::default(),
+            leases: Arc::new(Mutex::new(BTreeMap::new())),
+            ttl_ms: 0,
+            per_key_bytes: 0,
+            pin_bytes: 0,
+        };
         if changed {
             archive.persist()?;
         }
@@ -156,6 +268,56 @@ impl Archive {
 
     pub fn config(&self) -> &ArchiveConfig {
         &self.cfg
+    }
+
+    /// The content-addressed KV segment store (inspection/GC; never exposed by the HTTP API).
+    pub fn segments(&self) -> &SegmentStore {
+        &self.segments
+    }
+
+    /// Set the lifecycle policy; zero disables each limit. Not persisted: the server re-applies its flags on
+    /// startup. `(ttl_ms, per_key_bytes, pin_bytes)`.
+    pub fn set_policy(&mut self, ttl_ms: u64, per_key_bytes: u64, pin_bytes: u64) {
+        self.ttl_ms = ttl_ms;
+        self.per_key_bytes = per_key_bytes;
+        self.pin_bytes = pin_bytes;
+    }
+
+    /// The current `(ttl_ms, per_key_bytes, pin_bytes)` policy.
+    pub fn policy(&self) -> (u64, u64, u64) {
+        (self.ttl_ms, self.per_key_bytes, self.pin_bytes)
+    }
+
+    /// Pin or unpin an entry for GC/TTL protection and persist the manifest.
+    ///
+    /// When `pin_bytes > 0`, pinning is refused if the pinned total would exceed the cap; unpinning always
+    /// works. Pinning an already-pinned (or unpinning a non-pinned) entry is a no-op that still succeeds.
+    pub fn set_pinned(&mut self, id: &str, pinned: bool) -> Result<()> {
+        let entry = self
+            .entries
+            .get(id)
+            .with_context(|| format!("slot archive: no entry {id} to pin"))?;
+        if entry.pinned == pinned {
+            return Ok(());
+        }
+        if pinned && self.pin_bytes > 0 {
+            let after = self.pinned_bytes().saturating_add(entry.bytes);
+            if after > self.pin_bytes {
+                bail!(
+                    "slot archive: pinning {id} would use {after} pinned bytes, over the {}-byte pin cap",
+                    self.pin_bytes
+                );
+            }
+        }
+        let entry = self.entries.get_mut(id).context("entry disappeared while pinning")?;
+        entry.pinned = pinned;
+        self.persist()?;
+        Ok(())
+    }
+
+    /// Logical bytes held by pinned entries.
+    pub fn pinned_bytes(&self) -> u64 {
+        self.entries.values().filter(|e| e.pinned).map(|e| e.bytes).sum()
     }
 
     pub fn stats(&self) -> ArchiveStats {
@@ -201,8 +363,14 @@ impl Archive {
                 entry.last_used_ms = now_ms();
                 return Ok(SaveSlot::Existing(entry.clone()));
             }
-            // A stale row whose file disappeared: forget it and let the caller write a new file.
+            // A stale row whose file disappeared: forget it (releasing v2 segment references) and let the caller
+            // write a new file.
+            let stale = entry.clone();
             self.entries.remove(&id);
+            let ids: Vec<String> = stale.segments.into_iter().map(|segment| segment.id).collect();
+            self.release_segments(&ids);
+            let missing = stale.state_file.as_deref().unwrap_or(&stale.file).to_path_buf();
+            let _ = fs::remove_file(missing);
         }
 
         let shard = id.get(..2).context("archive entry id is too short")?;
@@ -266,47 +434,9 @@ impl Archive {
         }
 
         let bytes = meta.len();
-        let limit = self.cfg.budget_bytes.saturating_sub(RESERVE_BYTES);
-        if bytes > limit {
+        if let Err(err) = self.reserve_budget(id, owner, bytes, fingerprint) {
             let _ = fs::remove_file(path);
-            bail!(
-                "slot archive: a {bytes}-byte entry does not fit in the {limit}-byte budget ({} bytes reserved)",
-                RESERVE_BYTES
-            );
-        }
-
-        // Budget: evict foreign (unusable for this fingerprint) files first, then the oldest unpinned entries.
-        let mut used = self.used_bytes();
-        if used.saturating_add(bytes) > limit {
-            // Only under pressure: apply the `versions` policy before the LRU pass.
-            self.prune_all_lineages();
-            used = self.used_bytes();
-            let mut candidates: Vec<(bool, u64, String)> = self
-                .entries
-                .values()
-                .filter(|e| !e.pinned && e.id != id)
-                .map(|e| (e.fingerprint != fingerprint, e.last_used_ms, e.id.clone()))
-                .collect();
-            candidates.sort_by(|a, b| {
-                b.0.cmp(&a.0)
-                    .then_with(|| a.1.cmp(&b.1))
-                    .then_with(|| a.2.cmp(&b.2))
-            });
-            for (_, _, candidate) in candidates {
-                if used.saturating_add(bytes) <= limit {
-                    break;
-                }
-                if let Some(freed) = self.evict_entry(&candidate) {
-                    used = used.saturating_sub(freed);
-                }
-            }
-            if used.saturating_add(bytes) > limit {
-                let _ = fs::remove_file(path);
-                bail!(
-                    "slot archive is full: a {bytes}-byte entry does not fit under the {limit}-byte limit \
-                     even after evicting every unpinned entry"
-                );
-            }
+            return Err(err);
         }
 
         // Lineage is computed after budget enforcement, so it never points at an entry evicted above.
@@ -323,6 +453,8 @@ impl Archive {
         let entry = ArchiveEntry {
             id: id.to_string(),
             file: path.to_path_buf(),
+            state_file: None,
+            segments: Vec::new(),
             bytes,
             n_tokens: tokens.len(),
             owner,
@@ -340,9 +472,466 @@ impl Archive {
         Ok(entry)
     }
 
+    /// Enforce the per-owner quota and the global budget for a new entry of `bytes`.
+    ///
+    /// The caller owns the data cleanup (remove the state file, release the segments); this only decides whether the
+    /// entry fits and evicts other entries as the policy allows.
+    fn reserve_budget(&mut self, id: &str, owner: u64, bytes: u64, fingerprint: u64) -> Result<()> {
+        let limit = self.cfg.budget_bytes.saturating_sub(RESERVE_BYTES);
+        if bytes > limit {
+            bail!(
+                "slot archive: a {bytes}-byte entry does not fit in the {limit}-byte budget ({} bytes reserved)",
+                RESERVE_BYTES
+            );
+        }
+
+        // Per-key quota: evict this owner's own LRU entries first so one conversation cannot crowd every
+        // other owner out. Pinned and leased entries are protected, and another owner is never touched here.
+        if self.per_key_bytes > 0 {
+            if bytes > self.per_key_bytes {
+                bail!(
+                    "slot archive: a {bytes}-byte entry exceeds the {}-byte per-owner quota",
+                    self.per_key_bytes
+                );
+            }
+            let mut owner_used: u64 = self
+                .entries
+                .values()
+                .filter(|e| e.owner == owner && e.id != id)
+                .map(|e| e.bytes)
+                .sum();
+            if owner_used.saturating_add(bytes) > self.per_key_bytes {
+                let mut candidates: Vec<(u64, String)> = self
+                    .entries
+                    .values()
+                    .filter(|e| e.owner == owner && e.id != id && !e.pinned)
+                    .map(|e| (e.last_used_ms, e.id.clone()))
+                    .collect();
+                candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                for (_, candidate) in candidates {
+                    if owner_used.saturating_add(bytes) <= self.per_key_bytes {
+                        break;
+                    }
+                    if let Some(freed) = self.evict_entry(&candidate) {
+                        owner_used = owner_used.saturating_sub(freed);
+                    }
+                }
+                if owner_used.saturating_add(bytes) > self.per_key_bytes {
+                    bail!(
+                        "slot archive: owner {owner} is over its {}-byte quota and only pinned or leased \
+                         entries remain to evict",
+                        self.per_key_bytes
+                    );
+                }
+            }
+        }
+
+        // Global budget: evict foreign (unusable for this fingerprint) files first, then expired entries,
+        // then the oldest unpinned entries.
+        let mut used = self.used_bytes();
+        if used.saturating_add(bytes) > limit {
+            // Only under pressure: apply the `versions` policy before the LRU pass.
+            self.prune_all_lineages();
+            let now = now_ms();
+            used = self.used_bytes();
+            let mut candidates: Vec<(u8, u64, String)> = self
+                .entries
+                .values()
+                .filter(|e| !e.pinned && e.id != id)
+                .map(|e| {
+                    let rank = if e.fingerprint != fingerprint {
+                        0
+                    } else if self.ttl_expired(e, now) {
+                        1
+                    } else {
+                        2
+                    };
+                    (rank, e.last_used_ms, e.id.clone())
+                })
+                .collect();
+            candidates.sort_by(|a, b| {
+                a.0.cmp(&b.0)
+                    .then_with(|| a.1.cmp(&b.1))
+                    .then_with(|| a.2.cmp(&b.2))
+            });
+            for (rank, _, candidate) in candidates {
+                if used.saturating_add(bytes) <= limit {
+                    break;
+                }
+                if let Some(freed) = self.evict_entry(&candidate) {
+                    used = used.saturating_sub(freed);
+                    if rank == 1 {
+                        self.stats.expired = self.stats.expired.saturating_add(1);
+                    }
+                }
+            }
+            if used.saturating_add(bytes) > limit {
+                bail!(
+                    "slot archive is full: a {bytes}-byte entry does not fit under the {limit}-byte limit \
+                     even after evicting every unpinned entry"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Save the idle slot `slot` as a v2 segmented entry: `SEGMENT_TOKENS`-sized content-addressed KV segments plus
+    /// one `STRSTATE` file holding the token list and the recurrent snapshot.
+    ///
+    /// `owner` is the conversation owner (`GpuModel::slot_owner`), as in [`Archive::commit_save`]. The caller is
+    /// responsible for the slot being idle and for holding whatever lock keeps it so; this method only validates the
+    /// history (`pos == history.len()`, non-empty). The same content already archived is touched, not rewritten.
+    ///
+    /// On failure every reference taken by this call is released and the state file is removed. Segment bytes are
+    /// counted per new file only; an entry that shares segments with an older entry does not pay for them again.
+    pub fn save_segmented(
+        &mut self,
+        g: &mut GpuModel<'_>,
+        slot: usize,
+        owner: u64,
+        reason: &str,
+    ) -> Result<ArchiveEntry> {
+        if slot >= g.slots() {
+            bail!("slot archive: slot {slot} of {}", g.slots());
+        }
+        let tokens = g.slot_tokens(slot).to_vec();
+        if tokens.is_empty() {
+            bail!("slot archive: slot {slot} has no token history to save");
+        }
+        if g.slot_pos(slot) != tokens.len() {
+            bail!(
+                "slot archive: slot {slot}: pos {} but {} tokens in its history",
+                g.slot_pos(slot),
+                tokens.len()
+            );
+        }
+        if tokens.len() < self.cfg.min_tokens {
+            bail!(
+                "slot archive: history of {} tokens is below the min_tokens limit {}",
+                tokens.len(),
+                self.cfg.min_tokens
+            );
+        }
+        let fingerprint = g.slot_fingerprint();
+        let prefix_hash = prefix_hash(&tokens);
+        let id = id_for(fingerprint, owner, tokens.len(), prefix_hash);
+
+        // Same content is already archived: touch it. Only a complete v2 entry counts; a stale or v1 row with the
+        // same id is removed and replaced (a lease blocks the replacement, never the touch of a live v2 entry).
+        if let Some(existing) = self.entries.get(&id).cloned() {
+            let reusable = existing.format == 2
+                && existing.n_tokens == tokens.len()
+                && self.entry_data_present(&existing)
+                && existing.state_file.as_deref().is_some_and(|path| {
+                    read_state_header(path).is_ok_and(|(header, saved)| {
+                        header.fingerprint == fingerprint
+                            && header.owner == owner
+                            && header.n_tokens == tokens.len()
+                            && saved == tokens
+                    })
+                });
+            if reusable {
+                self.touch(&id);
+                return self
+                    .entries
+                    .get(&id)
+                    .cloned()
+                    .context("slot archive entry disappeared while touching it");
+            }
+            if self.leases(&id) > 0 {
+                bail!("slot archive: entry {id} is leased; cannot replace it with a segmented save");
+            }
+            self.delete(&id)?;
+        }
+
+        // Write the segments first: a crash leaves only orphan segment files, never an entry whose segments are
+        // missing. Track every segment this entry takes a reference on so a later failure can release it again.
+        let mut refs = Vec::new();
+        let mut taken: Vec<String> = Vec::new();
+        let mut new_bytes = 0u64;
+        let mut parent: Option<String> = None;
+        let mut write_segments = || -> Result<()> {
+            for (index, chunk) in tokens.chunks(SEGMENT_TOKENS).enumerate() {
+                let start = index * SEGMENT_TOKENS;
+                let end = start + chunk.len();
+                let segment_id = slot_segments::segment_id(fingerprint, parent.as_deref(), chunk);
+                let existed = self.segments.contains(&segment_id);
+                let mut payload = Vec::new();
+                g.save_kv_segment(slot, start, end, &mut payload)?;
+                let segment = self.segments.put(fingerprint, parent.as_deref(), chunk, &payload)?;
+                if segment.id != segment_id {
+                    bail!(
+                        "slot archive: segment store returned id {}, expected {segment_id}",
+                        segment.id
+                    );
+                }
+                if !existed {
+                    new_bytes = new_bytes.saturating_add(segment.bytes);
+                }
+                taken.push(segment.id.clone());
+                refs.push(SegmentRef { id: segment.id.clone(), start, end });
+                parent = Some(segment.id);
+            }
+            Ok(())
+        };
+        if let Err(err) = write_segments() {
+            self.release_segments(&taken);
+            return Err(err);
+        }
+
+        // The recurrent snapshot is the per-entry part; the token list and the header live in the same file.
+        let mut state_payload = Vec::new();
+        let state_written = (|| -> Result<PathBuf> {
+            g.save_recurrent_to(slot, &mut state_payload)?;
+            let path = state_path(&self.cfg.dir, &id)?;
+            write_state_file_atomic(
+                &path,
+                &StateHeader {
+                    fingerprint,
+                    owner,
+                    rope_offset: g.slot_rope_offset(slot),
+                    n_tokens: tokens.len(),
+                },
+                &tokens,
+                &state_payload,
+            )?;
+            Ok(path)
+        })();
+        let state_path = match state_written {
+            Ok(path) => path,
+            Err(err) => {
+                self.release_segments(&taken);
+                return Err(err);
+            }
+        };
+        let bytes = match fs::metadata(&state_path) {
+            Ok(meta) if meta.is_file() => meta.len().saturating_add(new_bytes),
+            Ok(_) => {
+                let _ = fs::remove_file(&state_path);
+                self.release_segments(&taken);
+                bail!("slot archive: {} is not a regular file", state_path.display());
+            }
+            Err(err) => {
+                let _ = fs::remove_file(&state_path);
+                self.release_segments(&taken);
+                return Err(err).with_context(|| format!("stat {}", state_path.display()));
+            }
+        };
+
+        if let Err(err) = self.reserve_budget(&id, owner, bytes, fingerprint) {
+            let _ = fs::remove_file(&state_path);
+            self.release_segments(&taken);
+            return Err(err);
+        }
+
+        // Lineage is computed after budget enforcement, so it never points at an entry evicted above.
+        let parent_entry = self
+            .longest_prefix(owner, &tokens, fingerprint)
+            .filter(|e| e.n_tokens < tokens.len() && e.id != id)
+            .map(|e| e.id);
+        let now = now_ms();
+        let entry = ArchiveEntry {
+            id: id.clone(),
+            file: state_path.clone(),
+            state_file: Some(state_path.clone()),
+            segments: refs,
+            bytes,
+            n_tokens: tokens.len(),
+            owner,
+            fingerprint,
+            prefix_hash,
+            created_ms: now,
+            last_used_ms: now,
+            parent: parent_entry,
+            pinned: false,
+            reason: reason.to_string(),
+            format: 2,
+        };
+        self.entries.insert(id.clone(), entry.clone());
+        if let Err(err) = self.persist() {
+            self.entries.remove(&id);
+            let _ = fs::remove_file(&state_path);
+            self.release_segments(&taken);
+            return Err(err);
+        }
+        // The slot is reusable at this history, exactly as after a v1 synchronous save (`save_state` cleared the
+        // marker while writing the recurrent payload).
+        g.mark_slot_saved(slot, &tokens, owner);
+        Ok(entry)
+    }
+
+    /// Restore a v2 entry into the idle slot `slot` and return the number of restored tokens.
+    ///
+    /// The entry's recorded `owner` (the conversation owner) is installed; the caller's request owner is not used.
+    /// `allow_evict` is deliberately not a parameter: an automatic restore never evicts a non-empty slot under a
+    /// unified budget. Any error clears the target slot before returning, so the server can fall back to prefill.
+    pub fn restore_segmented(
+        &mut self,
+        g: &mut GpuModel<'_>,
+        slot: usize,
+        entry: &ArchiveEntry,
+    ) -> Result<usize> {
+        let result = self.restore_segmented_inner(g, slot, entry);
+        if result.is_err() {
+            // A partially installed state must never be used, and an automatic restore failure means prefill.
+            if let Err(err) = g.erase_slot(slot) {
+                crate::say!("slot archive: clearing slot {slot} after a failed segmented restore: {err:#}");
+            }
+        }
+        result
+    }
+
+    fn restore_segmented_inner(
+        &mut self,
+        g: &mut GpuModel<'_>,
+        slot: usize,
+        entry: &ArchiveEntry,
+    ) -> Result<usize> {
+        if entry.format != 2 {
+            bail!(
+                "slot archive: entry {} is format {}, not a segmented (format 2) entry",
+                entry.id,
+                entry.format
+            );
+        }
+        if entry.n_tokens == 0 {
+            bail!("slot archive: entry {} has no tokens", entry.id);
+        }
+        if entry.n_tokens > g.ctx() {
+            bail!(
+                "slot archive: entry {} has {} tokens, --ctx is {}",
+                entry.id,
+                entry.n_tokens,
+                g.ctx()
+            );
+        }
+        let fingerprint = g.slot_fingerprint();
+        if entry.fingerprint != fingerprint {
+            bail!(
+                "slot archive: entry {} fingerprint {:016x} does not match this model {:016x}",
+                entry.id,
+                entry.fingerprint,
+                fingerprint
+            );
+        }
+        let state_file = entry
+            .state_file
+            .as_deref()
+            .context("segmented entry has no state file")?;
+        let (header, tokens, state_payload) = read_state_file(state_file)?;
+        if header.fingerprint != entry.fingerprint {
+            bail!(
+                "slot archive: {} header fingerprint {:016x} does not match the entry {:016x}",
+                state_file.display(),
+                header.fingerprint,
+                entry.fingerprint
+            );
+        }
+        if header.owner != entry.owner {
+            bail!(
+                "slot archive: {} header owner {} does not match the entry owner {}",
+                state_file.display(),
+                header.owner,
+                entry.owner
+            );
+        }
+        if header.n_tokens != entry.n_tokens || tokens.len() != entry.n_tokens {
+            bail!(
+                "slot archive: {} has {} tokens, the entry has {}",
+                state_file.display(),
+                tokens.len(),
+                entry.n_tokens
+            );
+        }
+        if !segments_cover(&entry.segments, entry.n_tokens) {
+            bail!("slot archive: entry {} segment ranges are not a contiguous cover of its history", entry.id);
+        }
+
+        // Capacity/unified growth first; never evicts (automatic restore). This does not touch the file.
+        g.prepare_segmented_restore(slot, tokens.len(), false)?;
+        for segment in &entry.segments {
+            let payload = self.segments.get_checked(&segment.id, &tokens[segment.start..segment.end])?;
+            let mut reader = &payload[..];
+            g.restore_kv_segment(slot, segment.start, segment.end, &mut reader)?;
+        }
+        let mut payload = &state_payload[..];
+        let consumed = g.restore_recurrent_from(slot, &mut payload)?;
+        if consumed != state_payload.len() as u64 {
+            bail!(
+                "slot archive: {} recurrent payload is {} bytes, {} were consumed",
+                state_file.display(),
+                state_payload.len(),
+                consumed
+            );
+        }
+        g.finish_segmented_restore(slot, &tokens, entry.owner, header.rope_offset)?;
+        Ok(tokens.len())
+    }
+
+    /// Drop every reference in `ids`, logging (but not failing) a manifest write error: an over-counted ref is
+    /// safe, a dangling entry is not.
+    fn release_segments(&mut self, ids: &[String]) {
+        for id in ids.iter().rev() {
+            if let Err(err) = self.segments.unref(id) {
+                crate::say!("slot archive: releasing segment {id}: {err:#}");
+            }
+        }
+    }
+
     /// Longest entry whose token history is an exact prefix of `tokens[..keep]`, with the same owner and
     /// fingerprint and `n_tokens <= ctx`. Increments the hit/miss counters.
     pub fn lookup(&mut self, owner: u64, tokens: &[u32], keep: usize, fingerprint: u64, ctx: usize) -> Result<Option<ArchiveEntry>> {
+        let found = self.lookup_match(owner, tokens, keep, fingerprint, ctx)?;
+        if found.is_some() {
+            self.stats.hits += 1;
+        } else {
+            self.stats.misses += 1;
+        }
+        Ok(found)
+    }
+
+    /// Same exact lookup as [`Archive::lookup`], but also takes a transient [`Lease`] on the match before
+    /// returning it. The lease protects the entry from `DELETE` and GC until the guard is dropped.
+    ///
+    /// A miss increments the same counter as [`Archive::lookup`].
+    pub fn lookup_leased(&mut self, owner: u64, tokens: &[u32], keep: usize, fingerprint: u64, ctx: usize) -> Result<Option<(ArchiveEntry, Lease)>> {
+        let Some(entry) = self.lookup_match(owner, tokens, keep, fingerprint, ctx)? else {
+            self.stats.misses += 1;
+            return Ok(None);
+        };
+        self.stats.hits += 1;
+        let lease = self.add_lease(&entry.id);
+        Ok(Some((entry, lease)))
+    }
+
+    /// Take a lease on an existing entry. `None` when no entry with `id` is currently indexed.
+    pub fn lease(&mut self, id: &str) -> Option<Lease> {
+        if !self.entries.contains_key(id) {
+            return None;
+        }
+        Some(self.add_lease(id))
+    }
+
+    /// Number of live leases on `id` (0 when the entry is unleased or unknown).
+    pub fn leases(&self, id: &str) -> usize {
+        self.lease_table().get(id).copied().unwrap_or(0)
+    }
+
+    fn lease_table(&self) -> MutexGuard<'_, BTreeMap<String, usize>> {
+        self.leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Register one lease. Drop ignores missing ids, so registering before the entry is inserted is harmless.
+    fn add_lease(&self, id: &str) -> Lease {
+        *self.lease_table().entry(id.to_string()).or_insert(0) += 1;
+        Lease { id: id.to_string(), leases: Arc::clone(&self.leases) }
+    }
+
+    /// The shared body of [`Archive::lookup`] and [`Archive::lookup_leased`]: exact prefix match and LRU
+    /// touch, without hit/miss accounting.
+    fn lookup_match(&mut self, owner: u64, tokens: &[u32], keep: usize, fingerprint: u64, ctx: usize) -> Result<Option<ArchiveEntry>> {
         let n_max = keep.min(ctx).min(tokens.len());
         let mut candidates: Vec<(usize, String)> = self
             .entries
@@ -363,11 +952,11 @@ impl Archive {
             if entry.prefix_hash != hashes[&n] {
                 continue;
             }
-            // Hash match: prove it with the token list at the start of the file.
-            let exact = match read_tokens(&entry.file) {
+            // Hash match: prove it with the saved token list (the file header for v1, the state file for v2).
+            let exact = match read_entry_tokens(entry) {
                 Ok(saved) => saved.len() == n && saved == tokens[..n],
                 Err(err) => {
-                    crate::say!("slot archive: cannot read {}: {err:#}", entry.file.display());
+                    crate::say!("slot archive: cannot read the tokens of {}: {err:#}", entry.id);
                     false
                 }
             };
@@ -377,12 +966,10 @@ impl Archive {
             let used = now_ms();
             if let Some(entry) = self.entries.get_mut(&id) {
                 entry.last_used_ms = used;
-                self.stats.hits += 1;
                 return Ok(Some(entry.clone()));
             }
         }
 
-        self.stats.misses += 1;
         Ok(None)
     }
 
@@ -417,21 +1004,23 @@ impl Archive {
         }
     }
 
-    /// Delete an entry and its file. Returns the freed bytes.
+    /// Delete an entry, its state/slot file and (for v2) its segment references. Returns the freed logical bytes.
+    ///
+    /// An entry with live [`Lease`]s is not deleted: the caller gets an error and should retry after the restore
+    /// or save that holds it completes. Missing files are tolerated; a state file that cannot be unlinked keeps the
+    /// entry so a later GC can retry.
     pub fn delete(&mut self, id: &str) -> Result<u64> {
-        let Some(entry) = self.entries.get(id) else { return Ok(0) };
-        let file = entry.file.clone();
-        let bytes = entry.bytes;
-        match fs::remove_file(&file) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err).with_context(|| format!("removing {}", file.display()));
-            }
+        let Some(entry) = self.entries.get(id).cloned() else { return Ok(0) };
+        let held = self.leases(id);
+        if held > 0 {
+            bail!(
+                "slot archive: entry {id} is leased by {held} in-flight operation(s); retry after it completes"
+            );
         }
+        self.remove_entry_data(&entry, true)?;
         self.entries.remove(id);
         self.persist()?;
-        Ok(bytes)
+        Ok(entry.bytes)
     }
 
     /// Evict unusable entries first, then (only when over the target) prune lineages per `versions` and evict
@@ -441,15 +1030,33 @@ impl Archive {
         let mut report = GcReport::default();
         let mut changed = false;
 
-        // Unusable: the manifest row points at a missing file. (Foreign fingerprints are not identifiable
-        // without a current fingerprint argument, so they are only evicted by the LRU pass.)
+        // TTL: remove unpinned idle entries before any budget work. Leased entries are skipped by
+        // `evict_entry`; a future `last_used_ms` saturates to a zero age.
+        if self.ttl_ms > 0 {
+            let now = now_ms();
+            let expired: Vec<String> = self
+                .entries
+                .values()
+                .filter(|e| self.ttl_expired(e, now))
+                .map(|e| e.id.clone())
+                .collect();
+            for id in expired {
+                if let Some(freed) = self.evict_entry(&id) {
+                    report.evicted += 1;
+                    report.expired += 1;
+                    report.freed_bytes = report.freed_bytes.saturating_add(freed);
+                    self.stats.expired = self.stats.expired.saturating_add(1);
+                    changed = true;
+                }
+            }
+        }
+
+        // Unusable: the manifest row points at a missing file (or, for v2, a missing segment). (Foreign
+        // fingerprints are not identifiable without a current fingerprint argument, so they are only evicted by
+        // the LRU pass.)
         let ids: Vec<String> = self.entries.keys().cloned().collect();
         for id in ids {
-            let unusable = match fs::metadata(&self.entries[&id].file) {
-                Ok(meta) => !meta.is_file(),
-                Err(_) => true,
-            };
-            if unusable {
+            if !self.entry_data_present(&self.entries[&id]) {
                 if let Some(freed) = self.evict_entry(&id) {
                     report.evicted += 1;
                     report.freed_bytes = report.freed_bytes.saturating_add(freed);
@@ -491,6 +1098,11 @@ impl Archive {
         if changed {
             self.persist()?;
         }
+        // Entry references are gone; drop the zero-ref segment files in the same pass. Rows still referenced by a
+        // v2 entry stay, so a shared segment survives until its last entry goes.
+        if let Err(err) = self.segments.gc() {
+            crate::say!("slot archive: segment GC failed: {err:#}");
+        }
         Ok(report)
     }
 
@@ -506,22 +1118,73 @@ impl Archive {
         self.entries.values().map(|e| e.bytes).sum()
     }
 
-    /// Remove an entry and its file. `None` when the file could not be unlinked (the entry is kept).
+    /// True when `entry` is subject to an enabled TTL and has been idle longer than it. Pinned entries never
+    /// expire; a `last_used_ms` in the future (clock skew) is treated as just used.
+    fn ttl_expired(&self, entry: &ArchiveEntry, now: u64) -> bool {
+        self.ttl_ms > 0
+            && !entry.pinned
+            && now.saturating_sub(entry.last_used_ms) > self.ttl_ms
+    }
+
+    /// Remove an entry, its file(s) and its v2 segment references. `None` when the state/slot file could not be
+    /// unlinked (the entry is kept) or when the entry is leased (GC must never pull a file out from under an
+    /// in-flight restore). Segment reference releases are best effort: an over-counted ref leaks disk but never
+    /// leaves an entry pointing at a missing segment.
     fn evict_entry(&mut self, id: &str) -> Option<u64> {
-        let entry = self.entries.get(id)?;
-        let file = entry.file.clone();
-        let bytes = entry.bytes;
-        match fs::remove_file(&file) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                crate::say!("slot archive: cannot remove {}: {err:#}; keeping the entry", file.display());
-                return None;
-            }
+        if self.leases(id) > 0 {
+            return None;
+        }
+        let entry = self.entries.get(id)?.clone();
+        if let Err(err) = self.remove_entry_data(&entry, false) {
+            crate::say!("slot archive: keeping {id}: {err:#}");
+            return None;
         }
         self.entries.remove(id);
         self.stats.evictions = self.stats.evictions.saturating_add(1);
-        Some(bytes)
+        Some(entry.bytes)
+    }
+
+    /// Release a v2 entry's segment references, remove its state file, and then remove a v1 entry's slot file.
+    ///
+    /// For v2 the order is segments first, then the state file: a crash between the two leaves a state file
+    /// without references (harmless, GC'd/adopted later), never an entry whose segments are already gone. A state
+    /// file that cannot be unlinked is logged and left as an orphan; the entry is still removed, because it has
+    /// already released its segment references and must not survive pointing at them. A v1 unlink error in `strict`
+    /// mode (explicit DELETE) keeps the entry, as before.
+    fn remove_entry_data(&mut self, entry: &ArchiveEntry, strict: bool) -> Result<()> {
+        if entry.format == 2 {
+            for segment in entry.segments.iter().rev() {
+                if let Err(err) = self.segments.unref(&segment.id) {
+                    crate::say!("slot archive: releasing segment {} of {}: {err:#}", segment.id, entry.id);
+                }
+            }
+            let path = entry.state_file.as_deref().unwrap_or(&entry.file);
+            remove_file_if_present(path, false)?;
+        } else {
+            remove_file_if_present(&entry.file, strict)?;
+        }
+        Ok(())
+    }
+
+    /// True when every file an entry needs is present: its slot/state file and, for v2, each segment row and file.
+    fn entry_data_present(&self, entry: &ArchiveEntry) -> bool {
+        let file = if entry.format == 2 {
+            entry.state_file.as_deref().unwrap_or(&entry.file)
+        } else {
+            &entry.file
+        };
+        if !fs::metadata(file).map(|meta| meta.is_file()).unwrap_or(false) {
+            return false;
+        }
+        if entry.format == 2 {
+            return entry.segments.iter().all(|segment| {
+                self.segments
+                    .segment(&segment.id)
+                    .and_then(|row| fs::metadata(&row.file).ok())
+                    .is_some_and(|meta| meta.is_file())
+            });
+        }
+        true
     }
 
     /// Apply the `versions` policy to the lineage of `leaf_id`.
@@ -588,6 +1251,11 @@ impl Archive {
                 .map(|e| ManifestEntry {
                     id: e.id.clone(),
                     file: relative_string(&self.cfg.dir, &e.file),
+                    state_file: e
+                        .state_file
+                        .as_deref()
+                        .map(|path| relative_string(&self.cfg.dir, path)),
+                    segments: e.segments.clone(),
                     bytes: e.bytes,
                     n_tokens: e.n_tokens,
                     owner: e.owner,
@@ -628,6 +1296,282 @@ pub(crate) fn read_tokens(path: &Path) -> Result<Vec<u32>> {
     let mut r = BufReader::new(f);
     let (_header, tokens) = crate::slot_file::read_header(&mut r)?;
     Ok(tokens)
+}
+
+/// The token history of an entry: the `STRATASLOT` header for v1, the `STRSTATE` header for v2.
+pub(crate) fn read_entry_tokens(entry: &ArchiveEntry) -> Result<Vec<u32>> {
+    match entry.format {
+        1 => read_tokens(&entry.file),
+        2 => {
+            let path = entry
+                .state_file
+                .as_deref()
+                .context("segmented entry has no state file")?;
+            read_state_tokens(path)
+        }
+        other => bail!("slot archive: entry {} has unsupported format {other}", entry.id),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// STRSTATE v1: the v2 entry's token list and recurrent snapshot
+// ---------------------------------------------------------------------------------------------------------
+//
+// ```text
+// magic[8]  = "STRSTATE"
+// version: u32 = 1
+// fingerprint: u64
+// owner: u64
+// rope_offset: i32
+// n_tokens: u32
+// tokens: n_tokens × u32
+// state_len: u64
+// state: state_len bytes (the `STRRSEG` payload from GpuModel::save_recurrent_to)
+// ```
+//
+// There is no footer: the exact file length (header + tokens + length + payload) is checked, so a truncated or
+// extended file is rejected. KV rows are not in this file; they are the content-addressed segments.
+
+/// The parsed `STRSTATE` header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StateHeader {
+    pub fingerprint: u64,
+    pub owner: u64,
+    pub rope_offset: i32,
+    pub n_tokens: usize,
+}
+
+fn read_state_preamble<R: Read>(r: &mut R) -> Result<(StateHeader, Vec<u32>, u64)> {
+    let mut magic = [0u8; 8];
+    r.read_exact(&mut magic).context("reading the state file magic")?;
+    if magic != STATE_MAGIC {
+        bail!(
+            "bad state file magic {magic:02x?}, expected {STATE_MAGIC:02x?}"
+        );
+    }
+    let version = crate::slot_file::read_u32(r).context("reading the state file version")?;
+    if version != STATE_VERSION {
+        bail!("unsupported state file version {version}, expected {STATE_VERSION}");
+    }
+    let fingerprint = crate::slot_file::read_u64(r).context("reading the state file fingerprint")?;
+    let owner = crate::slot_file::read_u64(r).context("reading the state file owner")?;
+    let mut rope = [0u8; 4];
+    r.read_exact(&mut rope).context("reading the state file rope offset")?;
+    let rope_offset = i32::from_le_bytes(rope);
+    let n_tokens = crate::slot_file::read_u32(r).context("reading the state file token count")? as usize;
+    if n_tokens == 0 || n_tokens > MAX_STATE_TOKENS {
+        bail!("state file has {n_tokens} tokens, the expected range is 1..={MAX_STATE_TOKENS}");
+    }
+    let mut tokens = Vec::with_capacity(n_tokens);
+    for index in 0..n_tokens {
+        tokens.push(
+            crate::slot_file::read_u32(r)
+                .with_context(|| format!("reading state file token {index} of {n_tokens}"))?,
+        );
+    }
+    let payload_len = crate::slot_file::read_u64(r).context("reading the state payload length")?;
+    Ok((
+        StateHeader { fingerprint, owner, rope_offset, n_tokens },
+        tokens,
+        payload_len,
+    ))
+}
+
+/// Validate the file length against the header and return the expected total size.
+fn state_expected_len(n_tokens: usize, payload_len: u64) -> Result<u64> {
+    let tokens = (n_tokens as u64)
+        .checked_mul(4)
+        .context("state file token list length overflow")?;
+    STATE_HEADER_LEN
+        .checked_add(tokens)
+        .and_then(|n| n.checked_add(8))
+        .and_then(|n| n.checked_add(payload_len))
+        .context("state file length overflow")
+}
+
+/// Read and validate a `STRSTATE` header plus token list, without reading the recurrent payload.
+pub(crate) fn read_state_tokens(path: &Path) -> Result<Vec<u32>> {
+    Ok(read_state_header(path)?.1)
+}
+
+/// Read and validate a `STRSTATE` header plus token list. This is the startup/lookup path: it never reads the
+/// (potentially tens of MB) recurrent payload.
+pub(crate) fn read_state_header(path: &Path) -> Result<(StateHeader, Vec<u32>)> {
+    let f = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let meta = f.metadata().with_context(|| format!("stat {}", path.display()))?;
+    ensure_regular(&meta, path)?;
+    let (header, tokens, payload_len) = {
+        let mut r = BufReader::new(f);
+        read_state_preamble(&mut r).with_context(|| format!("reading {}", path.display()))?
+    };
+    let expected = state_expected_len(header.n_tokens, payload_len)?;
+    if meta.len() != expected {
+        bail!(
+            "state file {} is {} bytes, the header describes {expected}",
+            path.display(),
+            meta.len()
+        );
+    }
+    Ok((header, tokens))
+}
+
+/// Read and validate a whole `STRSTATE` file.
+pub(crate) fn read_state_file(path: &Path) -> Result<(StateHeader, Vec<u32>, Vec<u8>)> {
+    let f = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let meta = f.metadata().with_context(|| format!("stat {}", path.display()))?;
+    ensure_regular(&meta, path)?;
+    let mut r = BufReader::new(f);
+    let (header, tokens, payload_len) = read_state_preamble(&mut r)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let expected = state_expected_len(header.n_tokens, payload_len)?;
+    if meta.len() != expected {
+        bail!(
+            "state file {} is {} bytes, the header describes {expected}",
+            path.display(),
+            meta.len()
+        );
+    }
+    let payload_len = usize::try_from(payload_len).context("state payload does not fit in memory")?;
+    let mut payload = vec![0u8; payload_len];
+    r.read_exact(&mut payload)
+        .with_context(|| format!("reading the state payload of {}", path.display()))?;
+    Ok((header, tokens, payload))
+}
+
+fn ensure_regular(meta: &fs::Metadata, path: &Path) -> Result<()> {
+    if !meta.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    Ok(())
+}
+
+/// The state file path for entry `id`: `<dir>/<2 hex>/<id>.state`.
+fn state_path(dir: &Path, id: &str) -> Result<PathBuf> {
+    let shard = id.get(..2).context("archive entry id is too short")?;
+    Ok(dir.join(shard).join(format!("{id}.state")))
+}
+
+/// Write a `STRSTATE` file via a temp file + fsync + rename (0600), returning its length.
+fn write_state_file_atomic(
+    path: &Path,
+    header: &StateHeader,
+    tokens: &[u32],
+    payload: &[u8],
+) -> Result<u64> {
+    if tokens.is_empty() {
+        bail!("refusing to write an empty state file");
+    }
+    if tokens.len() != header.n_tokens {
+        bail!(
+            "state file header says {} tokens, the list has {}",
+            header.n_tokens,
+            tokens.len()
+        );
+    }
+    let n_tokens = u32::try_from(tokens.len()).context("state token count does not fit in u32")?;
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    ensure_dir(dir)?;
+    let (tmp, mut file) = create_temp(dir, "state")?;
+
+    let write = (|| -> Result<()> {
+        file.write_all(&STATE_MAGIC).context("writing the state file magic")?;
+        crate::slot_file::write_u32(&mut file, STATE_VERSION)?;
+        crate::slot_file::write_u64(&mut file, header.fingerprint)?;
+        crate::slot_file::write_u64(&mut file, header.owner)?;
+        file.write_all(&header.rope_offset.to_le_bytes())
+            .context("writing the state rope offset")?;
+        crate::slot_file::write_u32(&mut file, n_tokens)?;
+        for &token in tokens {
+            crate::slot_file::write_u32(&mut file, token)?;
+        }
+        crate::slot_file::write_u64(&mut file, payload.len() as u64)?;
+        file.write_all(payload).context("writing the state payload")?;
+        file.sync_all().context("syncing the state file")?;
+        Ok(())
+    })();
+    if let Err(err) = write {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    drop(file);
+    let bytes = fs::metadata(&tmp)
+        .with_context(|| format!("stat {}", tmp.display()))?
+        .len();
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err)
+            .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()));
+    }
+    fsync_dir(dir);
+    Ok(bytes)
+}
+
+/// Create a uniquely named 0600 temp file in `dir`, returning its path and handle.
+fn create_temp(dir: &Path, tag: &str) -> Result<(PathBuf, fs::File)> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    for attempt in 0..32u32 {
+        let path = dir.join(format!(
+            ".{tag}.{}.{nanos}.{attempt}.tmp",
+            std::process::id()
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && attempt < 31 => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("creating {}", path.display()));
+            }
+        }
+    }
+    bail!("could not create a temporary state file in {}", dir.display())
+}
+
+fn fsync_dir(dir: &Path) {
+    #[cfg(unix)]
+    {
+        if let Ok(file) = fs::File::open(dir) {
+            let _ = file.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+}
+
+/// Remove `path` if present. With `strict`, an unlink error other than "not found" is returned.
+fn remove_file_if_present(path: &Path, strict: bool) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) if strict => {
+            Err(err).with_context(|| format!("removing {}", path.display()))
+        }
+        Err(err) => {
+            crate::say!("slot archive: cannot remove {}: {err:#}", path.display());
+            Ok(())
+        }
+    }
+}
+
+/// True when `segments` is an ordered, contiguous cover of `[0, n_tokens)`.
+fn segments_cover(segments: &[SegmentRef], n_tokens: usize) -> bool {
+    let mut next = 0usize;
+    for segment in segments {
+        if segment.start != next || segment.end <= segment.start || segment.end > n_tokens {
+            return false;
+        }
+        next = segment.end;
+    }
+    next == n_tokens
 }
 
 /// Stable 64-bit FNV-1a hash of a token history.
@@ -672,6 +1616,12 @@ struct ManifestFile {
 struct ManifestEntry {
     id: String,
     file: String,
+    /// v2 only: the `STRSTATE` file, relative to the archive directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state_file: Option<String>,
+    /// v2 only: the ordered KV segments. Absent in a v1 manifest (and empty for a v1 entry).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    segments: Vec<SegmentRef>,
     bytes: u64,
     n_tokens: usize,
     owner: u64,
@@ -707,9 +1657,16 @@ fn load_manifest(dir: &Path) -> Result<BTreeMap<String, ArchiveEntry>> {
     let mut entries = BTreeMap::new();
     for row in manifest.entries {
         let file = entry_path(dir, &row.file)?;
+        let state_file = row
+            .state_file
+            .as_deref()
+            .map(|state| entry_path(dir, state))
+            .transpose()?;
         let entry = ArchiveEntry {
             id: row.id,
             file,
+            state_file,
+            segments: row.segments,
             bytes: row.bytes,
             n_tokens: row.n_tokens,
             owner: row.owner,
@@ -727,33 +1684,87 @@ fn load_manifest(dir: &Path) -> Result<BTreeMap<String, ArchiveEntry>> {
     Ok(entries)
 }
 
-/// Stat the file and compare its `STRATASLOT` header with the manifest row.
-fn validate_entry(entry: &ArchiveEntry) -> Result<()> {
-    let meta = fs::metadata(&entry.file).with_context(|| format!("stat {}", entry.file.display()))?;
-    if !meta.is_file() {
-        bail!("{} is not a regular file", entry.file.display());
-    }
-    let (header, tokens) = read_slot(&entry.file)?;
-    if header.fingerprint != entry.fingerprint {
-        bail!(
-            "header fingerprint {:016x} does not match the manifest {:016x}",
-            header.fingerprint,
-            entry.fingerprint
-        );
-    }
-    if header.owner != entry.owner {
-        bail!(
-            "header owner {} does not match the manifest {}",
-            header.owner,
-            entry.owner
-        );
-    }
-    if header.n_tokens != entry.n_tokens as u64 || tokens.len() != entry.n_tokens {
-        bail!(
-            "header has {} tokens, the manifest says {}",
-            header.n_tokens,
-            entry.n_tokens
-        );
+/// Stat the file(s) and compare the on-disk header with the manifest row. Format 1 is a `STRATASLOT` file; format 2
+/// is a `STRSTATE` file plus a contiguous segment chain. An unsupported format is invalid, never silently accepted.
+fn validate_entry(entry: &ArchiveEntry, segments: &SegmentStore) -> Result<()> {
+    match entry.format {
+        1 => {
+            let meta = fs::metadata(&entry.file)
+                .with_context(|| format!("stat {}", entry.file.display()))?;
+            ensure_regular(&meta, &entry.file)?;
+            let (header, tokens) = read_slot(&entry.file)?;
+            if header.fingerprint != entry.fingerprint {
+                bail!(
+                    "header fingerprint {:016x} does not match the manifest {:016x}",
+                    header.fingerprint,
+                    entry.fingerprint
+                );
+            }
+            if header.owner != entry.owner {
+                bail!(
+                    "header owner {} does not match the manifest {}",
+                    header.owner,
+                    entry.owner
+                );
+            }
+            if header.n_tokens != entry.n_tokens as u64 || tokens.len() != entry.n_tokens {
+                bail!(
+                    "header has {} tokens, the manifest says {}",
+                    header.n_tokens,
+                    entry.n_tokens
+                );
+            }
+        }
+        2 => {
+            let path = entry
+                .state_file
+                .as_deref()
+                .context("segmented entry has no state file")?;
+            let (header, tokens) = read_state_header(path)?;
+            if header.fingerprint != entry.fingerprint {
+                bail!(
+                    "state file fingerprint {:016x} does not match the manifest {:016x}",
+                    header.fingerprint,
+                    entry.fingerprint
+                );
+            }
+            if header.owner != entry.owner {
+                bail!(
+                    "state file owner {} does not match the manifest {}",
+                    header.owner,
+                    entry.owner
+                );
+            }
+            if header.n_tokens != entry.n_tokens || tokens.len() != entry.n_tokens {
+                bail!(
+                    "state file has {} tokens, the manifest says {}",
+                    tokens.len(),
+                    entry.n_tokens
+                );
+            }
+            if !segments_cover(&entry.segments, entry.n_tokens) {
+                bail!("segment ranges are not a contiguous cover of the history");
+            }
+            for segment in &entry.segments {
+                let row = segments
+                    .segment(&segment.id)
+                    .with_context(|| format!("segment {} is missing", segment.id))?;
+                if row.n_tokens != segment.end - segment.start {
+                    bail!(
+                        "segment {} has {} tokens, the entry range [{}, {}) needs {}",
+                        segment.id,
+                        row.n_tokens,
+                        segment.start,
+                        segment.end,
+                        segment.end - segment.start
+                    );
+                }
+                let meta = fs::metadata(&row.file)
+                    .with_context(|| format!("stat {}", row.file.display()))?;
+                ensure_regular(&meta, &row.file)?;
+            }
+        }
+        other => bail!("unsupported entry format {other}"),
     }
     Ok(())
 }
@@ -805,6 +1816,8 @@ fn rebuild_manifest(dir: &Path) -> Result<BTreeMap<String, ArchiveEntry>> {
                 ArchiveEntry {
                     id,
                     file: path,
+                    state_file: None,
+                    segments: Vec::new(),
                     bytes: meta.len(),
                     n_tokens: tokens.len(),
                     owner: header.owner,
@@ -1041,6 +2054,10 @@ mod tests {
 
     fn write_manifest_json(dir: &Path, value: &serde_json::Value) {
         fs::write(dir.join(MANIFEST), serde_json::to_vec(value).unwrap()).unwrap();
+    }
+
+    fn set_last_used(archive: &mut Archive, id: &str, used: u64) {
+        archive.entries.get_mut(id).unwrap().last_used_ms = used;
     }
 
     #[test]
@@ -1516,5 +2533,744 @@ mod tests {
         assert_eq!(archive.list(None, 0)[0].id, b.id);
         // The manifest was rewritten without the dead row.
         assert_eq!(manifest_json(dir)["entries"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn lease_blocks_delete_and_gc() {
+        let tmp = TempDir::new("leased");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let entry = save(&mut archive, 1, &(1..=8).collect::<Vec<_>>());
+
+        let lease = archive.lease(&entry.id).unwrap();
+        assert_eq!(lease.id(), entry.id);
+        assert_eq!(archive.leases(&entry.id), 1);
+        let err = archive.delete(&entry.id).unwrap_err();
+        assert!(err.to_string().contains("leased"), "{err}");
+        assert!(entry.file.exists());
+        assert_eq!(archive.stats().entries, 1);
+        drop(lease);
+        assert_eq!(archive.leases(&entry.id), 0);
+        assert_eq!(archive.delete(&entry.id).unwrap(), entry.bytes);
+        assert!(!entry.file.exists());
+
+        // GC skips a leased entry even when the budget is over the target.
+        let entry = save(&mut archive, 2, &(20..=28).collect::<Vec<_>>());
+        drop(archive);
+        let mut cfg = config(dir);
+        cfg.budget_bytes = RESERVE_BYTES + 1;
+        let mut archive = Archive::open(cfg).unwrap();
+        let lease = archive.lease(&entry.id).unwrap();
+        let report = archive.gc().unwrap();
+        assert_eq!(report.evicted, 0);
+        assert_eq!(report.freed_bytes, 0);
+        assert!(entry.file.exists());
+        assert_eq!(archive.leases(&entry.id), 1);
+
+        drop(lease);
+        let report = archive.gc().unwrap();
+        assert_eq!(report.evicted, 1);
+        assert_eq!(report.freed_bytes, entry.bytes);
+        assert!(!entry.file.exists());
+        assert_eq!(archive.stats().entries, 0);
+    }
+
+    #[test]
+    fn double_lease_needs_two_drops() {
+        let tmp = TempDir::new("double-lease");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let entry = save(&mut archive, 1, &(1..=7).collect::<Vec<_>>());
+
+        let first = archive.lease(&entry.id).unwrap();
+        let second = archive.lease(&entry.id).unwrap();
+        assert_eq!(archive.leases(&entry.id), 2);
+        drop(first);
+        assert_eq!(archive.leases(&entry.id), 1);
+        assert!(
+            archive.delete(&entry.id).is_err(),
+            "one lease must still block delete"
+        );
+        drop(second);
+        assert_eq!(archive.leases(&entry.id), 0);
+        assert_eq!(archive.delete(&entry.id).unwrap(), entry.bytes);
+
+        // Unknown ids cannot be leased; a stale guard is harmless.
+        assert!(archive.lease("0000000000000000").is_none());
+        assert_eq!(archive.leases("no-such-entry"), 0);
+    }
+
+    #[test]
+    fn lookup_leased_matches_lookup_and_counts() {
+        let tmp = TempDir::new("lookup-leased");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let tokens: Vec<u32> = (1..=8).collect();
+        let short = save(&mut archive, 1, &tokens[..4]);
+        let long = save(&mut archive, 1, &tokens[..6]);
+
+        let (hit, lease) = archive.lookup_leased(1, &tokens, 8, FP, 100).unwrap().unwrap();
+        assert_eq!(hit.id, long.id);
+        assert_eq!(hit.n_tokens, 6);
+        assert_eq!(archive.leases(&long.id), 1);
+        assert_eq!(archive.leases(&short.id), 0);
+        assert_eq!(archive.stats().hits, 1);
+
+        // Same exact match as the unleased lookup.
+        let unleased = archive.lookup(1, &tokens, 8, FP, 100).unwrap().unwrap();
+        assert_eq!(unleased.id, long.id);
+        assert_eq!(archive.stats().hits, 2);
+
+        // A miss increments the miss counter and takes no lease.
+        assert!(archive.lookup_leased(2, &tokens, 8, FP, 100).unwrap().is_none());
+        assert_eq!(archive.stats().misses, 1);
+        assert_eq!(archive.leases(&long.id), 1);
+        // `keep`/`ctx` behave exactly as in `lookup`.
+        let (hit, short_lease) = archive.lookup_leased(1, &tokens, 4, FP, 100).unwrap().unwrap();
+        assert_eq!(hit.id, short.id);
+        assert_eq!(archive.stats().hits, 3);
+        assert_eq!(archive.leases(&short.id), 1);
+        drop(short_lease);
+
+        // The lookup lease protects the entry from DELETE.
+        assert!(archive.delete(&long.id).is_err());
+        drop(lease);
+        assert_eq!(archive.leases(&long.id), 0);
+        assert_eq!(archive.delete(&long.id).unwrap(), long.bytes);
+    }
+
+    #[test]
+    fn leases_do_not_leak_after_drop() {
+        let tmp = TempDir::new("lease-leak");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let entry = save(&mut archive, 1, &(1..=9).collect::<Vec<_>>());
+
+        for _ in 0..64 {
+            let lease = archive.lease(&entry.id).unwrap();
+            assert_eq!(archive.leases(&entry.id), 1);
+            drop(lease);
+        }
+        assert_eq!(archive.leases(&entry.id), 0);
+
+        // A guard can outlive the Archive: dropping it must not panic or leak into a reopened store.
+        let lease = archive.lease(&entry.id).unwrap();
+        drop(archive);
+        drop(lease);
+
+        let mut archive = Archive::open(config(dir)).unwrap();
+        assert_eq!(archive.leases(&entry.id), 0);
+        assert_eq!(archive.delete(&entry.id).unwrap(), entry.bytes);
+        assert!(archive.list(None, 0).is_empty());
+    }
+
+    #[test]
+    fn policy_is_off_by_default_and_round_trips() {
+        let tmp = TempDir::new("policy");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        assert_eq!(archive.policy(), (0, 0, 0));
+        archive.set_policy(86_400_000, 1 << 30, 1 << 28);
+        assert_eq!(archive.policy(), (86_400_000, 1 << 30, 1 << 28));
+        archive.set_policy(0, 0, 0);
+        assert_eq!(archive.policy(), (0, 0, 0));
+    }
+
+    #[test]
+    fn ttl_evicts_expired_and_keeps_fresh() {
+        let tmp = TempDir::new("ttl");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let old = save(&mut archive, 1, &(1..=6).collect::<Vec<_>>());
+        let fresh = save(&mut archive, 1, &(20..=25).collect::<Vec<_>>());
+        archive.set_policy(1_000, 0, 0);
+        let now = now_ms();
+        set_last_used(&mut archive, &old.id, now.saturating_sub(10_000));
+        set_last_used(&mut archive, &fresh.id, now.saturating_sub(100));
+
+        let report = archive.gc().unwrap();
+        assert_eq!((report.evicted, report.expired), (1, 1), "{report:?}");
+        assert!(report.freed_bytes >= old.bytes);
+        assert!(!old.file.exists(), "the expired file must be removed");
+        assert!(fresh.file.exists(), "the fresh entry must survive");
+        assert_eq!(archive.stats().expired, 1);
+        assert_eq!(archive.list(None, 0).len(), 1);
+
+        // A `last_used_ms` in the future (clock skew) must not expire or panic.
+        set_last_used(&mut archive, &fresh.id, now.saturating_add(1_000_000));
+        let report = archive.gc().unwrap();
+        assert_eq!((report.evicted, report.expired), (0, 0));
+        assert!(fresh.file.exists());
+    }
+
+    #[test]
+    fn ttl_zero_is_off() {
+        let tmp = TempDir::new("ttl-off");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let entry = save(&mut archive, 1, &(1..=6).collect::<Vec<_>>());
+        set_last_used(&mut archive, &entry.id, 0);
+        let report = archive.gc().unwrap();
+        assert_eq!((report.evicted, report.expired), (0, 0));
+        assert_eq!(archive.stats().expired, 0);
+        assert!(entry.file.exists());
+        assert_eq!(archive.stats().entries, 1);
+    }
+
+    #[test]
+    fn per_key_quota_evicts_only_that_owner() {
+        let tmp = TempDir::new("perkey");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let a1 = save(&mut archive, 1, &(1..=10).collect::<Vec<_>>());
+        std::thread::sleep(Duration::from_millis(2));
+        let a2 = save(&mut archive, 1, &(21..=30).collect::<Vec<_>>());
+        // Owner 0 is a normal bucket, not a special case.
+        let b1 = save(&mut archive, 0, &(41..=50).collect::<Vec<_>>());
+        assert_eq!(a1.bytes, a2.bytes);
+
+        // Room for two entries per owner: the third owner-1 save evicts owner 1's oldest entry only.
+        archive.set_policy(0, a1.bytes * 2 + 26, 0);
+        std::thread::sleep(Duration::from_millis(2));
+        let a3 = save(&mut archive, 1, &(61..=70).collect::<Vec<_>>());
+
+        let ids: Vec<String> = archive.list(None, 0).into_iter().map(|e| e.id).collect();
+        assert!(ids.contains(&a2.id), "{ids:?}");
+        assert!(ids.contains(&a3.id), "{ids:?}");
+        assert!(ids.contains(&b1.id), "owner 0 must be untouched: {ids:?}");
+        assert!(!ids.contains(&a1.id), "the oldest owner-1 entry must go: {ids:?}");
+        assert!(!a1.file.exists());
+        assert!(a2.file.exists() && b1.file.exists());
+        assert_eq!(archive.list(Some(0), 0).len(), 1);
+    }
+
+    #[test]
+    fn per_key_quota_boundary_and_oversize_entry() {
+        let tmp = TempDir::new("perkey-boundary");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let a1 = save(&mut archive, 1, &(1..=10).collect::<Vec<_>>());
+        std::thread::sleep(Duration::from_millis(2));
+        let a2 = save(&mut archive, 1, &(21..=30).collect::<Vec<_>>());
+        let size = a1.bytes;
+        assert_eq!(a2.bytes, size);
+
+        // Exactly at the quota: both entries fit (`>` not `>=`).
+        archive.set_policy(0, size * 2, 0);
+        assert_eq!(archive.stats().entries, 2);
+        assert!(a1.file.exists() && a2.file.exists());
+
+        // The new entry makes the owner exceed the quota by exactly one entry; evicting the oldest brings
+        // the bucket back to exactly the quota, which is allowed.
+        std::thread::sleep(Duration::from_millis(2));
+        let a3 = save(&mut archive, 1, &(41..=50).collect::<Vec<_>>());
+        assert!(!a1.file.exists(), "the oldest entry must be evicted");
+        assert!(a2.file.exists() && a3.file.exists());
+
+        // One byte under two entries: the owner cannot keep two, so both older entries go.
+        archive.set_policy(0, size * 2 - 1, 0);
+        std::thread::sleep(Duration::from_millis(2));
+        let a4 = save(&mut archive, 1, &(51..=60).collect::<Vec<_>>());
+        let owner_entries = archive.list(Some(1), 0);
+        assert_eq!(owner_entries.len(), 1, "{owner_entries:?}");
+        assert_eq!(owner_entries[0].id, a4.id);
+        assert!(!a2.file.exists() && !a3.file.exists());
+
+        // An entry that alone exceeds the quota is rejected and its file deleted.
+        archive.set_policy(0, size - 1, 0);
+        let tokens: Vec<u32> = (61..=70).collect();
+        let (id, path) = match archive.prepare_save(9, &tokens, FP, "test").unwrap() {
+            SaveSlot::New { id, path } => (id, path),
+            SaveSlot::Existing(_) => panic!("expected New"),
+        };
+        write_slot(&path, 9, FP, &tokens);
+        let err = archive
+            .commit_save(&id, &path, 9, &tokens, FP, "test")
+            .unwrap_err();
+        assert!(err.to_string().contains("per-owner quota"), "{err}");
+        assert!(!path.exists(), "the rejected file must be deleted");
+        assert!(archive.list(Some(9), 0).is_empty());
+    }
+
+    #[test]
+    fn per_key_quota_protects_pinned_and_leased() {
+        let tmp = TempDir::new("perkey-protected");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let a1 = save(&mut archive, 1, &(1..=10).collect::<Vec<_>>());
+        std::thread::sleep(Duration::from_millis(2));
+        let a2 = save(&mut archive, 1, &(21..=30).collect::<Vec<_>>());
+        std::thread::sleep(Duration::from_millis(2));
+        let a3 = save(&mut archive, 1, &(41..=50).collect::<Vec<_>>());
+        let size = a1.bytes;
+
+        archive.set_pinned(&a1.id, true).unwrap();
+        let lease = archive.lease(&a2.id).unwrap();
+        // Three entries fill the quota; a fourth must evict only the unpinned, unleased one.
+        archive.set_policy(0, size * 3, 0);
+        std::thread::sleep(Duration::from_millis(2));
+        let a4 = save(&mut archive, 1, &(61..=70).collect::<Vec<_>>());
+        assert!(a1.file.exists() && a2.file.exists() && a4.file.exists());
+        assert!(!a3.file.exists(), "only the unprotected entry may be evicted");
+
+        // With every remaining entry protected, a new save fails clearly instead of breaking the quota.
+        let a4_lease = archive.lease(&a4.id).unwrap();
+        archive.set_policy(0, size * 2, 0);
+        let tokens: Vec<u32> = (81..=90).collect();
+        let (id, path) = match archive.prepare_save(1, &tokens, FP, "test").unwrap() {
+            SaveSlot::New { id, path } => (id, path),
+            SaveSlot::Existing(_) => panic!("expected New"),
+        };
+        write_slot(&path, 1, FP, &tokens);
+        let err = archive
+            .commit_save(&id, &path, 1, &tokens, FP, "test")
+            .unwrap_err();
+        assert!(err.to_string().contains("pinned or leased"), "{err}");
+        assert!(!path.exists());
+        assert_eq!(archive.stats().entries, 3);
+        drop((lease, a4_lease));
+    }
+
+    #[test]
+    fn per_key_quota_still_enforces_the_global_budget() {
+        let tmp = TempDir::new("perkey-global");
+        let dir = tmp.path();
+        let mut cfg = config(dir);
+        cfg.budget_bytes = RESERVE_BYTES + 400;
+        let mut archive = Archive::open(cfg).unwrap();
+        archive.set_policy(0, 1 << 30, 0);
+        let mut saved = Vec::new();
+        for i in 0..6u32 {
+            let tokens: Vec<u32> = (0..10).map(|j| i * 1000 + j + 1).collect();
+            std::thread::sleep(Duration::from_millis(2));
+            saved.push(save(&mut archive, 1, &tokens));
+        }
+        assert!(archive.stats().bytes <= 400, "{:?}", archive.stats());
+        assert!(archive.stats().evictions > 0);
+        assert!(archive.list(None, 0).iter().any(|e| e.id == saved[5].id));
+        assert!(archive.list(None, 0).iter().all(|e| e.id != saved[0].id));
+    }
+
+    #[test]
+    fn pin_persists_across_open() {
+        let tmp = TempDir::new("pin-persist");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let a = save(&mut archive, 1, &(1..=6).collect::<Vec<_>>());
+        let b = save(&mut archive, 1, &(20..=25).collect::<Vec<_>>());
+        assert_eq!(archive.pinned_bytes(), 0);
+        archive.set_pinned(&a.id, true).unwrap();
+        assert_eq!(archive.pinned_bytes(), a.bytes);
+        // Idempotent: pinning twice must not double-count.
+        archive.set_pinned(&a.id, true).unwrap();
+        assert_eq!(archive.pinned_bytes(), a.bytes);
+        drop(archive);
+
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let entries = archive.list(None, 0);
+        assert!(entries.iter().find(|e| e.id == a.id).unwrap().pinned);
+        assert!(!entries.iter().find(|e| e.id == b.id).unwrap().pinned);
+        assert_eq!(archive.pinned_bytes(), a.bytes);
+
+        archive.set_pinned(&a.id, false).unwrap();
+        assert_eq!(archive.pinned_bytes(), 0);
+        drop(archive);
+        let archive = Archive::open(config(dir)).unwrap();
+        assert!(!archive.list(None, 0).iter().any(|e| e.pinned));
+        assert_eq!(archive.pinned_bytes(), 0);
+    }
+
+    #[test]
+    fn pin_cap_is_enforced_and_unpin_always_works() {
+        let tmp = TempDir::new("pin-cap");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let a = save(&mut archive, 1, &(1..=6).collect::<Vec<_>>());
+        let b = save(&mut archive, 1, &(20..=25).collect::<Vec<_>>());
+        archive.set_policy(0, 0, a.bytes + 10);
+        archive.set_pinned(&a.id, true).unwrap();
+        assert_eq!(archive.pinned_bytes(), a.bytes);
+
+        let err = archive.set_pinned(&b.id, true).unwrap_err();
+        assert!(err.to_string().contains("pin cap"), "{err}");
+        assert!(!archive.list(None, 0).iter().find(|e| e.id == b.id).unwrap().pinned);
+        assert_eq!(archive.pinned_bytes(), a.bytes);
+
+        // Unpinning is never blocked, even by a cap smaller than the current pinned total.
+        archive.set_policy(0, 0, 1);
+        archive.set_pinned(&a.id, false).unwrap();
+        assert_eq!(archive.pinned_bytes(), 0);
+        assert!(archive.set_pinned(&b.id, true).is_err());
+
+        // Zero means unlimited.
+        archive.set_policy(0, 0, 0);
+        archive.set_pinned(&b.id, true).unwrap();
+        assert_eq!(archive.pinned_bytes(), b.bytes);
+
+        assert!(archive.set_pinned("no-such-entry", true).is_err());
+    }
+
+    #[test]
+    fn pinned_survives_gc_and_ttl() {
+        let tmp = TempDir::new("pin-gc");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let entry = save(&mut archive, 1, &(1..=6).collect::<Vec<_>>());
+        archive.set_pinned(&entry.id, true).unwrap();
+        archive.set_policy(1_000, 0, 0);
+        set_last_used(&mut archive, &entry.id, 0);
+
+        let report = archive.gc().unwrap();
+        assert_eq!((report.evicted, report.expired), (0, 0));
+        assert!(entry.file.exists());
+        assert_eq!(archive.stats().entries, 1);
+
+        // A pin also protects the entry from budget pressure, even when it is over budget by itself.
+        drop(archive);
+        let mut cfg = config(dir);
+        cfg.budget_bytes = RESERVE_BYTES + 1;
+        let mut archive = Archive::open(cfg).unwrap();
+        let report = archive.gc().unwrap();
+        assert_eq!(report.evicted, 0);
+        assert_eq!(archive.stats().entries, 1);
+        assert!(entry.file.exists());
+    }
+
+    /// Build a v2 entry without a GPU: 4-token segments with a deterministic payload and a `STRSTATE` state file.
+    /// The payload is not a real `STRRSEG`; these tests only exercise the archive/format layer.
+    fn v2_entry(archive: &mut Archive, owner: u64, tokens: &[u32], reason: &str) -> ArchiveEntry {
+        let prefix = prefix_hash(tokens);
+        let id = id_for(FP, owner, tokens.len(), prefix);
+        let mut parent: Option<String> = None;
+        let mut refs = Vec::new();
+        let mut new_bytes = 0u64;
+        for (index, chunk) in tokens.chunks(4).enumerate() {
+            let start = index * 4;
+            let end = start + chunk.len();
+            let expected_id = slot_segments::segment_id(FP, parent.as_deref(), chunk);
+            let existed = archive.segments.contains(&expected_id);
+            let payload: Vec<u8> = chunk.iter().flat_map(|t| t.to_le_bytes()).collect();
+            let segment = archive
+                .segments
+                .put(FP, parent.as_deref(), chunk, &payload)
+                .unwrap();
+            if !existed {
+                new_bytes = new_bytes.saturating_add(segment.bytes);
+            }
+            refs.push(SegmentRef { id: segment.id.clone(), start, end });
+            parent = Some(segment.id);
+        }
+        let path = state_path(&archive.cfg.dir, &id).unwrap();
+        let state_bytes = write_state_file_atomic(
+            &path,
+            &StateHeader { fingerprint: FP, owner, rope_offset: 0, n_tokens: tokens.len() },
+            tokens,
+            b"test-recurrent-payload",
+        )
+        .unwrap();
+        let now = now_ms();
+        let entry = ArchiveEntry {
+            id: id.clone(),
+            file: path.clone(),
+            state_file: Some(path),
+            segments: refs,
+            bytes: state_bytes.saturating_add(new_bytes),
+            n_tokens: tokens.len(),
+            owner,
+            fingerprint: FP,
+            prefix_hash: prefix,
+            created_ms: now,
+            last_used_ms: now,
+            parent: None,
+            pinned: false,
+            reason: reason.to_string(),
+            format: 2,
+        };
+        archive.entries.insert(id, entry.clone());
+        archive.persist().unwrap();
+        entry
+    }
+
+    #[test]
+    fn state_file_round_trip_and_header_validation() {
+        let tmp = TempDir::new("state");
+        let dir = tmp.path();
+        let path = dir.join("ab").join("entry.state");
+        let tokens: Vec<u32> = (1..=17).collect();
+        let payload = b"opaque recurrent payload".to_vec();
+        let header = StateHeader { fingerprint: FP, owner: 0x1234, rope_offset: -7, n_tokens: tokens.len() };
+        let bytes = write_state_file_atomic(&path, &header, &tokens, &payload).unwrap();
+        assert_eq!(bytes, fs::metadata(&path).unwrap().len());
+        assert_eq!(read_state_tokens(&path).unwrap(), tokens);
+        let (got, got_tokens, got_payload) = read_state_file(&path).unwrap();
+        assert_eq!(got, header);
+        assert_eq!(got_tokens, tokens);
+        assert_eq!(got_payload, payload);
+
+        // A wrong token count in the header is refused before anything is written.
+        let bad = StateHeader { n_tokens: tokens.len() + 1, ..header };
+        assert!(write_state_file_atomic(&dir.join("bad.state"), &bad, &tokens, &payload).is_err());
+        assert!(!dir.join("bad.state").exists());
+
+        let raw = fs::read(&path).unwrap();
+        assert_eq!(&raw[..8], &STATE_MAGIC);
+    }
+
+    #[test]
+    fn state_file_rejects_corrupt_headers_and_lengths() {
+        let tmp = TempDir::new("state-corrupt");
+        let dir = tmp.path();
+        let path = dir.join("entry.state");
+        let tokens: Vec<u32> = (1..=9).collect();
+        let header = StateHeader { fingerprint: FP, owner: 1, rope_offset: 0, n_tokens: tokens.len() };
+        write_state_file_atomic(&path, &header, &tokens, b"payload").unwrap();
+        let good = fs::read(&path).unwrap();
+
+        let mut bad = good.clone();
+        bad[0] ^= 0xff;
+        fs::write(&path, &bad).unwrap();
+        let err = read_state_tokens(&path).unwrap_err();
+        assert!(format!("{err:#}").contains("magic"), "{err:#}");
+
+        let mut bad = good.clone();
+        bad[8..12].copy_from_slice(&(STATE_VERSION + 1).to_le_bytes());
+        fs::write(&path, &bad).unwrap();
+        let err = read_state_tokens(&path).unwrap_err();
+        assert!(format!("{err:#}").contains("version"), "{err:#}");
+
+        // n_tokens = 0 and a token count that disagrees with the file length.
+        let mut bad = good.clone();
+        bad[32..36].copy_from_slice(&0u32.to_le_bytes());
+        fs::write(&path, &bad).unwrap();
+        assert!(read_state_tokens(&path).is_err());
+
+        let mut bad = good.clone();
+        bad[32..36].copy_from_slice(&(tokens.len() as u32 + 1).to_le_bytes());
+        fs::write(&path, &bad).unwrap();
+        assert!(read_state_tokens(&path).is_err());
+
+        let mut bad = good.clone();
+        bad.push(0);
+        fs::write(&path, &bad).unwrap();
+        let err = read_state_file(&path).unwrap_err();
+        assert!(format!("{err:#}").contains("bytes"), "{err:#}");
+
+        fs::write(&path, &good[..good.len() - 1]).unwrap();
+        assert!(read_state_file(&path).is_err());
+    }
+
+    #[test]
+    fn v2_manifest_round_trip_and_v1_backcompat() {
+        let tmp = TempDir::new("v2-manifest");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let v1 = save(&mut archive, 1, &(1..=6).collect::<Vec<_>>());
+        // A persisted v1 row has neither v2 field.
+        let json = manifest_json(dir);
+        assert!(json["entries"].as_array().unwrap().iter().all(|row| row.get("segments").is_none()));
+        assert!(json["entries"].as_array().unwrap().iter().all(|row| row.get("state_file").is_none()));
+
+        let tokens: Vec<u32> = (1..=13).collect();
+        let v2 = v2_entry(&mut archive, 2, &tokens, "segmented");
+        assert_eq!(v2.format, 2);
+        assert_eq!(v2.segments.len(), 4);
+        assert_eq!(v2.segments.iter().map(|s| s.end - s.start).sum::<usize>(), tokens.len());
+        let json = manifest_json(dir);
+        let row = json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == v2.id)
+            .unwrap();
+        assert_eq!(row["format"], 2);
+        assert_eq!(row["segments"].as_array().unwrap().len(), 4);
+        assert!(row["state_file"].as_str().unwrap().ends_with(".state"));
+        drop(archive);
+
+        let archive = Archive::open(config(dir)).unwrap();
+        let entries = archive.list(None, 0);
+        assert_eq!(entries.len(), 2);
+        let loaded = entries.iter().find(|e| e.id == v2.id).unwrap();
+        assert_eq!(loaded.segments, v2.segments);
+        assert_eq!(loaded.state_file, v2.state_file);
+        assert_eq!(loaded.bytes, v2.bytes);
+        assert!(entries.iter().any(|e| e.id == v1.id && e.format == 1));
+    }
+
+    #[test]
+    fn entry_token_reader_handles_v1_and_v2() {
+        let tmp = TempDir::new("tokens");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let v1_tokens: Vec<u32> = (10..=18).collect();
+        let v1 = save(&mut archive, 1, &v1_tokens);
+        assert_eq!(read_entry_tokens(&v1).unwrap(), v1_tokens);
+        let v2_tokens: Vec<u32> = (30..=39).collect();
+        let v2 = v2_entry(&mut archive, 1, &v2_tokens, "segmented");
+        assert_eq!(read_entry_tokens(&v2).unwrap(), v2_tokens);
+
+        let missing = ArchiveEntry { state_file: None, ..v2.clone() };
+        assert!(read_entry_tokens(&missing).is_err(), "a v2 entry without a state file must not silently read file");
+    }
+
+    #[test]
+    fn lookup_and_longest_prefix_see_v2_entries() {
+        let tmp = TempDir::new("v2-lookup");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let tokens: Vec<u32> = (1..=20).collect();
+        let short = v2_entry(&mut archive, 3, &tokens[..8], "segmented");
+        let long = v2_entry(&mut archive, 3, &tokens[..16], "segmented");
+
+        let hit = archive.lookup(3, &tokens, 20, FP, 100).unwrap().unwrap();
+        assert_eq!(hit.id, long.id);
+        assert_eq!(hit.format, 2);
+        // Exact token proof comes from the state file: a change inside the saved prefix rejects the entry.
+        let mut changed = tokens.clone();
+        changed[3] = 999;
+        assert!(archive.lookup(3, &changed, 20, FP, 100).unwrap().is_none());
+        let mut after = tokens.clone();
+        after[10] = 999;
+        assert_eq!(archive.lookup(3, &after, 20, FP, 100).unwrap().unwrap().id, short.id);
+        assert_eq!(archive.longest_prefix(3, &tokens, FP).unwrap().id, long.id);
+    }
+
+    #[test]
+    fn delete_v2_releases_only_its_own_segment_refs() {
+        let tmp = TempDir::new("v2-delete");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let tokens: Vec<u32> = (1..=20).collect();
+        let first = v2_entry(&mut archive, 1, &tokens[..12], "segmented");
+        let second = v2_entry(&mut archive, 1, &tokens[..20], "segmented");
+
+        // The first three 4-token segments are shared by both entries.
+        let shared: Vec<String> = first.segments.iter().map(|s| s.id.clone()).collect();
+        for id in &shared {
+            let refs = archive.segments.segment(id).unwrap().refs;
+            assert_eq!(refs, 2, "segment {id} must be referenced by both entries");
+        }
+        let files: Vec<PathBuf> = shared
+            .iter()
+            .map(|id| archive.segments.segment(id).unwrap().file.clone())
+            .collect();
+        let freed = archive.delete(&first.id).unwrap();
+        assert_eq!(freed, first.bytes);
+        assert!(!first.state_file.as_ref().unwrap().exists());
+        assert_eq!(archive.stats().entries, 1);
+        for (id, file) in shared.iter().zip(&files) {
+            assert_eq!(archive.segments.segment(id).unwrap().refs, 1, "{id}");
+            assert!(file.exists(), "a shared segment must survive its first entry");
+        }
+        let tail: Vec<String> = second.segments[3..].iter().map(|s| s.id.clone()).collect();
+        assert_eq!(tail.len(), 2);
+        assert!(tail.iter().all(|id| archive.segments.contains(id)));
+
+        archive.delete(&second.id).unwrap();
+        assert!(archive.segments.list().is_empty(), "all refs released");
+        assert!(files.iter().all(|file| !file.exists()));
+        drop(archive);
+        let archive = Archive::open(config(dir)).unwrap();
+        assert!(archive.segments().list().is_empty());
+        assert_eq!(archive.stats().entries, 0);
+    }
+
+    #[test]
+    fn open_reconciles_segment_refs_after_a_manifest_rebuild() {
+        let tmp = TempDir::new("v2-reconcile");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let tokens: Vec<u32> = (1..=20).collect();
+        let first = v2_entry(&mut archive, 1, &tokens[..12], "segmented");
+        let second = v2_entry(&mut archive, 1, &tokens[..20], "segmented");
+        let shared = second.segments[0].id.clone();
+        let shared_file = archive.segments.segment(&shared).unwrap().file.clone();
+        assert_eq!(archive.segments.segment(&shared).unwrap().refs, 2);
+        drop(archive);
+
+        // A rebuild can only adopt each file with refs = 1; opening the archive must restore the true counts
+        // from the entries, or deleting one entry would remove a shared file still used by the other.
+        fs::write(dir.join(slot_segments::MANIFEST), b"{ not json").unwrap();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        assert_eq!(archive.stats().entries, 2);
+        assert_eq!(archive.segments.segment(&shared).unwrap().refs, 2);
+        archive.delete(&first.id).unwrap();
+        assert_eq!(archive.segments.segment(&shared).unwrap().refs, 1);
+        assert!(shared_file.exists());
+        archive.delete(&second.id).unwrap();
+        assert!(archive.segments().list().is_empty());
+        assert!(!shared_file.exists());
+    }
+
+    #[test]
+    fn gc_and_open_drop_invalid_v2_entries() {
+        let tmp = TempDir::new("v2-invalid");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let entry = v2_entry(&mut archive, 1, &(1..=12).collect::<Vec<_>>(), "segmented");
+        let segment_id = entry.segments[1].id.clone();
+        let segment_file = archive.segments.segment(&segment_id).unwrap().file.clone();
+        drop(archive);
+
+        // A corrupt segment is dropped by the store at open; the entry then loses a referenced segment.
+        let mut raw = fs::read(&segment_file).unwrap();
+        raw[0] ^= 0xff;
+        fs::write(&segment_file, &raw).unwrap();
+        let archive = Archive::open(config(dir)).unwrap();
+        assert_eq!(archive.stats().entries, 0, "an entry with a bad segment must be dropped");
+        assert!(!segment_file.exists(), "the corrupt segment file is removed");
+        assert!(archive.segments().list().is_empty(), "the dropped entry released its refs");
+
+        // A missing state file is dropped at open and releases the segments it referenced.
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let entry = v2_entry(&mut archive, 2, &(100..=112).collect::<Vec<_>>(), "segmented");
+        assert_eq!(archive.segments.list().len(), 4);
+        fs::remove_file(entry.state_file.as_ref().unwrap()).unwrap();
+        drop(archive);
+        let archive = Archive::open(config(dir)).unwrap();
+        assert_eq!(archive.stats().entries, 0);
+        assert!(archive.segments().list().is_empty());
+
+        // GC also evicts a v2 entry whose segment file disappeared while the process was running.
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let entry = v2_entry(&mut archive, 3, &(200..=212).collect::<Vec<_>>(), "segmented");
+        let gone = archive.segments.segment(&entry.segments[0].id).unwrap().file.clone();
+        fs::remove_file(&gone).unwrap();
+        let report = archive.gc().unwrap();
+        assert_eq!(report.evicted, 1);
+        assert_eq!(archive.stats().entries, 0);
+        assert!(!entry.state_file.as_ref().unwrap().exists());
+    }
+
+    #[test]
+    fn v2_open_rejects_mismatched_state_header_and_segment_cover() {
+        let tmp = TempDir::new("v2-header");
+        let dir = tmp.path();
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let entry = v2_entry(&mut archive, 4, &(1..=9).collect::<Vec<_>>(), "segmented");
+
+        // Manifest n_tokens disagrees with the state file.
+        let mut json = manifest_json(dir);
+        let row = json["entries"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|row| row["id"] == entry.id)
+            .unwrap();
+        row["n_tokens"] = serde_json::json!(entry.n_tokens + 1);
+        write_manifest_json(dir, &json);
+        drop(archive);
+        let archive = Archive::open(config(dir)).unwrap();
+        assert_eq!(archive.stats().entries, 0);
+
+        // A non-contiguous segment cover is invalid even when every segment exists.
+        let mut archive = Archive::open(config(dir)).unwrap();
+        let entry = v2_entry(&mut archive, 5, &(20..=29).collect::<Vec<_>>(), "segmented");
+        assert!(!segments_cover(&[], entry.n_tokens));
+        assert!(!segments_cover(&entry.segments[..1], entry.n_tokens));
+        let mut broken = entry.segments.clone();
+        broken[1].start += 1;
+        assert!(!segments_cover(&broken, entry.n_tokens));
+        assert!(segments_cover(&entry.segments, entry.n_tokens));
     }
 }

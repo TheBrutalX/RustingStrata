@@ -98,6 +98,11 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   (default 1024) and `--slot-archive-versions N` (default 1) tune the archive: the logical budget in GiB
   (`N << 30` bytes), the shortest state worth saving, the minimum growth since the last checkpoint, and how many
   entries to keep per lineage.
+- `--slot-archive-ttl DURATION` (default `0`, off), `--slot-archive-per-key-gb N` (default 0, off) and
+  `--slot-archive-pin-gb N` (default 10% of `--slot-archive-gb`; `0` = no cap) add the archive lifecycle:
+  expire unpinned entries idle for longer than DURATION (`30d`, `12h`, `45s`; a plain number is seconds), cap one
+  API-key owner's bytes, and cap what an admin may pin. TTL and lineage pruning are lazy: GC applies them, and a
+  checkpoint prefers expired entries when it needs room; there is no background timer. Pinned entries are exempt.
 - `--rope-scaling none|linear|yarn` changes the RoPE plan, not only the KV size. `yarn` and `linear` need
   `--rope-scale FACTOR` (2 doubles the context); `yarn` also needs `--yarn-orig-ctx N` (the context the model was
   trained on) and takes `--yarn-beta-fast`/`--yarn-beta-slow` (32/1, llama.cpp's defaults). A file that carries
@@ -400,10 +405,17 @@ The match is exact on token ids, within the same model/KV/YaRN/split fingerprint
 not a text-similarity or message-hash cache. The archive is off by default and must be a different directory from
 `--slot-save-path`; the server refuses to start when they resolve to the same one.
 
-- `--slot-archive-gb N`: logical budget for the entry files in GiB (1 GiB = 2^30 bytes), default 50. A
+New checkpoints are **format-2 segmented entries**. The token list and the recurrent/DeltaNet/MTP/PLE/QSA state
+live in a `STRSTATE` file; the attention K/V rows are split into 1024-token content-addressed segments under
+`segments/<2 hex>/<id>.seg`, indexed by `segments.json`. A conversation that grows writes only its new segments,
+and two conversations with the same system prompt/tools/chosen document share the prefix segments. Older
+format-1 `STRATASLOT` entries remain listed and restorable.
+
+- `--slot-archive-gb N`: logical budget for the state files, segment payloads and v1 slot files in GiB
+  (1 GiB = 2^30 bytes), default 50. A segment shared with an older entry is not charged to the newer entry. A
   checkpoint that would exceed `budget - 1 GiB` first prunes unpinned ancestors beyond `--slot-archive-versions`,
   then evicts entries with a foreign fingerprint, then the least-recently-used unpinned entries. It never evicts a
-  pinned entry, but phase 1 has no route that sets `pinned`; that field is reserved.
+  pinned entry; see `action=pin` below.
 - `--slot-archive-min-tokens N`: do not archive a history shorter than this, default 256.
 - `--slot-archive-min-delta N`: do not rewrite a lineage unless it grew by at least this many tokens since the
   longest archived prefix, default 1024.
@@ -411,33 +423,52 @@ not a text-similarity or message-hash cache. The archive is off by default and m
   only under budget pressure or when `POST /slots/archive/gc` runs, so a parent and a continuation coexist while
   there is room. A longer child cannot be rewound to its shorter parent, so raise N when earlier points matter for
   rollback.
+- `--slot-archive-ttl DURATION`: delete unpinned entries unused for longer than this, for example `30d`, `12h`,
+  `15m` or `45s`; a plain number is seconds, and `0` (default) turns the TTL off. The TTL is lazy:
+  `POST /slots/archive/gc` applies it, and a checkpoint prefers expired entries when it needs room; there is no
+  background timer, so an idle entry can outlive it until the next GC. Pinned entries never expire.
+- `--slot-archive-per-key-gb N`: per-owner quota in GiB, default 0 (off). At a checkpoint the owner's least
+  recently used unpinned entries are evicted first; the quota step never touches another owner's entries, and the
+  global budget is enforced afterwards. Owner 0 (no `--api-keys`) is a single bucket. An entry larger than the
+  quota is refused.
+- `--slot-archive-pin-gb N`: cap on the bytes an admin may pin, in GiB. Absent, it is 10% of `--slot-archive-gb`
+  (5 GiB at the default 50); `0` removes the cap. A pin that would exceed it answers `409`. The cap is a safety
+  valve, not a target.
 
-`POST /slots/archive/gc` first drops rows whose file is missing, then applies the same lineage pruning and LRU
-eviction when the archive is over the target. It has no current-fingerprint argument, so foreign entries are
-ordinary LRU candidates there.
+`POST /slots/archive/gc` first drops unpinned entries older than `--slot-archive-ttl`, then rows whose file is
+missing, then applies the same lineage pruning and LRU eviction when the archive is over the target. It has no
+current-fingerprint argument, so foreign entries are ordinary LRU candidates there. TTL and lineage pruning are
+lazy: GC applies them, and a checkpoint only prunes when it needs room. There is no timer, so an idle entry can
+outlive its TTL until the next GC.
 
-`GET /slots/archive` reports the directory, the budget, the bytes in use and one row per entry. Optional `?limit=`
-(maximum rows), `?owner=` (API-key id) and `?fingerprint=` (hex) filter the list; the response never contains token
-text or file paths.
+`GET /slots/archive` reports the directory, the budget, the bytes in use, the bytes held by pinned entries and one
+row per entry. Optional `?limit=` (maximum rows), `?owner=` (API-key id) and `?fingerprint=` (hex) filter the
+list; the response never contains token text or file paths.
 
 ```json
 {
   "dir": "/var/lib/strata/archive",
   "budget_bytes": 53687091200,
   "used_bytes": 12345678901,
+  "pinned_bytes": 0,
   "entries": [
     {"id": "a1b2c3d4e5f60718-0000000000000007-1058-9f3c2a1b4d5e6f70", "owner": 7,
      "n_tokens": 1058, "bytes": 77379688, "created_ms": 1795766400000,
      "last_used_ms": 1795766400000, "pinned": false, "reason": "divergence",
-     "fingerprint": "a1b2c3d4e5f60718"}
+     "fingerprint": "a1b2c3d4e5f60718", "format": 2}
   ]
 }
 ```
 
 - `DELETE /slots/archive/{id}` deletes one entry and answers
-  `{"id": "...", "deleted": true, "freed_bytes": 77379688}`.
+  `{"id": "...", "deleted": true, "freed_bytes": 77379688}`. An entry leased by an in-flight restore answers
+  `409`; retry after that restore completes.
+- `POST /slots/archive/{id}?action=pin|unpin` with `{}` pins or unpins one entry and answers
+  `{"id": "...", "pinned": true}`. A pin protects the entry from the TTL, the budget and lineage pruning, and it
+  survives a restart. Pinning a missing id answers `404`; a pin that would exceed `--slot-archive-pin-gb` answers
+  `409`. The route is admin-only, like the other archive routes.
 - `POST /slots/archive/gc` runs the eviction policy on demand and answers
-  `{"evicted": 3, "freed_bytes": 123}`.
+  `{"evicted": 3, "expired": 1, "freed_bytes": 123}`; `expired` counts the TTL removals included in `evicted`.
 - `POST /slots/{id}?action=checkpoint` with `{}` saves the idle slot now, using the archive budget instead of a
   client filename, and answers `{"id_slot": 0, "id": "...", "n_saved": 1058, "n_written": 77379688,
   "timings": {"save_ms": 83.7}}`. It needs `--slot-archive-dir`, not `--slot-save-path`. Use it before building
@@ -449,14 +480,18 @@ curl -s -X POST -H 'Content-Type: application/json' -d '{}' \
     'http://127.0.0.1:8080/slots/0?action=checkpoint'
 curl -s -X DELETE 'http://127.0.0.1:8080/slots/archive/<id>'
 curl -s -X POST -H 'Content-Type: application/json' -d '{}' \
+    'http://127.0.0.1:8080/slots/archive/<id>?action=pin'
+curl -s -X POST -H 'Content-Type: application/json' -d '{}' \
+    'http://127.0.0.1:8080/slots/archive/<id>?action=unpin'
+curl -s -X POST -H 'Content-Type: application/json' -d '{}' \
     http://127.0.0.1:8080/slots/archive/gc
 ```
 
 - **Owner.** An entry is matched only by a request with the same API-key owner, and a checkpoint records the
   conversation's owner, not the owner of the request that caused an eviction. Without `--api-keys` every request
   has owner 0, so the archive is shared by all clients. With keys, `GET /slots/archive`, `DELETE`,
-  `POST /slots/archive/gc` and `POST /slots/{id}?action=checkpoint` are admin-only: a customer key gets `403`,
-  like the explicit slot routes.
+  `POST /slots/archive/{id}?action=pin|unpin`, `POST /slots/archive/gc` and `POST /slots/{id}?action=checkpoint`
+  are admin-only: a customer key gets `403`, like the explicit slot routes.
 - **Unified KV.** Automatic restore uses a free slot only, never takes a slot a request holds, and never forces.
   If that free slot holds another conversation, the server checkpoints it before the restore overwrites it. If
   the growth would need a non-empty reclaim victim, the server skips the archive hit and prefills normally; that
@@ -470,13 +505,21 @@ curl -s -X POST -H 'Content-Type: application/json' -d '{}' \
 - **Compaction.** A compacted prompt is a summary plus recent messages, generally not a prefix of the old
   conversation, so it still needs a full prefill. The pre-compact entry is for rollback and audit; the compacted
   prompt is prefilled once and checkpointed as a new lineage, and that entry is the fast resume afterwards.
-- **Restart.** The manifest and entries survive a restart, and a continuation restores from disk without the old
-  process. A server stop only keeps states that were checkpointed earlier; phase 1 has no shutdown checkpoint, so
-  a conversation still resident in VRAM at `SIGTERM` is lost unless it was checkpointed explicitly.
-- **Privacy.** An entry is a plaintext `STRATASLOT` file created `0600` in a directory created `0700`. It holds
-  the full token history (prompt, system prompt, tools and generated tokens) and the KV/recurrent state, not a
-  compressed transcript. Treat the directory as a copy of the conversations, keep it off any HTTP-served path,
-  and include it in (or deliberately exclude it from) backups and retention.
+- **Storage and dedup.** A format-2 entry references its ordered segment chain; deleting the entry unrefs those
+  segments, and a segment still referenced by another entry survives. `segments.json` and `segments/` are managed
+  by the server: do not edit them by hand. The budget counts a shared segment once; `bytes` for a new entry is its
+  state file plus the segments it actually created.
+- **Restart.** The manifest, `segments.json`, segment files and entries (including each `pinned` flag) survive a
+  restart, and a continuation restores from disk without the old process. A server stop only keeps states that were
+  checkpointed earlier; phase 2 still has no shutdown checkpoint, so a conversation resident in VRAM at `SIGTERM`
+  is lost unless it was checkpointed explicitly. A lost `manifest.json` can rebuild v1 `.slot` entries only; v2
+  entries are not reconstructible from the segment files alone.
+- **Privacy.** An entry is plaintext: a `STRSTATE` file plus `STRKVSEG` segment files (or a v1 `STRATASLOT` file),
+  all created `0600` in a directory created `0700`. It holds the full token history (prompt, system prompt, tools
+  and generated tokens) and the KV/recurrent state, not a compressed transcript. Segments are shared globally
+  inside the archive directory while entries remain owner-scoped; another key cannot restore an entry it does not
+  own. Treat the directory as a copy of the conversations, keep it off any HTTP-served path, and include it in (or
+  deliberately exclude it from) backups and retention.
 
 Without `--slot-archive-dir`, the archive routes answer `501` and the server behaves exactly as before.
 

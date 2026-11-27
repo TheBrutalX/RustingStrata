@@ -5,8 +5,10 @@ archived conversation. This is the next layer above [SLOT-SAVE.md](SLOT-SAVE.md)
 `STRATASLOT` v1 file and the explicit save/restore API; this one defines the **policy, index, budget and matching**
 that make those files a cache the server manages on its own.
 
-**Status: implemented (phase 1).** The decisions below are the design that the phase-1
-code follows:
+**Status: implemented (phase 1, plus the phase-2 subset).** New archive entries are format-2 segmented entries
+with content-addressed KV segments; leases, TTL, per-key quota and pin/unpin are implemented. v1 entries remain
+readable. The remaining phase-2 work (asynchronous v2 save/restore, shutdown checkpoint, manifest journal) is
+listed below and analysed in [SLOT-ARCHIVE-PHASE2.md](SLOT-ARCHIVE-PHASE2.md). The phase-1 decisions still hold:
 
 - restore is automatic, by **exact token-prefix match** (no conversation id, no client change);
 - checkpoint triggers are **before a slot is freed** and **before a prompt diverges from the slot history**
@@ -15,9 +17,9 @@ code follows:
 
 The existing explicit `--slot-save-path` files remain unchanged. The archive is a second, opt-in directory.
 
-## Implementation status (phase 1)
+## Implementation status
 
-Code:
+Phase-1 code:
 
 - `src/slot_archive.rs`: directory and JSON manifest, startup load/rebuild and orphan adoption, prefix index,
   budget and GC, lazy lineage pruning, owner/fingerprint gates.
@@ -27,24 +29,41 @@ Code:
 - `src/main.rs`: `--slot-archive-*` flags, the checkpoint triggers in single-slot and `--parallel` serving,
   `GET /slots/archive`, `DELETE /slots/archive/{id}`, `POST /slots/archive/gc`,
   `POST /slots/{id}?action=checkpoint`, and the archive metrics.
-- `tools/test_slot_archive.sh`: end-to-end tests for single-slot and `--parallel 2` (divergence/restore, explicit
-  checkpoint, delete, GC, restart, parallel eviction/restore, 501 without the flag).
 
-Verified:
+Phase-2 subset added:
 
-- `cargo check --locked` is clean.
-- `src/slot_archive.rs`: 17 unit tests.
-- GPU helpers: 9 pure `reclaim_plan` tests and the `slot_save_as_records_explicit_owner` GPU test.
-- GPU regression: `slot_` 4/4, `unified_` 2/2, `prefill_cached_reuses_history`, `prefill_matches_reference`.
-- `tools/test_slot_archive.sh`: 76/76 checks (28 single + 10 restart + 21 parallel + 15 parallel-restart + 2
-  no-flag). The parallel run confirms A/B in two slots, C evicting one conversation, the archive entry matching
-  the evicted token count, and a restore from disk after a process restart.
-- Full lib suite: 205/205 (the 17 archive tests and 9 reclaim-plan tests included).
-- Existing explicit slot-save E2E: 43/43, unchanged.
+- `src/slot_segments.rs`: content-addressed KV segment store (`segments.json`, `segments/<2 hex>/<id>.seg`),
+  parent-chain ids, refs/unref, rebuild/reconcile and GC.
+- `src/slot_archive.rs`: `save_segmented` / `restore_segmented`, the `STRSTATE` state file, `STRKVSEG`/`STRRSEG`
+  payloads, per-entry `SegmentRef` lists, `Lease`, TTL, per-key quota, pin/unpin and `pinned_bytes`.
+- `src/gpu_model/slot.rs`: `save_kv_segment` / `restore_kv_segment`, `save_recurrent_to` /
+  `restore_recurrent_from`, `save_slot_to` / `restore_slot_from`, and the bounded async writer/reader
+  (`save_slot_file_async_as`). The v1 async path is used for v1-format restores; v2 saves are synchronous.
+- `src/main.rs`: `--slot-archive-ttl`, `--slot-archive-per-key-gb`, `--slot-archive-pin-gb`,
+  `POST /slots/archive/{id}?action=pin|unpin`, `pinned_bytes`/`expired` output, the lease-aware `DELETE` `409`,
+  and the v2 checkpoint/restore path.
+- `tools/test_slot_archive_dedup.sh`: end-to-end cross-conversation segment sharing, delete-refcount and restart.
 
-Not in phase 1 (see §17): asynchronous host staging and a writer thread, shutdown checkpoint, TTL and per-key
-quotas, explicit multi-version branching (the `--slot-archive-versions` flag exists and prunes lazily), an admin
-pin route, and checkpointing parked host state on LRU eviction.
+Verified on the integration branch:
+
+- `tools/test_slot_archive.sh`: **106/106** checks (28 single + 10 restart + 21 parallel + 15 parallel-restart +
+  30 lifecycle + 2 no-flag). The parallel run confirms A/B in two slots, C evicting one conversation, the archive
+  entry matching the evicted token count, and a restore from disk after a process restart. The lifecycle run
+  covers TTL expiry, pin survival, unpin/expiry and `404` on a deleted id.
+- `tools/test_slot_archive_dedup.sh`: **88/88** (63 full + 25 restart). Shared segment rows report `refs >= 2`;
+  deleting one entry keeps the segments used by the other; the surviving entry still restores with
+  `cached_tokens > 0`; a restart restores again.
+- `tools/test_slot_save.sh`: **43/43**, unchanged explicit save/restore.
+- Full lib suite: **252/252**, including 40 `slot_archive` and 12 `slot_segments` tests.
+- GPU: `slot_archive_` 3/3, `slot_segment_` 2/2, `slot_` suite (async owner/equivalence included), `unified_`,
+  `prefill_cached_reuses_history`, `prefill_matches_reference`.
+- `STRATASLOT` flags are stable across saves (the AUX flag no longer depends on whether `saved` was allocated).
+
+Not in the phase-2 subset (see §17 and [SLOT-ARCHIVE-PHASE2.md](SLOT-ARCHIVE-PHASE2.md)): asynchronous/chunked
+v2 save and restore, request-level `saving`/`restoring` states and scheduler interleaving, a shutdown checkpoint,
+manifest journal/batching, v2 rebuild after manifest loss, multi-version branching, and checkpointing parked host
+state on LRU eviction. The v1 async writer/reader API exists, but an automatic v2 checkpoint still holds the
+archive mutex and the model thread.
 
 ## 1. Goal
 
@@ -61,11 +80,14 @@ context, or stopping work for the night should not throw away a prefill that too
 
 ## 2. Non-goals
 
-- Binary compatibility with llama.cpp `.slot` files. The format stays `STRATASLOT` v1, as in SLOT-SAVE.
+- Binary compatibility with llama.cpp `.slot` files. Explicit `--slot-save-path` files stay `STRATASLOT` v1;
+  new archive entries are format 2 (a `STRSTATE` state file plus `STRKVSEG` segments), and v1 archive entries
+  remain readable.
 - Encryption or compression in v1. Files are plaintext, like the explicit slot files.
 - Saving a slot in the middle of a generation. A checkpoint requires an idle slot whose `pos == history.len()`.
-- Moving a live slot to disk asynchronously in phase 1. A checkpoint blocks the model thread for the copy; the
-  host-staging split is phase 2 (§10.3).
+- Moving a live slot to disk asynchronously in this wave. The v1 async writer/reader exists, but an automatic v2
+  checkpoint is synchronous and blocks the model thread; the chunked v2 path is the remaining phase-2 work
+  (§10.3).
 - Cross-model or cross-KV restore. The fingerprint still decides compatibility.
 - A UI for browsing or editing archive entries. The HTTP metadata/delete API is enough for v1.
 - Sharing entries between API keys by default. Entries are owner-scoped (§15).
@@ -92,16 +114,23 @@ What phase 1 added:
 - `GET /slots/archive`, `DELETE`, manual GC, `POST action=checkpoint` and archive metrics;
 - best-effort restore: a missing, corrupt, foreign or owner-mismatched entry falls back to normal prefill.
 
-Still phase 2 (or later): a background writer and asynchronous host staging, a shutdown checkpoint, TTL and
-per-key quotas, an admin pin route, and multi-version branching.
+What the phase-2 subset added: format-2 segmented entries with content-addressed KV segments and shared prefixes
+(§7.4), entry leases/refcounts, TTL, per-key quota, and the admin pin/unpin route. Still phase 2 (or later): a
+chunked/asynchronous v2 save and restore with scheduler interleaving, a shutdown checkpoint, manifest
+journal/batching, v2 rebuild after manifest loss, and multi-version branching.
 
 ## 4. Terms
 
 - **Working set**: the slots currently resident in VRAM (`GpuModel::slots()`), with their KV and recurrent state.
-- **Archive entry**: one immutable `STRATASLOT` v1 file plus one manifest row.
+- **Archive entry**: one immutable file plus one manifest row. Format 1 is a `STRATASLOT` v1 file; format 2 is a
+  `STRSTATE` state file plus an ordered list of KV segments.
+- **Segment**: a 1024-token content-addressed KV range shared by entries that have the same prefix, stored under
+  `segments/` with a row in `segments.json`.
 - **Checkpoint**: writing the state of an idle slot to the archive.
 - **Prefix match**: an entry's token history is an exact prefix of the request's prompt tokens.
 - **Lineage**: entry B extends entry A when A's history is a prefix of B's history. B's `parent` is A.
+- **Lease**: a transient reference held while a lookup/restore/save is in flight; `DELETE` answers `409` and GC
+  skips a leased entry.
 - **Hit**: a request whose prompt matches an entry and is restored from it.
 - **Fallback**: the normal path, prefill from position 0 (or from whatever RAM prefix exists).
 
@@ -148,7 +177,7 @@ document does not pretend otherwise.
                         |
               archive.checkpoint(slot, reason)
                         |
-          STRATASLOT file + manifest row
+          STRATASLOT v1 file (legacy) or format-2 state + segment chain
                         |
                  budget / GC check
 ```
@@ -157,11 +186,15 @@ Components:
 
 - **`Archive`** (server side): directory, logical budget, manifest and prefix index, owner handling, GC, metrics.
   Owned by `Hosting` and shared with `Sched` (parallel) or `Runner::Gpu` (single slot).
+- **`SegmentStore`**: content-addressed KV segments (`segments.json` + `segments/`), refs/unref, rebuild and GC.
+  It is shared by v2 entries but never exposed over HTTP.
 - **`Sched` / `Runner`**: decide when a slot is about to be lost, call `checkpoint`, and look up an entry before
   admission.
 - **`GpuModel`**: exposes `slot_tokens`, `saved_owner`, `slot_fingerprint`; performs the GPU copies in
-  `save_slot_file` / `restore_slot_file`.
-- **Writer thread** (phase 2): receives a host copy and streams it to disk while the model thread continues.
+  `save_slot_file`/`restore_slot_file` (v1) and `save_kv_segment`/`restore_kv_segment` plus
+  `save_recurrent_to`/`restore_recurrent_from` (v2).
+- **Writer thread**: used by the v1 async save/restore API. Automatic v2 checkpoints are synchronous in this wave;
+  the server's `pending` list and 10 s drain remain for the v1 API.
 
 The archive must not live inside `GpuModel`: the GPU code knows how to copy a slot, not where the cache directory
 is, how much disk it may use or which slot to pick. Triggers and matching belong to the scheduler.
@@ -173,20 +206,28 @@ is, how much disk it may use or which slot to pick. Triggers and matching belong
 ```
 <archive-dir>/manifest.json
 <archive-dir>/manifest.json.tmp.<pid>.<nanos>
-<archive-dir>/<2 hex>/<id>.slot
+<archive-dir>/segments.json
+<archive-dir>/segments.json.tmp.<pid>.<nanos>
+<archive-dir>/<2 hex>/<id>.slot        format 1 (legacy entries)
+<archive-dir>/<2 hex>/<id>.state       format 2 state file
 <archive-dir>/<2 hex>/.<id>.<pid>.<nanos>.tmp
+<archive-dir>/segments/<2 hex>/<id>.seg
+<archive-dir>/segments/<2 hex>/.<id>.*.tmp
 ```
 
 - The two-hex shard is the first byte of the entry id, so one directory does not hold tens of thousands of files.
 - `id` is server-generated: `hex64(fingerprint) + "-" + hex64(owner) + "-" + n_tokens + "-" + hex64(prefix_hash)`.
-  It is stable for the same state, which makes deduplication trivial.
-- Entry files are ordinary `STRATASLOT` v1 files. An operator can copy one into `--slot-save-path` and restore it
-  explicitly, subject to the filename validation of that route.
-- Temp files are created `0600`; the directory is created `0700` if missing.
+  It is stable for the same state, which makes entry-level dedupe trivial.
+- New entries are format 2: an `id.state` file with the token list and recurrent snapshot, plus segment refs in
+  the manifest. v1 `.slot` files remain listed and restorable.
+- A format-2 entry can no longer be copied into `--slot-save-path` as one file, because its KV lives in segments.
+  The explicit v1 files and their restore route are unchanged.
+- Temp files are created `0600`; the directory and segment store are created `0700` if missing.
 
 ### 7.2 Manifest
 
-`manifest.json` is a small JSON object rewritten atomically on change:
+`manifest.json` is a small JSON object rewritten atomically on change. A v1 row has `format: 1` and a `.slot`
+file; a v2 row adds `state_file` and an ordered `segments` array:
 
 ```json
 {
@@ -194,8 +235,10 @@ is, how much disk it may use or which slot to pick. Triggers and matching belong
   "entries": [
     {
       "id": "a1b2c3d4e5f60718-0000000000000007-1058-9f3c2a1b4d5e6f70",
-      "file": "a1/a1b2c3d4e5f60718-....slot",
-      "bytes": 77379688,
+      "file": "a1/a1b2c3d4e5f60718-....state",
+      "state_file": "a1/a1b2c3d4e5f60718-....state",
+      "segments": [{"id": "0123456789abcdef", "start": 0, "end": 1024}],
+      "bytes": 7354321,
       "n_tokens": 1058,
       "owner": 7,
       "fingerprint": "a1b2c3d4e5f60718",
@@ -205,7 +248,7 @@ is, how much disk it may use or which slot to pick. Triggers and matching belong
       "parent": null,
       "pinned": false,
       "reason": "divergence",
-      "format": 1
+      "format": 2
     }
   ]
 }
@@ -213,9 +256,13 @@ is, how much disk it may use or which slot to pick. Triggers and matching belong
 
 Fields:
 
-- `id`: stable identity; also the dedupe key.
-- `file`: path relative to the archive directory; never accepted from a client.
-- `bytes`: apparent file size, used for the budget. `st_blocks` could be used for allocated space; v1 uses `bytes`.
+- `id`: stable identity; also the entry-level dedupe key.
+- `file`: path relative to the archive directory; never accepted from a client. For v2 it points at the same
+  state file as `state_file`.
+- `state_file` (v2): the `STRSTATE` file with the token list and recurrent snapshot.
+- `segments` (v2): ordered `{id, start, end}` refs covering `[0, n_tokens)` contiguously.
+- `bytes`: apparent size used for the logical budget. For v2 it is the state file plus the segment bytes this
+  entry created; shared segments are not charged again. `st_blocks` is not used.
 - `n_tokens`: the entry's history length, i.e. the number of KV rows it restores.
 - `owner`: the **conversation owner**, not the owner of the request that triggered the checkpoint (§9.5).
 - `fingerprint`: the stable `slot_fingerprint` from SLOT-SAVE.
@@ -223,34 +270,39 @@ Fields:
   exact tokens, so a collision wastes a read but cannot select a wrong state.
 - `created_ms`, `last_used_ms`: wall-clock milliseconds; LRU uses `last_used_ms`.
 - `parent`: the longest entry whose history is a prefix of this one, if known; used for lineage pruning.
-- `pinned`: admin protection from GC. GC honors it, but phase 1 has no route that sets it; the pin route is
-  phase 2.
-- `reason`: `divergence`, `evict` or `checkpoint`; a manifest rebuild records `recovered`. `shutdown` is phase 2.
-- `format`: `1`; a future format bump can coexist.
+- `pinned`: admin protection from GC; set by `POST /slots/archive/{id}?action=pin|unpin`.
+- `reason`: `divergence`, `evict` or `checkpoint`; a manifest rebuild records `recovered`. `shutdown` is not
+  emitted because there is no shutdown checkpoint.
+- `format`: `1` or `2`.
 
-`used_bytes` is derived by summing `bytes`; it is not stored, to avoid a second source of truth.
+`used_bytes` is derived by summing `bytes`; it is not stored, to avoid a second source of truth. Segment rows in
+`segments.json` carry their own `bytes`, `n_tokens`, `parent`, `refs` and timestamps.
 
 ### 7.3 Atomicity and startup
 
 - File: the existing save writes a temp file in the destination directory, fsyncs it, then renames it over the
-  target. The archive uses the same path but with a server-generated name.
+  target. The archive uses the same path but with a server-generated name; v2 segments do the same under
+  `segments/`.
 - Manifest: write `manifest.json.tmp.<pid>.<nanos>`, fsync, rename over `manifest.json`, fsync the directory on Unix
-  (best effort elsewhere).
+  (best effort elsewhere). `segments.json` uses the same temp+fsync+rename sequence.
 - Crash windows:
-  - file renamed, manifest not updated: the file is an orphan. At startup it is adopted by reading its header and
-    token list, or deleted if invalid;
+  - file renamed, manifest not updated: the file is an orphan. At startup a v1 `.slot` orphan is adopted by
+    reading its header and token list, or deleted if invalid; a segment orphan is adopted with `refs = 1` and
+    reconciled from the surviving v2 entries. A v2 `.state` orphan is **not** turned back into an entry;
   - manifest updated, file missing: the entry is dropped at startup;
   - temp file left: deleted at startup (no writer survives a restart).
-- Startup validation is cheap: parse the manifest, stat each file, read the `STRATASLOT` header (magic, version,
-  fingerprint, owner, `n_tokens`) and compare it with the manifest row. Full buffer/footer validation stays on
-  restore.
-- A corrupt `manifest.json` is moved aside (`manifest.json.bad.<ts>`) and rebuilt from the files in the shards.
+- Startup validation parses the manifest, stats every file and (v1) reads the `STRATASLOT` header, or (v2) reads
+  the `STRSTATE` header and checks that every referenced segment exists with matching tokens. Full buffer/footer
+  validation stays on restore.
+- A corrupt `manifest.json` is moved aside (`manifest.json.bad.<ts>`) and rebuilt from the v1 `.slot` files in the
+  shards. A v2 entry is not reconstructed from its `.state`/segments after manifest loss; the segment store's own
+  `segments.json` can be rebuilt from `.seg` files, but the entry rows cannot.
 - Entries with a foreign fingerprint are kept (they may be valid after switching back to that model). A save
   under budget pressure evicts them before the least-recently-used entries; manual GC has no current-fingerprint
   argument, so it treats them as ordinary LRU candidates.
 - `manifest.json` rewriting is O(entries). At 10k entries it is about 3 MB; rewriting on checkpoints and GC is
-  acceptable for v1. If it becomes a problem, phase 2 can switch to an append-only journal or SQLite without
-  changing the file format.
+  acceptable now, and the archive does not batch touches or keep a journal. `segments.json` is a second full
+  rewrite. Switching to an append-only journal or SQLite remains open.
 
 ## 8. Matching and automatic restore
 
@@ -274,10 +326,11 @@ lookup(owner, prompt, keep, fingerprint, ctx):
 - Hashing the request prefixes is linear in the prompt length, which tokenization already paid for.
 - Candidates are usually few (tens to hundreds). A bucket by `(fingerprint, owner)` and sorted `n_tokens` keeps the
   scan small; a trie is unnecessary for v1.
-- Exact verification reads only the token list at the start of the slot file (`4 * n_tokens` bytes), not the KV.
-- The file is opened read-only; a lookup reads only its header and token list. Phase 1 has no refcount: an entry
-  deleted between lookup and restore is simply a failed restore and the request falls back to prefill. Refcounting
-  a reader is phase 2.
+- Exact verification reads only the token list at the start of the entry (`4 * n_tokens` bytes): the `STRATASLOT`
+  header for v1, the `STRSTATE` header for v2, not the KV or segments.
+- The file is opened read-only. `lookup_leased` returns a lease that `DELETE` and GC honor, so an entry cannot
+  disappear between lookup and restore. The caller keeps the lease until the restore returns; dropping it early
+  reopens the phase-1 race.
 
 ### 8.2 Slot selection and prefill
 
@@ -407,21 +460,22 @@ when the triggering request belongs to another key. Matching still compares the 
 If the server runs without API keys, every request has owner 0 and the archive is effectively server-wide; document
 this in HOSTING.
 
-### 9.6 Shutdown (phase 2)
+### 9.6 Shutdown (still open)
 
-Phase 1 selected divergence and eviction, not shutdown. Consequence: if the **server process** stops, states
-that were not checkpointed earlier are lost; only the last checkpoint per conversation survives. The overnight
-case works without this trigger if the server stays up and the slot is later reused or diverges.
+Phase 1 selected divergence and eviction, not shutdown, and the phase-2 subset did not add it. Consequence: if the
+**server process** stops, states that were not checkpointed earlier are lost; only the last checkpoint per
+conversation survives. The overnight case works without this trigger if the server stays up and the slot is later
+reused or diverges.
 
-A phase-2 option can cover it:
+A later phase-2 option can cover it:
 
-- `--slot-archive-on-shutdown` (off in phase 1, recommended on for the overnight workflow when added);
+- `--slot-archive-on-shutdown` (does not exist yet; recommended on for the overnight workflow when added);
 - on graceful `SIGTERM`, after the queue drains and before the model is dropped, checkpoint every non-empty slot;
 - `SIGKILL`/crash cannot be covered; the last periodic/triggered checkpoint is the recovery point.
 
 ## 10. Save pipeline
 
-### 10.1 Phase 1: synchronous
+### 10.1 Synchronous (phase 1 and the current v2 path)
 
 1. The scheduler/model thread verifies the slot is idle, not partial and `n_tokens >= min`; an image prompt
    (`rope_offset != 0`) is skipped.
@@ -437,17 +491,22 @@ A phase-2 option can cover it:
 
 The model thread is blocked for the disk copy, as with the explicit save. At 0.5-1 GB/s a 1 GB state costs 1-2 s;
 a 10.9 GB 1M-token state costs 10-20 s. That is acceptable for an admin-style trigger but noticeable on every
-conversation switch. Phase 2 removes the disk part from the model thread.
+conversation switch.
+
+The phase-2 v2 save (`save_segmented`) keeps this synchronous shape: it writes a `STRSTATE` state file and the new
+segments, then rewrites the manifest. It walks every 1024-token chunk and reuses an existing segment instead of
+rewriting it, so disk writes are limited to new segment files, but the GPU copy still covers the whole history.
+The chunked async writer is not used by v2.
 
 ### 10.2 Dirty tracking and dedupe
 
 - If the history is unchanged since the last checkpoint, do nothing.
 - If the new history is an extension of an existing entry for the same lineage and the growth is below
   `--slot-archive-min-delta`, do nothing.
-- Content-addressed ids make a repeated save of the same state a no-op (touch LRU, no disk write).
-- A save that fails leaves the previous entry intact; the temp file is removed.
+- Content-addressed entry ids make a repeated save of the same state a no-op (touch LRU, no disk write).
+- A save that fails leaves the previous entry intact; the temp file is removed and v2 releases its segment refs.
 
-### 10.3 Phase 2: host staging
+### 10.3 Host staging
 
 The GPU→host copy must stay on the model thread because the backend context is not thread-safe and the slot's
 buffers are owned by `GpuModel`. The disk write does not:
@@ -459,8 +518,10 @@ buffers are owned by `GpuModel`. The disk write does not:
 4. On restore, read the file on a request/writer thread, then hand the bytes to the model thread for the H2D copy
    and state install.
 
-This keeps the model stall to the GPU copy. It needs a `Snapshot` representation separate from `save_slot_file`'s
-inline GPU reads; the format and the validation code stay shared.
+**Status:** this is implemented as the v1 async save/restore API (`save_slot_to`/`restore_slot_from`, a
+four-chunk 64 MiB ring, `save_slot_file_async_as`). v1-format archive entries restore through the async reader. The
+v2 segmented path does not use it yet: automatic v2 saves and restores are synchronous, and there is no scheduler
+interleaving.
 
 ### 10.4 Failure and disk-full
 
@@ -478,9 +539,13 @@ inline GPU reads; the format and the validation code stay shared.
 - `--slot-archive-gb N` is GiB (1 GiB = 2^30 bytes). The default is 50 GiB when the archive is enabled; 200 GiB
   is a reasonable large-server value.
 - `used_bytes = sum(entry.bytes)`. The budget is logical, with 1 GiB (`RESERVE_BYTES`) kept free for the temp file
-  and the manifest. The filesystem's free space is a second limit; phase 1 relies on write/ENOSPC handling rather
+  and the manifest. The filesystem's free space is a second limit; the code relies on write/ENOSPC handling rather
   than a `statvfs` check.
-- The budget includes only `*.slot` files; the manifest and temps are negligible but count in the reserve.
+- For v2, an entry's `bytes` is its state file plus the segment bytes that entry created; a segment shared with an
+  older entry is not charged again. Segment space is released when its last reference goes, so `used_bytes` is a
+  logical charge, not a filesystem `du`. Leave disk headroom above the budget.
+- The budget includes the entry files and their segments; the manifests and temps are negligible but count in the
+  reserve.
 
 ### 11.2 Eviction order
 
@@ -494,10 +559,11 @@ A checkpoint that would exceed `budget - 1 GiB` (`commit_save`) evicts in this o
 It never evicts a pinned entry or the entry being written. Deleting a file is best-effort; if unlink fails, keep
 the entry and try the next candidate, then rewrite the manifest after the batch.
 
-`POST /slots/archive/gc` first drops rows whose file is missing, then, when the archive is still over the target,
-applies the same lineage pruning and LRU eviction. GC has no current-fingerprint argument, so foreign-fingerprint
-entries are ordinary LRU candidates there. Phase 1 has no refcount for an entry being restored; a file deleted
-between lookup and restore makes that restore fall back to prefill.
+`POST /slots/archive/gc` first drops unpinned entries older than `--slot-archive-ttl`, then rows whose file (or v2
+segment) is missing, then, when the archive is still over the target, applies the same lineage pruning and LRU
+eviction. GC has no current-fingerprint argument, so foreign-fingerprint entries are ordinary LRU candidates
+there. A leased entry is skipped by GC; `DELETE` answers `409` and the caller retries. Deleting an entry releases
+its segment refs, and the zero-ref segments are removed by the same GC (or at the next open).
 
 ### 11.3 Lineage caveat
 
@@ -509,9 +575,10 @@ is a disk/rollback trade-off:
   earlier points. Pruning is lazy: it runs only under budget pressure or in GC, so a parent and its continuation
   coexist while there is room;
 - `--slot-archive-versions N`: keep up to N entries per lineage, pruned the same way;
-- the `pinned` field protects a specific entry from GC, but phase 1 has no route that sets it; an admin pin route
-  (for a pre-compact checkpoint or a branch point) is phase 2;
-- for the branching use case, phase 2 adds explicit branch ids and multi-version management.
+- the `pinned` field protects a specific entry from GC and TTL; `POST /slots/archive/{id}?action=pin|unpin`
+  sets it (admin-only, persisted in the manifest);
+- explicit branch ids and multi-version management are still open; the pin route covers a pre-compact or branch
+  point in the meantime.
 
 If rollback matters more than disk, raise `N`; do not imply that a longer state can replace a shorter one for time
 travel.
@@ -528,11 +595,15 @@ With q8 KV on the 35B-A3B layout, SLOT-SAVE measures about 10.9 GB per 1M tokens
 | 256k tokens | ~2.8 GB |
 | 1M tokens | ~10.9 GB |
 
-- 200 GiB ≈ 18M archived tokens, about 180 conversations of 100k tokens or 18 of 1M.
+- q8 is the KV figure. q4 halves it to ~5.8 GB/1M and q2 to ~3.9 GB/1M, with different numerics; the fixed
+  ~66 MB recurrent/MTP/PLE/QSA state does not shrink with `--kv`.
+- 200 GiB ≈ 18M archived tokens at q8, about 180 conversations of 100k tokens or 18 of 1M (roughly 34M/52M
+  tokens at q4/q2 before the fixed state).
 - The token history is 4 bytes/token (400 KB for 100k) and the recurrent state is a few MB per slot; both are small
   next to the KV.
-- Lazy lineage pruning, `min-delta` and content-addressed dedupe keep the archive close to "one latest snapshot per
-  conversation" once it is under pressure, rather than one entry per switch.
+- Lazy lineage pruning, `min-delta` and content-addressed segment sharing keep the archive close to "one latest
+  snapshot per conversation" once it is under pressure, rather than one entry per switch. A shared prefix is
+  written once and referenced by every entry with that prefix.
 
 ## 12. CLI and HTTP API
 
@@ -544,12 +615,15 @@ With q8 KV on the 35B-A3B layout, SLOT-SAVE measures about 10.9 GB per 1M tokens
 --slot-archive-min-tokens N   do not archive states shorter than N (default 256)
 --slot-archive-min-delta N    minimum growth since the last checkpoint (default 1024)
 --slot-archive-versions N     keep N entries per lineage (default 1)
+--slot-archive-ttl DURATION   expire unpinned entries idle longer than this (default 0, off)
+--slot-archive-per-key-gb N   per-owner quota in GiB (default 0, off)
+--slot-archive-pin-gb N       cap on pinned bytes (default 10% of the budget; 0 = no cap)
 ```
 
-Phase 2: `--slot-archive-ttl`, `--slot-archive-per-key-gb`, `--slot-archive-on-shutdown`.
-
-The archive and `--slot-save-path` must be different directories; the server refuses to start when they resolve
-to the same directory. Shard names are server-controlled; no client-supplied filename reaches the archive.
+`--slot-archive-on-shutdown` does **not** exist yet; there is no shutdown checkpoint and no `--slot-archive-stage-mb`
+flag (the async ring size is fixed). The archive and `--slot-save-path` must be different directories; the server
+refuses to start when they resolve to the same directory. Shard names are server-controlled; no client-supplied
+filename reaches the archive.
 
 ### 12.2 Routes
 
@@ -562,38 +636,47 @@ All are admin-only, like `/api/load` and the explicit slot routes. Customer keys
     "dir": "/var/lib/strata/archive",
     "budget_bytes": 53687091200,
     "used_bytes": 12345678901,
+    "pinned_bytes": 0,
     "entries": [
       {"id": "...", "owner": 7, "n_tokens": 1058, "bytes": 77379688,
        "created_ms": 1795766400000, "last_used_ms": 1795766400000,
-       "pinned": false, "reason": "divergence", "fingerprint": "..."}
+       "pinned": false, "restoring": false, "reason": "divergence",
+       "fingerprint": "...", "format": 2}
     ]
   }
   ```
 
   Optional `?limit=`, `?owner=` and `?fingerprint=` (hex) filter the list; no token contents and no file paths in
-  the response.
+  the response. `format` tells v1 from v2. `restoring` is a lease-derived approximation (it can also be set by a
+  lookup or save lease), not a request-level slot state.
 
-- `DELETE /slots/archive/{id}` → `{"id": "...", "deleted": true, "freed_bytes": 77379688}`.
-- `POST /slots/archive/gc` → `{"evicted": 3, "freed_bytes": 123}` (manual GC; see §11.2 for how it differs from
-  the pressure path of a save).
+- `DELETE /slots/archive/{id}` → `{"id": "...", "deleted": true, "freed_bytes": 77379688}`. A leased entry
+  answers `409`; retry after the in-flight operation completes.
+- `POST /slots/archive/{id}?action=pin|unpin` → `{"id": "...", "pinned": true}`. A pin protects the entry from
+  the TTL, the budget and lineage pruning; a pin over `--slot-archive-pin-gb` answers `409`, and a missing id
+  answers `404`.
+- `POST /slots/archive/gc` → `{"evicted": 3, "expired": 1, "freed_bytes": 123}` (manual GC; see §11.2 for how it
+  differs from the pressure path of a save).
 - `POST /slots/{id}?action=checkpoint` → `{"id_slot": 0, "id": "...", "n_saved": 1058, "n_written": 77379688,
   "timings": {"save_ms": 83.7}}`. This is the explicit pre-compact/branch checkpoint; it uses the archive budget,
   not a client filename.
 - The existing `POST /slots/{id}?action=save|restore|erase` keep their `--slot-save-path` semantics unchanged.
 
-Route ordering matters: `GET /slots/archive` and `DELETE /slots/archive/...` must be matched before the generic
+Route ordering matters: `GET /slots/archive` and the `/slots/archive/...` routes must be matched before the generic
 `POST /slots/{id}` parser, otherwise `archive` fails to parse as an id.
 
 ### 12.3 Metrics and logs
 
 Prometheus text at `/metrics`, JSON at `/api/stats` (under `archive`):
 
-- `strata_slot_archive_entries`, `strata_slot_archive_bytes`, `strata_slot_archive_budget_bytes`;
+- `strata_slot_archive_entries`, `strata_slot_archive_bytes`, `strata_slot_archive_budget_bytes`,
+  `strata_slot_archive_pinned_bytes`;
 - `strata_slot_archive_hits_total`, `strata_slot_archive_misses_total`, `strata_slot_archive_restores_total`,
-  `strata_slot_archive_evictions_total`, `strata_slot_archive_failures_total`.
+  `strata_slot_archive_evictions_total`, `strata_slot_archive_expired_total`,
+  `strata_slot_archive_failures_total`.
 
-Phase 1 has no save/restore duration histogram; the explicit checkpoint response reports `timings.save_ms`, and the
-save/restore log lines report their own milliseconds.
+There is no save/restore duration histogram, job/queue/staging metric or GC-reason label; the explicit checkpoint
+response reports `timings.save_ms`, and the save/restore log lines report their own milliseconds.
 
 Logs: a save line has `slot`, `reason`, `n`, `bytes` and `ms`; a restore line has `slot`, `n` and `ms`. Failures log
 the reason but never the prompt text.
@@ -616,12 +699,16 @@ the reason but never the prompt text.
 - Files are plaintext, `0600`, in a `0700` directory. Use full-disk encryption if the host is not trusted.
 - Owner-scoped by default: an entry is only matched by a request with the same API key id. The admin can list
   metadata and delete entries, but HTTP never serves file contents.
+- Segments are **global within the archive directory**: two entries with the same exact prefix share KV bytes even
+  if they belong to different owners. The entry rows and token lists remain owner-scoped, so the shared segment
+  does not let one key restore another key's entry. There is no owner-namespaced dedup mode yet.
 - A checkpoint records `saved_owner`, not the triggering request's owner (§9.5), so a cross-key eviction cannot
   re-label another key's conversation.
 - Without API keys, owner 0 is shared by all requests; the archive is server-wide. Document this in HOSTING.
 - `--slot-archive-gb` and `--slot-archive-min-tokens` bound disk use and the damage of a misbehaving client.
-  TTL and per-key quotas are phase 2.
-- Manifest and filenames are server-generated; no traversal surface. Deletion takes an entry id, never a path.
+  TTL, per-key quota and pin/unpin are implemented.
+- Manifest, segment ids and filenames are server-generated; no traversal surface. Deletion takes an entry id,
+  never a path.
 - Fingerprint checks keep a model/KV/YaRN/split change from restoring incompatible state.
 - Backups: an archive is a copy of user conversations. Include it in retention/purge policy or exclude it
   deliberately, exactly as HOSTING says for explicit slot files.
@@ -629,41 +716,51 @@ the reason but never the prompt text.
 ## 15. Invariants
 
 1. Never restore without an exact token-prefix match, the same fingerprint and the same owner.
-2. Never touch a slot before the file's header, lengths and footer pass validation.
+2. Never touch a slot before the file's header, lengths and footer pass validation (v1), or before the state file
+   and every referenced segment validate (v2).
 3. Never fail an HTTP request because the archive missed, broke, is full or is unmounted.
 4. Never checkpoint a busy slot, a partial state (`pos != history.len()`) or an empty slot.
-5. Never evict a pinned entry. Phase 1 has no reader refcount; if an entry disappears between lookup and restore,
-   that restore falls back to prefill.
+5. Never evict a pinned or leased entry. A lease protects an entry between lookup and the end of its restore; the
+   v2 save also holds the archive lock across its I/O.
 6. File and manifest updates are atomic (temp + fsync + rename); a crash leaves the old entry usable.
 7. A failed restore resets the target slot (existing behavior) and falls back to prefill.
 8. Automatic restore never uses `force` and never takes a slot that a request holds. A non-empty free slot is
    checkpointed before the restore overwrites it.
-9. The archive is content-addressed; saving the same state twice does not duplicate the file.
+9. The archive and its segments are content-addressed; saving the same state twice does not duplicate the entry,
+   and two entries with the same prefix share segment files.
 10. The archive never changes the token stream or the greedy output; it only changes how much is prefilled.
 
 ## 16. Tests
 
-### Unit (`src/slot_archive.rs`, 17 tests)
+### Unit (`src/slot_archive.rs`, 40 tests; `src/slot_segments.rs`, 12 tests)
 
-- manifest round-trip and relative paths; rebuild from orphan files; corrupt manifest moved aside and rebuilt;
+- manifest round-trip and relative paths; rebuild from orphan `.slot` files; corrupt manifest moved aside and
+  rebuilt; v2 rows and `STRSTATE` round-trip; segment refs reconstructed/reconciled;
 - id stability/dedupe; `prepare_save` path and `min_tokens`; newest-used-first listing with a limit;
 - longest exact-prefix lookup and a hash-only false candidate rejected;
-- owner/fingerprint isolation; path escapes rejected; missing files dropped at open;
+- owner/fingerprint isolation; path escapes rejected; missing files or segments dropped at open;
 - budget eviction and an entry that cannot fit; lazy `versions` lineage pruning; delete; GC of missing files then
-  LRU.
+  LRU; TTL, per-key quota, pin/unpin and pin cap;
+- segment `put`/`get` dedupe, refcounts, parent-chain ids, corrupt/truncated rejection, temp cleanup and manifest
+  rebuild;
+- deleting a v2 entry releases only its own segment refs; a shared segment survives until its last entry; a
+  manifest rebuild reconciles refs.
 
 ### GPU helpers and integration
 
 - 9 pure `reclaim_plan` tests in `src/gpu_model.rs` (already fits, one victim, largest first, active excluded,
   cap-one excluded, target excluded, budget exhausted, exact boundary, no unified budget);
 - `slot_save_as_records_explicit_owner`: `save_slot_file_as` writes the explicit owner to the header and saved
-  state and restores the caller's request owner on success and failure.
+  state and restores the caller's request owner on success and failure;
+- KV/recurrent segment header round-trips and rejects bad magic, versions, ranges, counts and lengths;
+- async writer/reader equivalence and the 10 s shutdown drain tests.
 
 ### GPU regression
 
-- `slot_` 4/4 and `unified_` 2/2, plus `prefill_cached_reuses_history` and `prefill_matches_reference`.
+- `slot_archive_` 3/3, `slot_segment_` 2/2, the `slot_` suite (async owner/equivalence included), `unified_`,
+  `prefill_cached_reuses_history` and `prefill_matches_reference`.
 
-### E2E (`tools/test_slot_archive.sh`, 76/76 checks)
+### E2E (`tools/test_slot_archive.sh`, 106/106 checks)
 
 - single-slot divergence: chat A, switch to B, return to A; the divergence entry is listed and the continuation
   restores the archived prefix (`cached_tokens > 0`);
@@ -672,7 +769,18 @@ the reason but never the prompt text.
 - `--parallel 2`: A and B land in different slots, C evicts one conversation, the archive entry matches the
   evicted token count, and after a process restart the evicted continuation restores from disk (`cached_tokens >
   0`);
+- lifecycle: TTL 1 s expires an unpinned entry; a pinned entry survives, then unpin + GC expires it; pinning a
+  deleted id answers `404`; `pinned_bytes` is reported;
 - no `--slot-archive-dir`: `GET /slots/archive` and `action=checkpoint` answer `501`.
+
+### Dedup E2E (`tools/test_slot_archive_dedup.sh`, 88/88 checks)
+
+- three conversations share a long system prompt; the archive ends with at least two format-2 entries;
+- `segments.json` has a row referenced by both entries (`refs >= 2`), the unique segment count is below the sum
+  of per-entry refs, every entry range is contiguous and resolves, and the stored refcount equals the number of
+  referencing entries;
+- both continuations return `cached_tokens > 0`; deleting the older entry leaves the shared segments and the
+  survivor restores; a process restart restores again.
 
 The E2E does not set API keys, so `403` for customer keys and cross-owner isolation are covered by the key guard
 and the unit tests, not by this script. The budget/LRU behavior is covered by the unit tests, not by filling a
@@ -681,8 +789,8 @@ small archive over HTTP.
 ### Performance
 
 No new benchmark numbers are claimed here. The phase-2 evaluation still needs 32k/100k/1M checkpoint and restore
-timings, model-thread stall, lookup cost at 1k/10k entries, manifest load, GC time, and confirmation that the normal
-prefill path is unchanged when the archive is off.
+timings (v1 and v2), model-thread stall, lookup cost at 1k/10k entries, manifest load, GC time, and confirmation
+that the normal prefill path is unchanged when the archive is off.
 
 ## 17. Rollout
 
@@ -701,17 +809,27 @@ Done: matching rule, triggers, budget and owner semantics agreed.
 - synchronous save/restore, full snapshot, no compression;
 - unit/GPU/E2E tests, docs in USAGE/HOSTING, no behavior change without the flag.
 
-### Phase 2 — operational polish
+### Phase 2 — operational polish (subset done)
 
-Detailed analysis and sizing correction: [SLOT-ARCHIVE-PHASE2.md](SLOT-ARCHIVE-PHASE2.md).
+Detailed analysis, status and measured results: [SLOT-ARCHIVE-PHASE2.md](SLOT-ARCHIVE-PHASE2.md).
 
-- host staging + writer thread; restore read on a worker;
-- segment-level deduplication of shared prefixes (content-addressed KV segments, v2 entries);
-- TTL, per-key quota, admin pin route;
+Done in this wave:
+
+- segment-level deduplication of shared prefixes (content-addressed KV segments, format-2 entries, v1 readable);
+- entry leases/refcounts, `DELETE` 409 and GC skipping leased entries;
+- TTL, per-key quota, admin pin/unpin and the pin cap;
+- the split/async GPU core (`save_slot_to`/`restore_slot_from`, bounded writer/reader); v1 entries restore through
+  the async reader;
+- lifecycle/dedup E2E tests and docs.
+
+Still open:
+
+- chunked/asynchronous v2 save and restore, request-level `saving`/`restoring`, scheduler interleaving;
+- a shutdown checkpoint (`--slot-archive-on-shutdown`);
+- manifest journal/batching and v2 rebuild after `manifest.json` loss;
 - multi-version branching and explicit branch ids;
-- park/LRU eviction checkpoints; optional shutdown checkpoint;
-- prompt-cache interaction on restart; manifest journal/SQLite if needed;
-- dashboards/alerts for bytes, hit rate, failures.
+- park/LRU eviction checkpoints; prompt-cache interaction on restart;
+- dashboard/alerting beyond the existing metrics.
 
 ### Phase 3 — scale
 
@@ -726,18 +844,19 @@ Detailed analysis and sizing correction: [SLOT-ARCHIVE-PHASE2.md](SLOT-ARCHIVE-P
    the automatic restore overwrites it; under `--kv-unified`, a restore that would need a non-empty victim is
    skipped and the prompt prefills normally.
 3. **Chosen: keep 1 entry per lineage by default, pruned lazily.** Raise `--slot-archive-versions` for more
-   rollback points. An admin pin route is phase 2.
-4. **Chosen: rewritten JSON manifest for phase 1.** Revisit an append-only journal or SQLite at 10k+ entries.
+   rollback points. The admin pin route is implemented.
+4. **Chosen: rewritten JSON manifest.** It is still a full rewrite, now alongside `segments.json`; an append-only
+   journal or SQLite at 10k+ entries remains open.
 5. Still open: is a conversation id worth adding as an optional hint, even though matching is by tokens? It could
    improve listing and deletion UX, but is not needed for correctness.
-6. **Chosen: no shutdown checkpoint in phase 1.** `--slot-archive-on-shutdown` is a phase-2 option, recommended on
-   for the overnight workflow when it exists.
-7. **Chosen: phase 1 skips image/M-RoPE archive.** The explicit save path already handles image slots; archive
-   support needs an image key.
-8. **Chosen: owner-scoped by default.** An admin-only "shared prefix" mode could improve hit rate for a common
-   system prompt, at a privacy cost; it is still open.
+6. **Chosen: no shutdown checkpoint.** `--slot-archive-on-shutdown` does not exist; it remains recommended for the
+   overnight workflow when added.
+7. **Chosen: skip image/M-RoPE archive.** The explicit save path already handles image slots; archive support
+   needs an image key.
+8. **Chosen: owner-scoped entries with global segment sharing.** An owner-namespaced dedup mode could tighten
+   isolation at a hit-rate cost; it is still open and not implemented.
 
-## 19. Phase 1 acceptance
+## 19. Acceptance (phase 1 and phase-2 subset)
 
 - With `--slot-archive-dir` and no client changes, a conversation that diverges (switch/compact) is checkpointed,
   and a later prompt that continues it is restored with only the suffix prefilled; `cached_tokens` reports the
@@ -748,17 +867,22 @@ Detailed analysis and sizing correction: [SLOT-ARCHIVE-PHASE2.md](SLOT-ARCHIVE-P
   are tested.
 - A missing/corrupt/foreign/owner-mismatched entry falls back to a normal prefill and the request succeeds.
 - A checkpoint records the conversation owner, even when triggered by another key.
-- `GET /slots/archive` and `DELETE` work; customer keys get `403`; metrics expose bytes, entries, hits and
-  failures.
-- Restart keeps the manifest and entries usable; a missing or corrupt manifest is rebuilt from the shard files.
+- `GET /slots/archive` and `DELETE` work; customer keys get `403`; metrics expose bytes, entries, pinned bytes,
+  hits, misses, restores, evictions, expiries and failures.
+- Restart keeps the manifest and entries usable; a missing or corrupt v1-only manifest is rebuilt from the `.slot`
+  files. A v2 entry is not rebuilt from its `.state`/segments after manifest loss.
 - Without `--slot-archive-dir`, the server behaves as before (the archive routes answer `501`).
 - The slot and prefill regressions listed in §16 stay green, and the server behaves as before without
   `--slot-archive-dir`.
 
 ## 20. Compatibility with SLOT-SAVE
 
-- Archive entries are ordinary `STRATASLOT` v1 files. No format change is required for the MVP.
-- The explicit `--slot-save-path` routes, filename validation and response fields are untouched.
-- An operator can copy an archive entry into the explicit save directory and restore it by filename, or use the
-  archive API; the fingerprint rules are the same.
-- A future `STRATASLOT` v2 (checksum, compression) can be introduced behind the same manifest/version field.
+- Explicit `--slot-save-path` entries remain ordinary `STRATASLOT` v1 files.
+- New archive entries use the format-2 layout (a `STRSTATE` state file plus `STRATSEG` segments); v1 archive
+  entries remain readable and restorable.
+- The explicit `--slot-save-path` routes, filename validation and response fields are untouched. A format-2
+  archive entry cannot be copied into `--slot-save-path` as one file because its KV lives in segments.
+- An operator can still copy a v1 archive entry into the explicit save directory and restore it by filename, or
+  use the archive API; the fingerprint rules are the same.
+- A future `STRATASLOT` v2 variant with a checksum or compression can be introduced behind the same manifest
+  `format` field; this wave's format 2 is the segmented archive format, not a new explicit file format.
