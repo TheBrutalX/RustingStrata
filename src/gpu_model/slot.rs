@@ -13,6 +13,16 @@ use std::path::Path;
 /// Bytes copied between the GPU and the host in one `get`/`put`.
 const CHUNK: usize = 64 << 20;
 
+/// Restores the request owner when `save_slot_file_as` finishes or unwinds. The owner field is the caller's
+/// request identity; only the saved state and header carry the explicit conversation owner.
+struct OwnerGuard<'m, 'a> {
+    model: &'m mut GpuModel<'a>,
+    prev: u64,
+}
+impl Drop for OwnerGuard<'_, '_> {
+    fn drop(&mut self) { self.model.owner = self.prev; }
+}
+
 /// A writer that counts the bytes it passes through (the footer stores the payload length).
 struct Count<W> { w: W, n: u64 }
 impl<W> Count<W> {
@@ -43,13 +53,12 @@ impl GpuModel<'_> {
     }
 
     /// `save_slot_file` with an explicit conversation owner. The archive uses `slot_owner` here, not the owner of
-    /// the request that triggered the checkpoint: an eviction caused by another key must not re-label the state.
+    /// the request that triggered the checkpoint: an eviction caused by another key must not re-label the state. The
+    /// caller's request owner is restored on success, error and unwind.
     pub fn save_slot_file_as(&mut self, slot: usize, path: &Path, owner: u64) -> Result<u64> {
-        let prev = self.owner;
-        self.owner = owner;
-        let r = self.save_slot_file_owned(slot, path);
-        self.owner = prev;
-        r
+        let prev = std::mem::replace(&mut self.owner, owner);
+        let guard = OwnerGuard { model: self, prev };
+        guard.model.save_slot_file_owned(slot, path)
     }
 
     fn save_slot_file_owned(&mut self, slot: usize, path: &Path) -> Result<u64> {
@@ -232,19 +241,10 @@ impl GpuModel<'_> {
 
     /// The caps a unified restore of `new` tokens would have to reclaim, only the ones that are not empty.
     fn restore_victims(&self, slot: usize, new: usize) -> Vec<usize> {
-        let mut caps = self.kv_cap.clone();
-        let mut order: Vec<usize> = (0..caps.len())
-            .filter(|&i| i != slot && !self.active.get(i).copied().unwrap_or(false) && caps[i] > 1)
-            .collect();
-        order.sort_by_key(|&i| std::cmp::Reverse(caps[i]));
-        let fits = |caps: &[usize]| caps.iter().sum::<usize>() - caps[slot] + new <= self.kv_budget;
-        let mut victims = Vec::new();
-        for i in order {
-            if fits(&caps) { break; }
-            if !self.slot_empty(i) { victims.push(i); }
-            caps[i] = 1;
-        }
-        victims
+        super::reclaim_plan(&self.kv_cap, &self.active, self.kv_budget, slot, new)
+            .into_iter()
+            .filter(|&i| !self.slot_empty(i))
+            .collect()
     }
 
     fn slot_empty(&self, s: usize) -> bool {
