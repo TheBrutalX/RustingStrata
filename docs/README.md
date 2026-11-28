@@ -8,6 +8,7 @@
 - [SLOT-SAVE.md](SLOT-SAVE.md): explicit per-slot save/restore, `STRATASLOT` v1 format and HTTP API.
 - [SLOT-ARCHIVE.md](SLOT-ARCHIVE.md): automatic disk archive of conversation state, with prefix restore and a disk budget (design).
 - [SLOT-ARCHIVE-PHASE2.md](SLOT-ARCHIVE-PHASE2.md): phase-2 analysis: async chunked staging, leases, shutdown, retention, manifest scale.
+- [PARALLEL-SPEC.md](PARALLEL-SPEC.md): making MTP and K4v speculative decoding work with `--parallel > 1`.
 - [LORA.md](LORA.md): runtime LoRA / abliteration adapters.
 - [SUPPORTED_GPUS.md](SUPPORTED_GPUS.md): every GPU tried so far.
 - [AMD.md](AMD.md): known AMD issues and what to send in a report.
