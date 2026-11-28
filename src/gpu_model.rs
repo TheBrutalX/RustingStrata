@@ -422,6 +422,45 @@ fn build_shortlist(m: &Model, gpu: &dyn Backend, output: Option<&GpuTensor>) -> 
     Ok(Some(Shortlist { buf, ids, in_set }))
 }
 
+/// The draft-head state that belongs to one sequence (`MtpHead::slots`). The head's KV caches already live in `layer`,
+/// one per slot; this is the scalar state that used to be single-sequence. The current slot's copy lives in the
+/// `MtpHead` fields of the same names; `slots[cur]` is a stale placeholder, as `ngrams[ngram_cur]` is `None`.
+struct MtpSlotState {
+    /// Row 0 of the main model's `x` (or `eagle.cur_g`) at `save_state`.
+    saved_x: Buf,
+    /// Next draft-head entry position.
+    pos: usize,
+    /// Accepted drafts of the last `spec_step` whose draft head entries (from the main model's hidden rows 0..) are
+    /// still to be written; the next `spec_step` writes them in its first draft pass.
+    pend: Vec<u32>,
+    /// 12-step rolling window of draft acceptance bits (LSB = latest step), used for adaptive speculative depth.
+    adapt_window: u16,
+    /// Remaining 1-token bypass steps before probing EAGLE3/MTP again on partially-resident MoE runs.
+    adapt_skip: u8,
+    /// Count of out-of-shortlist tokens seen in this sequence; >4 auto-disables shortlist cleanly.
+    short_oob: std::cell::Cell<usize>,
+    use_short: std::cell::Cell<bool>,
+}
+
+impl MtpSlotState {
+    fn new(gpu: &dyn Backend, width: usize, use_short: bool) -> anyhow::Result<Self> {
+        Ok(Self {
+            saved_x: gpu.zeros::<f32>(width)?, pos: 0, pend: Vec::new(), adapt_window: 0x0FFF, adapt_skip: 0,
+            short_oob: std::cell::Cell::new(0), use_short: std::cell::Cell::new(use_short),
+        })
+    }
+
+    /// Forget the sequence's draft state (its KV rows are about to be cleared).
+    fn clear(&mut self, use_short: bool) {
+        self.pos = 0;
+        self.pend.clear();
+        self.adapt_window = 0x0FFF;
+        self.adapt_skip = 0;
+        self.short_oob.set(0);
+        self.use_short.set(use_short);
+    }
+}
+
 struct MtpHead {
     layer: Layer, eh_proj: Option<GpuTensor>, enorm: GpuTensor, hnorm: GpuTensor,
     /// The head's norm, or with hyper-connections its read (`nextn.hc_head_*`). Rows of `eh` and `x` are then per
@@ -439,10 +478,34 @@ struct MtpHead {
     /// Remaining 1-token bypass steps before probing EAGLE3/MTP again on partially-resident MoE runs.
     adapt_skip: u8,
     /// Sorted ASCII/Latin/Greek/Math/Code/Special vocab subset for fast MTP draft `lm_head` (`0.55 MB` index buffer).
+    /// Shared and read-only: the per-sequence `short_oob`/`use_short` live in `MtpSlotState`.
     short: Option<Shortlist>,
     /// Count of out-of-shortlist tokens seen in the current sequence; >4 auto-disables shortlist cleanly.
     short_oob: std::cell::Cell<usize>,
     use_short: std::cell::Cell<bool>,
+    /// The other slots' draft state (`use_slot`); `slots[cur]` is a stale placeholder, never the current state.
+    slots: Vec<MtpSlotState>,
+    /// Slot whose state the fields above hold.
+    cur: usize,
+}
+
+impl MtpHead {
+    /// Make slot `s`'s draft state current, exchanging it with the current one (`GpuModel::use_slot`).
+    fn use_slot(&mut self, s: usize) {
+        if s == self.cur || s >= self.slots.len() { return; }
+        let q = &mut self.slots[s];
+        std::mem::swap(&mut self.saved_x, &mut q.saved_x);
+        std::mem::swap(&mut self.pos, &mut q.pos);
+        std::mem::swap(&mut self.pend, &mut q.pend);
+        std::mem::swap(&mut self.adapt_window, &mut q.adapt_window);
+        std::mem::swap(&mut self.adapt_skip, &mut q.adapt_skip);
+        std::mem::swap(&mut self.short_oob, &mut q.short_oob);
+        std::mem::swap(&mut self.use_short, &mut q.use_short);
+        // The state just moved into `slots[s]` belongs to the old current slot: keep it at that slot's index, and
+        // leave the stale placeholder in `slots[s]` (the new current slot's entry).
+        self.slots.swap(s, self.cur);
+        self.cur = s;
+    }
 }
 
 /// What a slot keeps while another slot is current (`use_slot`): the `GpuModel` fields of the same names.
@@ -727,7 +790,13 @@ impl<'a> GpuModel<'a> {
 
     /// `load_slots` with the slots sharing one `ctx` token budget (`--kv-unified`).
     pub fn load_slots_kv(m: &'a Model<'a>, gpu: Box<dyn Backend>, ctx: usize, chunk: usize, vram_margin: usize, n: usize, unified: bool) -> anyhow::Result<GpuModel<'a>> {
-        Self::load_part(m, gpu, ctx, chunk, vram_margin, 0, 0..m.cfg.n_layer, n, unified)
+        Self::load_slots_kv_mtp(m, gpu, ctx, chunk, vram_margin, 0, n, unified)
+    }
+
+    /// `load_slots_kv` with the requested MTP draft count `k` (`0` = no draft head). The single-device `--parallel`
+    /// path uses this so that `--mtp` reaches `load_part`; the head's KV caches are allocated per slot there.
+    pub fn load_slots_kv_mtp(m: &'a Model<'a>, gpu: Box<dyn Backend>, ctx: usize, chunk: usize, vram_margin: usize, k: usize, n: usize, unified: bool) -> anyhow::Result<GpuModel<'a>> {
+        Self::load_part(m, gpu, ctx, chunk, vram_margin, k, 0..m.cfg.n_layer, n, unified)
     }
 
     /// `load_split` with the same VRAM margin on every device.
@@ -753,7 +822,7 @@ impl<'a> GpuModel<'a> {
         if gpus.len() == 1 {
             let g = gpus.into_iter().next().unwrap();
             let margin = vram_margin[0];
-            return if ns > 1 { Self::load_slots_kv(m, g, ctx, chunk, margin, ns, unified) } else { Self::load(m, g, ctx, chunk, margin, k) };
+            return if ns > 1 { Self::load_slots_kv_mtp(m, g, ctx, chunk, margin, k, ns, unified) } else { Self::load(m, g, ctx, chunk, margin, k) };
         }
         let rates = gpus.iter().map(|g| copy_rate(g.as_ref())).collect::<anyhow::Result<Vec<_>>>()?;
         let free = gpus.iter().map(|g| Ok(g.mem_info()?.0 as f64)).collect::<anyhow::Result<Vec<_>>>()?;
@@ -1123,6 +1192,8 @@ impl<'a> GpuModel<'a> {
                     short: None,
                     short_oob: std::cell::Cell::new(0),
                     use_short: std::cell::Cell::new(false),
+                    slots: (0..ns).map(|_| MtpSlotState::new(&*gpu, c.n_embd, false)).collect::<anyhow::Result<_>>()?,
+                    cur: 0,
                 })
             } else {
                 let short = build_shortlist(m, &*gpu, output.as_ref())?;
@@ -1148,6 +1219,8 @@ impl<'a> GpuModel<'a> {
                     short,
                     short_oob: std::cell::Cell::new(0),
                     use_short: std::cell::Cell::new(has_short),
+                    slots: (0..ns).map(|_| MtpSlotState::new(&*gpu, hcn * c.n_embd, has_short)).collect::<anyhow::Result<_>>()?,
+                    cur: 0,
                 })
             }
         } else { None };
@@ -1486,6 +1559,8 @@ impl<'a> GpuModel<'a> {
         // The current slot's n-gram drafter is swapped along with its history; `self.ngram` always holds the
         // current slot's drafter.
         ngram_swap(&mut self.ngram, &mut self.ngrams, &mut self.ngram_cur, s);
+        // The draft head's scalar state (`pos`/`pend`/`saved_x`/...) follows its slot too; its KV is already per slot.
+        if let Some(h) = self.mtp.as_mut() { h.use_slot(s); }
         if s == self.cur { return; }
         let mut q = std::mem::take(&mut self.seqs[s]);
         std::mem::swap(&mut self.pos, &mut q.pos);
@@ -1565,6 +1640,11 @@ impl<'a> GpuModel<'a> {
         }
     }
 
+    /// Whether an MTP draft head is loaded (in any part: a layer split keeps it on the tail). The batched
+    /// `step_rows`/`step_batch` paths do not support it, so the scheduler must use the serial `step`/`spec_step` path
+    /// when this is true.
+    pub fn mtp_active(&self) -> bool { self.parts().any(|p| p.mtp.is_some()) }
+
     /// The most rows `step_batch` takes (0: this model has no batched decode).
     /// Most tokens of one `verify` forward on this backend (4 on CUDA, `TMAX` on Vulkan).
     pub fn tmax(&self) -> usize { self.gpu.verify_rows() }
@@ -1632,6 +1712,16 @@ impl<'a> GpuModel<'a> {
             self.ngram = None;
         } else if let Some(entry) = self.ngrams.get_mut(i) {
             *entry = None;
+        }
+        // Its draft-head position, pending drafts and shortlist flags describe the same rows.
+        if let Some(h) = self.mtp.as_mut() {
+            let has = h.short.is_some();
+            if i == h.cur {
+                h.pos = 0; h.pend.clear(); h.adapt_window = 0x0FFF; h.adapt_skip = 0;
+                h.short_oob.set(0); h.use_short.set(has);
+            } else if let Some(st) = h.slots.get_mut(i) {
+                st.clear(has);
+            }
         }
         if i == self.cur {
             self.pos = 0; self.rope_offset = 0;
@@ -4299,6 +4389,26 @@ mod tests {
     #[test]
     fn reclaim_plan_without_budget_is_empty() {
         assert_eq!(reclaim_plan(&[4, 4], &[false, false], 0, 0, 6), Vec::<usize>::new());
+    }
+
+    /// `MtpSlotState::clear` forgets only that sequence's draft state (the KV caches are per slot too). `MtpHead`
+    /// itself needs GPU buffers, so the slot exchange is only exercised by a GPU run.
+    #[test]
+    fn mtp_slot_state_clear_is_per_slot() {
+        use super::MtpSlotState;
+        use crate::backend::Buf;
+        let state = |pos, pend: &[u32], window, skip, oob, short| MtpSlotState {
+            saved_x: Buf::new(0, 0, ()), pos, pend: pend.to_vec(), adapt_window: window, adapt_skip: skip,
+            short_oob: std::cell::Cell::new(oob), use_short: std::cell::Cell::new(short),
+        };
+        let mut a = state(7, &[1, 2], 0x0003, 2, 5, false);
+        let b = state(9, &[3], 0x00F0, 1, 2, false);
+        a.clear(true);
+        assert_eq!((a.pos, a.adapt_window, a.adapt_skip), (0, 0x0FFF, 0));
+        assert!(a.pend.is_empty());
+        assert_eq!((a.short_oob.get(), a.use_short.get()), (0, true));
+        assert_eq!((b.pos, b.adapt_window, b.adapt_skip, b.short_oob.get(), b.use_short.get()), (9, 0x00F0, 1, 2, false));
+        assert_eq!(b.pend, vec![3]);
     }
 }
 
