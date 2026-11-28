@@ -211,3 +211,8 @@ pauses for the verify, so aggregate throughput under many simultaneous streams s
   draft-friendly conversation.
 - MTP works with `parallel 3` after phase 2, with per-slot state.
 - `parallel 1` behavior and existing tests unchanged.
+
+Regression: `tools/test_parallel_spec.sh MODEL BIN SERVER_DIR [PORT]` starts a no-spec and a
+`ngram-map-k4v` server with `--parallel 3` on the same greedy prompt, checks byte-identical replies, non-zero
+accepted drafts and the decode-speed ratio, then sends three concurrent requests to a fresh spec server. The
+V100/Ornith run reports 6/6 checks (119.5 vs 140.8 tok/s, 14/14 drafts, three 200s).
