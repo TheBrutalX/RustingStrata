@@ -77,6 +77,10 @@ model-thread stall.
   `action=save`/`action=checkpoint` stay synchronous.
 - **Locking:** the archive mutex is not held during GPU copies; the writer/reader takes it per phase. `finish`
   still waits for the final state/manifest commit, so the model thread can wait for that commit at the end.
+- **Collision fallback:** a v2 segment id is derived from the token prefix, not the KV bytes. If the GPU produces
+  different KV for a segment whose id already exists (nondeterministic kernels), the store refuses to overwrite it.
+  The checkpoint path now falls back to a v1 full snapshot for that entry instead of losing it; the entry is still
+  restorable and the collision is logged.
 - **Benchmark:** the explicit-checkpoint path remains synchronous by design; the async automatic path is exercised
   by the archive/dedup E2E. `tests/archive_phase_bench.rs` measured the async sink path on the same 22.5k-token
   f16 state at **546 ms total** versus **930 ms** for the synchronous `save_segmented` (GPU copies + overlapped

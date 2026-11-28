@@ -3835,9 +3835,66 @@ where F: FnMut(&mut GpuModel<'_>) -> anyhow::Result<()> {
         }
         Err(e) => {
             if let Ok(mut a) = archive.lock() { a.note_failure(); }
-            Err(e)
+            // The v2 segment id is derived from the token prefix, not the KV bytes. If the GPU produced a slightly
+            // different KV for a segment already stored under that id, the segment store refuses to overwrite it.
+            // Do not lose the checkpoint: fall back to a v1 full snapshot for this entry.
+            say!("archive: v2 save for slot {slot} failed ({e:#}); falling back to a v1 snapshot");
+            match checkpoint_slot_v1(archive, g, slot, target, tokens.len(), owner, fp, reason) {
+                Ok(Some(info)) => {
+                    say!("archive: saved slot {slot} reason={reason} n={} bytes={} ms={:.1} format=1 (fallback)",
+                        info.n_saved, info.n_written, info.save_ms);
+                    Ok(Some(info))
+                }
+                Ok(None) => Ok(None),
+                Err(fallback) => {
+                    if let Ok(mut a) = archive.lock() { a.note_failure(); }
+                    Err(anyhow::anyhow!("v2 save failed: {e:#}; v1 fallback failed: {fallback:#}"))
+                }
+            }
         }
     }
+}
+
+/// A v1 full-snapshot checkpoint, used if the v2 segmented save fails (for example a segment-id collision after a
+/// nondeterministic KV recomputation). Keeps the checkpoint instead of dropping it; v1 entries are still restorable.
+fn checkpoint_slot_v1(archive: &ArchiveHandle, g: &mut GpuModel, slot: usize, target: usize,
+                      _n_tokens: usize, owner: u64, fingerprint: u64, reason: &str)
+    -> anyhow::Result<Option<CheckpointInfo>> {
+    let t = Instant::now();
+    let (id, path) = {
+        let mut a = match archive.lock() { Ok(a) => a, Err(_) => anyhow::bail!("slot archive lock poisoned") };
+        match a.prepare_save(owner, &g.slot_tokens(slot).to_vec(), fingerprint, reason) {
+            Ok(slot_archive::SaveSlot::Existing(e)) => {
+                a.touch(&e.id);
+                if g.current_slot() != target { g.use_slot(target); }
+                return Ok(Some(CheckpointInfo { id: e.id, n_saved: e.n_tokens, n_written: 0, save_ms: 0.0 }));
+            }
+            Ok(slot_archive::SaveSlot::New { id, path }) => (id, path),
+            Err(e) => { a.note_failure(); return Err(e); }
+        }
+    };
+    let tokens = g.slot_tokens(slot).to_vec();
+    let written = match g.save_slot_file_as(slot, &path, owner) {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            if let Ok(mut a) = archive.lock() { a.note_failure(); }
+            return Err(e);
+        }
+    };
+    if g.current_slot() != target { g.use_slot(target); }
+    let entry = {
+        let mut a = match archive.lock() { Ok(a) => a, Err(_) => anyhow::bail!("slot archive lock poisoned") };
+        match a.commit_save(&id, &path, owner, &tokens, fingerprint, reason) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                a.note_failure();
+                return Err(e);
+            }
+        }
+    };
+    Ok(Some(CheckpointInfo { id: entry.id, n_saved: tokens.len(), n_written: written, save_ms: t.elapsed().as_secs_f64() * 1e3 }))
 }
 
 /// The explicit `POST /slots/{id}?action=checkpoint` path: the v2 save stays synchronous (deterministic response),
@@ -3851,18 +3908,23 @@ fn checkpoint_slot_sync(archive: &ArchiveHandle, g: &mut GpuModel, slot: usize, 
     if g.slot_pos(slot) != tokens.len() || g.slot_shifted(slot) { return Ok(None); }
     let owner = g.slot_owner(slot);
     let fp = g.slot_fingerprint();
-    let mut a = match archive.lock() { Ok(a) => a, Err(_) => anyhow::bail!("slot archive lock poisoned") };
-    if tokens.len() < a.config().min_tokens {
+    let (min_tokens, min_delta, longest) = {
+        let a = match archive.lock() { Ok(a) => a, Err(_) => anyhow::bail!("slot archive lock poisoned") };
+        (a.config().min_tokens, a.config().min_delta, a.longest_prefix(owner, &tokens, fp).map(|e| e.n_tokens))
+    };
+    if tokens.len() < min_tokens {
         return Ok(None);
     }
-    let longest = a.longest_prefix(owner, &tokens, fp).map(|e| e.n_tokens);
-    if below_min_delta(tokens.len(), longest, a.config().min_delta) {
+    if below_min_delta(tokens.len(), longest, min_delta) {
         if g.current_slot() != target { g.use_slot(target); }
         return Ok(None);
     }
     let exact = longest == Some(tokens.len());
     let t = Instant::now();
-    let saved = a.save_segmented(g, slot, owner, reason);
+    let saved = match archive.lock() {
+        Ok(mut a) => a.save_segmented(g, slot, owner, reason),
+        Err(_) => Err(anyhow::anyhow!("slot archive lock poisoned")),
+    };
     if g.current_slot() != target { g.use_slot(target); }
     match saved {
         Ok(e) => {
@@ -3871,7 +3933,18 @@ fn checkpoint_slot_sync(archive: &ArchiveHandle, g: &mut GpuModel, slot: usize, 
             say!("archive: saved slot {slot} reason={reason} n={} bytes={n_written} ms={save_ms:.1} format=2 (explicit)", tokens.len());
             Ok(Some(CheckpointInfo { id: e.id, n_saved: tokens.len(), n_written, save_ms }))
         }
-        Err(e) => { a.note_failure(); Err(e) }
+        Err(e) => {
+            if let Ok(mut a) = archive.lock() { a.note_failure(); }
+            say!("archive: v2 explicit checkpoint for slot {slot} failed ({e:#}); falling back to a v1 snapshot");
+            match checkpoint_slot_v1(archive, g, slot, target, tokens.len(), owner, fp, reason) {
+                Ok(Some(info)) => Ok(Some(info)),
+                Ok(None) => Ok(None),
+                Err(fallback) => {
+                    if let Ok(mut a) = archive.lock() { a.note_failure(); }
+                    Err(anyhow::anyhow!("v2 checkpoint failed: {e:#}; v1 fallback failed: {fallback:#}"))
+                }
+            }
+        }
     }
 }
 

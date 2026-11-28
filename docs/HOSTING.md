@@ -477,6 +477,11 @@ disk at 0.5-1 GB/s; expect a shorter but still visible pause on very large state
 `--slot-archive-min-tokens`/`--slot-archive-min-delta` high enough that tiny states/extensions are not written on
 every turn.
 
+**Segment collisions.** The v2 segment id is content-addressed by the token prefix, not by the KV bytes. If a
+nondeterministic GPU run produces different KV for an already stored segment id, the store refuses to overwrite the
+existing segment; the checkpoint falls back to a v1 full snapshot for that entry and logs the fallback. The entry
+is restorable, but it does not share the v2 segments of the earlier entries.
+
 **Restore behavior.** Automatic restore uses a free slot only and never takes a slot a request holds. It never
 uses the `force=1` of the explicit route. If the chosen free slot holds another conversation, the server
 checkpoints it before the restore overwrites it. If no slot is free the request queues as usual and then
