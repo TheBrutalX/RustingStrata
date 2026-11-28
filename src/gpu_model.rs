@@ -568,8 +568,15 @@ pub struct GpuModel<'a> {
     /// Gyro files (`config::Hadamard`): the signs of a hidden row and of an expert's inner row, as floats.
     hada: Option<[Buf; 2]>,
     graph_tag: u64,
-    /// Speculative N-gram / lookup cache drafter (standalone or combined with `mtp`/`dflash` via `hybrid_spec_step`).
+    /// Speculative N-gram / lookup cache drafter of the current slot (`ngram_cur`), standalone or combined with
+    /// `mtp`/`dflash` via `hybrid_spec_step`. `use_slot` swaps it with the target slot's entry, so every existing
+    /// `self.ngram` use keeps seeing the current slot's drafter.
     pub ngram: Option<crate::ngram::NgramDrafter>,
+    /// Drafters of the slots that are not current. `ngrams[ngram_cur]` is `None`: the current slot's drafter lives in
+    /// `ngram` so that the single-slot code can keep reading the field directly.
+    ngrams: Vec<Option<crate::ngram::NgramDrafter>>,
+    /// Slot whose drafter `ngram` holds (always equal to `cur` once `use_slot` has run).
+    ngram_cur: usize,
     /// The layers of this part are `first..first + layers.len()`.
     first: usize,
     /// The part on the next device of a model split by layers (`load_split`): this part's hidden state goes to it
@@ -593,6 +600,64 @@ pub struct GpuModel<'a> {
     row_tokens: usize,
     /// Share of a batch step's missed experts that the CPU runs; the rest are staged over PCIe (`prefill_chunk`).
     cpu_frac: f64,
+}
+
+// ---------------------------------------------------------------------------
+// Per-slot N-gram drafter storage
+// ---------------------------------------------------------------------------
+//
+// `GpuModel::ngram` is the current slot's drafter (the public field the single-slot code has always used) and
+// `GpuModel::ngrams` holds the other slots' entries. These helpers keep the invariant that `slots[cur]` is `None`
+// while `cur` is selected, so one drafter always has exactly one owner. They are free functions rather than
+// `GpuModel` methods so that the bookkeeping can be tested on the CPU without a GPU.
+
+/// Make slot `s`'s drafter current, moving the current one into its slot's entry. A no-op when `s` is current (or
+/// out of range, which the slot accessors reject before this).
+fn ngram_swap(
+    current: &mut Option<crate::ngram::NgramDrafter>,
+    slots: &mut [Option<crate::ngram::NgramDrafter>],
+    cur: &mut usize,
+    s: usize,
+) {
+    if s == *cur || s >= slots.len() || *cur >= slots.len() { return; }
+    slots[*cur] = current.take();
+    *current = slots[s].take();
+    *cur = s;
+}
+
+/// Borrow slot `s`'s drafter without selecting the slot.
+fn ngram_at<'a>(
+    current: &'a mut Option<crate::ngram::NgramDrafter>,
+    slots: &'a mut [Option<crate::ngram::NgramDrafter>],
+    cur: usize,
+    s: usize,
+) -> Option<&'a mut crate::ngram::NgramDrafter> {
+    if s == cur { current.as_mut() } else { slots.get_mut(s).and_then(Option::as_mut) }
+}
+
+/// Install or remove slot `s`'s drafter without selecting the slot.
+fn ngram_set(
+    current: &mut Option<crate::ngram::NgramDrafter>,
+    slots: &mut [Option<crate::ngram::NgramDrafter>],
+    cur: usize,
+    s: usize,
+    drafter: Option<crate::ngram::NgramDrafter>,
+) {
+    if s == cur {
+        *current = drafter;
+    } else if let Some(entry) = slots.get_mut(s) {
+        *entry = drafter;
+    }
+}
+
+/// Whether slot `s` has a drafter.
+fn ngram_present(
+    current: &Option<crate::ngram::NgramDrafter>,
+    slots: &[Option<crate::ngram::NgramDrafter>],
+    cur: usize,
+    s: usize,
+) -> bool {
+    if s == cur { current.is_some() } else { slots.get(s).is_some_and(Option::is_some) }
 }
 
 /// Layer shares of `--split`: one positive number per device, such as `60,40`.
@@ -1256,7 +1321,7 @@ impl<'a> GpuModel<'a> {
         let reset_counts_after_prefill = std::env::var_os("STRATA_RESET_COUNTS").is_some();
         let _ = &mut ext_draft;
         crate::weights::trim_working_set();
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], ple_undo: ([-1, -1], vec![]), bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, hada, mrope: false, mrope_buf: gpu_mrope, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], history: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every, adapt_swaps, reset_counts_after_prefill, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, nsnap, short: 32, pf, prompt_cache_path: None, bt, mtp, dflash, ext_draft, ext_draft_pend: Vec::new(), mhc_ones, graph_tag: 0, ngram: None, first: range.start, next: None,
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], ple_undo: ([-1, -1], vec![]), bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, hada, mrope: false, mrope_buf: gpu_mrope, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], history: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every, adapt_swaps, reset_counts_after_prefill, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, nsnap, short: 32, pf, prompt_cache_path: None, bt, mtp, dflash, ext_draft, ext_draft_pend: Vec::new(), mhc_ones, graph_tag: 0, ngram: None, ngrams: (0..ns).map(|_| None).collect(), ngram_cur: 0, first: range.start, next: None,
                       cur: 0, seqs, kv_cap: if grow { vec![kv0; ns] } else { vec![] }, kv0, kv_budget: if unified { ctx } else { 0 }, active: vec![false; ns], rows: vec![], row_tokens: 0, cpu_frac: 0.5, kv_stage })
     }
 
@@ -1288,6 +1353,7 @@ impl<'a> GpuModel<'a> {
             ed.reset()?;
         }
         self.ext_draft_pend.clear();
+        // Only the current slot's drafter: `reset` clears the state of the selected slot (other slots keep theirs).
         if let Some(ng) = self.ngram.as_mut() { ng.reset(); }
         // A slot whose KV grew gives the VRAM back (its new caches are zeroed).
         let shrink = self.kv_cap.get(self.cur).is_some_and(|&n| n > self.kv0);
@@ -1417,6 +1483,9 @@ impl<'a> GpuModel<'a> {
     /// Make slot `s` current: `prefill`, `prefill_cached`, `step`, `reset` and the rest then use its state.
     pub fn use_slot(&mut self, s: usize) {
         if let Some(n) = self.next.as_mut() { n.use_slot(s); }
+        // The current slot's n-gram drafter is swapped along with its history; `self.ngram` always holds the
+        // current slot's drafter.
+        ngram_swap(&mut self.ngram, &mut self.ngrams, &mut self.ngram_cur, s);
         if s == self.cur { return; }
         let mut q = std::mem::take(&mut self.seqs[s]);
         std::mem::swap(&mut self.pos, &mut q.pos);
@@ -1458,6 +1527,21 @@ impl<'a> GpuModel<'a> {
 
     /// The slot whose buffers are currently selected.
     pub fn current_slot(&self) -> usize { self.cur }
+
+    /// Install (`Some`) or remove (`None`) slot `slot`'s n-gram drafter without changing the current slot.
+    pub fn set_slot_ngram(&mut self, slot: usize, drafter: Option<crate::ngram::NgramDrafter>) {
+        ngram_set(&mut self.ngram, &mut self.ngrams, self.ngram_cur, slot, drafter);
+    }
+
+    /// Mutably borrow slot `slot`'s n-gram drafter without changing the current slot.
+    pub fn slot_ngram(&mut self, slot: usize) -> Option<&mut crate::ngram::NgramDrafter> {
+        ngram_at(&mut self.ngram, &mut self.ngrams, self.ngram_cur, slot)
+    }
+
+    /// Whether slot `slot` currently has an n-gram drafter.
+    pub fn slot_ngram_any(&self, slot: usize) -> bool {
+        ngram_present(&self.ngram, &self.ngrams, self.ngram_cur, slot)
+    }
 
     fn slot_ids_mut(&mut self, s: usize) -> &mut Vec<u32> {
         if s == self.cur { &mut self.history } else { &mut self.seqs[s].history }
@@ -1542,6 +1626,13 @@ impl<'a> GpuModel<'a> {
     /// Forget what a slot's KV prefix was, before its cache is reclaimed for another slot. The token history, the
     /// DeltaNet snapshots and the system-prompt stash all describe rows that are about to be zeroed.
     fn drop_slot_cache(&mut self, i: usize) {
+        // The slot's history goes with its KV rows, so its drafter (whose tables are keyed by those positions)
+        // must go too: no slot may keep a drafter for a history it no longer has.
+        if i == self.ngram_cur {
+            self.ngram = None;
+        } else if let Some(entry) = self.ngrams.get_mut(i) {
+            *entry = None;
+        }
         if i == self.cur {
             self.pos = 0; self.rope_offset = 0;
             self.saved_ids.clear(); self.history.clear(); self.saved.clear(); self.saved_pos = 0;
@@ -3987,7 +4078,129 @@ impl<'a> GpuModel<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GpuModel, reclaim_plan, split_ends, split_shares, tally};
+    use super::{GpuModel, ngram_at, ngram_present, ngram_set, ngram_swap, reclaim_plan, split_ends, split_shares, tally};
+    use crate::ngram::{NgramConfig, NgramDrafter, SpecType};
+
+    fn ngram_cfg() -> NgramConfig {
+        NgramConfig {
+            types: vec![SpecType::NgramMapK4v],
+            draft_max: 8,
+            size_n: 2,
+            size_m: 4,
+            min_hits: 1,
+            ..Default::default()
+        }
+    }
+
+    fn ngram_drafter(history: &[u32]) -> NgramDrafter {
+        let mut d = NgramDrafter::new(ngram_cfg(), None).unwrap();
+        d.begin(history);
+        d
+    }
+
+    /// The per-slot n-gram fields of `GpuModel`, mirrored so the shared helpers can be tested without a GPU.
+    struct NgramBank {
+        cur: usize,
+        current: Option<NgramDrafter>,
+        slots: Vec<Option<NgramDrafter>>,
+    }
+
+    impl NgramBank {
+        fn new(n: usize) -> Self {
+            Self { cur: 0, current: None, slots: (0..n).map(|_| None).collect() }
+        }
+        fn use_slot(&mut self, s: usize) { ngram_swap(&mut self.current, &mut self.slots, &mut self.cur, s); }
+        fn set(&mut self, s: usize, d: Option<NgramDrafter>) { ngram_set(&mut self.current, &mut self.slots, self.cur, s, d); }
+        fn get(&mut self, s: usize) -> Option<&mut NgramDrafter> { ngram_at(&mut self.current, &mut self.slots, self.cur, s) }
+        fn any(&self, s: usize) -> bool { ngram_present(&self.current, &self.slots, self.cur, s) }
+    }
+
+    const HIST0: [u32; 20] = [1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4];
+    const HIST1: [u32; 20] = [10, 20, 30, 40, 50, 60, 70, 80, 10, 20, 30, 40, 50, 60, 70, 80, 10, 20, 30, 40];
+
+    /// Drafts and accepts stay in the drafter of the slot they were made for.
+    #[test]
+    fn ngram_drafters_are_independent_per_slot() {
+        let mut bank = NgramBank::new(2);
+        bank.set(0, Some(ngram_drafter(&HIST0)));
+        bank.set(1, Some(ngram_drafter(&HIST1)));
+        assert!(bank.any(0) && bank.any(1));
+
+        assert_eq!(bank.get(0).unwrap().draft(5, 4), vec![6, 7, 8, 1]);
+        bank.get(0).unwrap().accept(&[5, 6]);
+        assert_eq!(bank.get(1).unwrap().draft(50, 4), vec![60, 70, 80, 10]);
+
+        // Neither drafting nor accepting for slot 0 touched slot 1's history (or vice versa).
+        assert_eq!(bank.get(0).unwrap().history, [HIST0.as_slice(), &[5, 6]].concat());
+        assert_eq!(bank.get(1).unwrap().history, HIST1.to_vec());
+    }
+
+    /// `use_slot` carries the current drafter to its slot and takes the target slot's, so the current field always
+    /// belongs to the selected slot.
+    #[test]
+    fn use_slot_swaps_the_current_ngram_drafter() {
+        let mut bank = NgramBank::new(2);
+        bank.set(0, Some(ngram_drafter(&HIST0)));
+        bank.set(1, Some(ngram_drafter(&HIST1)));
+
+        bank.use_slot(1);
+        assert_eq!(bank.cur, 1);
+        assert_eq!(bank.current.as_ref().unwrap().history, HIST1);
+        assert!(bank.any(1));
+        bank.current.as_mut().unwrap().accept(&[10, 20]);
+        let hist1 = [HIST1.as_slice(), &[10, 20]].concat();
+        assert_eq!(bank.current.as_ref().unwrap().history, hist1);
+
+        bank.use_slot(0);
+        assert_eq!(bank.cur, 0);
+        assert_eq!(bank.current.as_ref().unwrap().history, HIST0);
+        assert!(bank.any(0) && bank.any(1));
+
+        bank.use_slot(1);
+        assert_eq!(bank.current.as_ref().unwrap().history, hist1);
+    }
+
+    /// Borrowing another slot's drafter (`slot_ngram`) must not select that slot.
+    #[test]
+    fn slot_ngram_access_keeps_the_current_slot() {
+        let mut bank = NgramBank::new(2);
+        bank.set(0, Some(ngram_drafter(&HIST0)));
+        bank.set(1, Some(ngram_drafter(&HIST1)));
+        bank.use_slot(1);
+        let before = bank.current.as_ref().unwrap().history.clone();
+
+        assert_eq!(bank.get(0).unwrap().history, HIST0);
+        assert_eq!(bank.cur, 1);
+        assert_eq!(bank.current.as_ref().unwrap().history, before);
+    }
+
+    /// `set_slot_ngram` installs/removes a drafter for any slot without changing the current one.
+    #[test]
+    fn set_slot_ngram_round_trips_without_switching() {
+        let mut bank = NgramBank::new(2);
+        bank.set(0, Some(ngram_drafter(&HIST0)));
+        bank.use_slot(1);
+        bank.set(1, Some(ngram_drafter(&HIST1)));
+        assert!(bank.any(0) && bank.any(1) && bank.current.is_some());
+        bank.set(1, None);
+        assert!(!bank.any(1));
+        assert!(bank.get(1).is_none());
+        assert!(bank.any(0) && bank.current.is_none());
+        assert_eq!(bank.cur, 1);
+    }
+
+    /// `reset` clears only the selected slot's drafter.
+    #[test]
+    fn reset_clears_only_the_current_slots_ngram() {
+        let mut bank = NgramBank::new(2);
+        bank.set(0, Some(ngram_drafter(&HIST0)));
+        bank.set(1, Some(ngram_drafter(&HIST1)));
+        bank.use_slot(0);
+        bank.current.as_mut().unwrap().reset();
+        assert!(bank.current.as_ref().unwrap().history.is_empty());
+        bank.use_slot(1);
+        assert_eq!(bank.current.as_ref().unwrap().history, HIST1);
+    }
 
     /// Layer counts given as shares come back as the same counts: a calibrated split loads as it was measured.
     #[test]
