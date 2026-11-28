@@ -4553,10 +4553,6 @@ impl Sched {
         let mtp = g.mtp_active();
         if !mtp && !g.slot_ngram_any(slot) { return Err(anyhow::Error::new(NoSpecDrafter(slot))); }
         g.use_slot(slot);
-        if mtp {
-            let (toks, next, rw) = g.spec_step(token, row, &mut sampler)?;
-            return Ok((toks, next, sampler, rw));
-        }
         // A plain `Step` (a grammar/logit_bias reply, or the thinking-budget close tokens) advances the slot's history
         // without telling its drafter. Re-seat a drafter that fell behind so drafting keeps using the real context;
         // this only affects which drafts are proposed, never the accepted stream.
@@ -4564,6 +4560,16 @@ impl Sched {
         if stale {
             let hist = g.slot_tokens(slot).to_vec();
             if let Some(ng) = g.ngram.as_mut() { ng.begin(&hist); }
+        }
+        if mtp {
+            // With both `--mtp` and `--spec-type`, the hybrid path uses a strong ngram draft first and falls back to
+            // the MTP head; MTP alone skips the ngram drafter.
+            if g.ngram.is_some() {
+                let (toks, next, rw) = g.hybrid_spec_step(token, row, &mut sampler)?;
+                return Ok((toks, next, sampler, rw));
+            }
+            let (toks, next, rw) = g.spec_step(token, row, &mut sampler)?;
+            return Ok((toks, next, sampler, rw));
         }
         let (toks, next) = g.ngram_spec_step(token, &mut sampler)?;
         Ok((toks, next, sampler, 0))
