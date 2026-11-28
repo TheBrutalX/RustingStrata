@@ -1565,6 +1565,10 @@ impl<'a> GpuModel<'a> {
         }
     }
 
+    /// Whether an MTP draft head is loaded. The batched `step_rows`/`step_batch` paths do not support it, so the
+    /// scheduler must use the serial `step`/`spec_step` path when this is true.
+    pub fn mtp_active(&self) -> bool { self.mtp.is_some() }
+
     /// The most rows `step_batch` takes (0: this model has no batched decode).
     /// Most tokens of one `verify` forward on this backend (4 on CUDA, `TMAX` on Vulkan).
     pub fn tmax(&self) -> usize { self.gpu.verify_rows() }
