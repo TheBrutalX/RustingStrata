@@ -1,6 +1,6 @@
 # Parallel speculative decoding (MTP and K4v)
 
-**Status: design / first implementation branch.** Today `--parallel > 1` disables both MTP (`--mtp`) and the ngram
+**Status: K4v implemented for `--parallel > 1`; MTP parallel is still pending.** Today `--parallel > 1` disables both MTP (`--mtp`) and the ngram
 drafter (`--spec-type ngram-map-k4v`): `resolve_flags` forces the draft count to 0, and `Engine::load` only attaches
 `NgramDrafter` when `parallel <= 1`. Batched decode (`step_rows`) has no path that verifies draft tokens for several
 slots.
@@ -157,7 +157,33 @@ After K4v works serially:
 - Sampling acceptance must not bias output; use the standard rule.
 - The saving/restoring archive paths must not run while a slot has pending drafts.
 
-## 10. Acceptance
+## 10. K4v result (phase 1)
+
+Implemented on `feat/parallel-spec`:
+
+- one `NgramDrafter` per slot in the model; `use_slot` swaps it;
+- `Job::SpecStep` moves the request's `Sampler` to the model thread, calls the existing `ngram_spec_step`
+  (draft → verify → rollback → ngram accept), and returns the accepted tokens and sampler;
+- the parallel `Runner::Slot` decode branch uses it when `--parallel > 1` and `--spec-type` is enabled;
+- one speculative slot is processed at a time (batched decode pauses during the verify).
+
+Measured with `Ornith-1.5-35B-A3B` (V100 32 GB, `--parallel 3 --ctx 32768 --kv q8`,
+`--spec-type ngram-map-k4v --spec-draft-n-max 2`), repeated-text prompt, 96 greedy tokens:
+
+| run | decode |
+|---|---:|
+| no spec | 120.3 tok/s |
+| K4v | 162.7 tok/s |
+
+Token streams were identical; the K4v log reported `speculative ngram drafts accepted 34/34 (100.0%)`.
+Three concurrent requests all returned 200; the spec run logs one accepted-draft summary for the slot that
+drafted. This is phase 1: one speculative slot at a time, so aggregate throughput under heavy concurrency still
+needs a benchmark against the batched non-spec path.
+
+MTP parallel is the next phase: the MTP head's `saved_x`/`pend`/`pos` is still a single sequence and `use_slot`
+does not swap it; `resolve_flags` still forces MTP off when `parallel > 1`.
+
+## 11. Acceptance
 
 - K4v works with `parallel 3`, produces the same tokens as non-spec, and improves decode tok/s for a
   draft-friendly conversation.
