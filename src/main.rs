@@ -142,6 +142,11 @@ struct Engine {
     /// repeat exactly.
     #[arg(long)]
     fixed_experts: bool,
+    /// Qwen3.8 Flash-Next: the GGUF that holds the n-gram table (`per_layer_token_embd`), for a model file without it
+    /// (`-noPLE`) or to use another quant of the table. Without it, a model with no table takes the one file next to
+    /// it whose name has "PLE" in it (`STRATA_PLE`).
+    #[arg(long)]
+    ple: Option<PathBuf>,
     /// Host RAM left free for the OS, in MB. The cap is `total RAM - margin` and bounds memory the process owns
     /// (baked tensors, LoRA factors, `--cache-ram`); the mmapped model is evictable page cache and is not counted.
     #[arg(long, default_value_t = 512)]
@@ -643,7 +648,9 @@ impl Engine {
         }
         for b in &bk { b.preflight(&types, false)?; }
         let margins = vram_margins(&self.vram_margin, &self.device)?.into_iter().map(|mb| mb << 20).collect::<Vec<_>>();
-        if (ngram_cfg.is_enabled() || m.cfg.dflash.is_some() || m.draft_model.is_some()) && self.parallel <= 1 {
+        // A verify/rollback needs recurrent snapshots even when no MTP head is loaded; DFlash/draft-model keep their
+        // single-slot gate. K4v under `--parallel` takes the same path, so its snapshots are set for any slot count.
+        if ngram_cfg.is_enabled() || ((m.cfg.dflash.is_some() || m.draft_model.is_some()) && self.parallel <= 1) {
             unsafe { std::env::set_var("STRATA_SPEC_SNAP", "1") };
         } else {
             unsafe { std::env::remove_var("STRATA_SPEC_SNAP") };
@@ -668,9 +675,15 @@ impl Engine {
                 r => break r.context(LOAD_HINT)?,
             }
         };
-        if ngram_cfg.is_enabled() && self.parallel <= 1 {
+        if ngram_cfg.is_enabled() {
+            // One drafter per slot: `use_slot` swaps it with the slot's history, so each request drafts from its own
+            // tokens and tables. With one slot this is the old `g.ngram = Some(..)` (slot 0 is the current slot);
+            // with `--parallel` every holder gets one and the request thread drives it through `Job::SpecStep`.
             let tok = Tokenizer::from_gguf(&m.w.g).ok();
-            g.ngram = Some(rusting_strata::ngram::NgramDrafter::new(ngram_cfg, tok.as_ref())?);
+            for slot in 0..g.slots() {
+                let drafter = rusting_strata::ngram::NgramDrafter::new(ngram_cfg.clone(), tok.as_ref())?;
+                g.set_slot_ngram(slot, Some(drafter));
+            }
         }
         g.short = short;
         g.cache_ram = self.cache_ram << 20;
@@ -1411,6 +1424,11 @@ fn start() -> anyhow::Result<()> {
     if let Some((_, sm)) = m.subcommand() && let Ok(Some(&n)) = sm.try_get_one::<usize>("ctx")
         && sm.value_source("ctx") == Some(clap::parser::ValueSource::CommandLine) {
         rusting_strata::CTX.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+    // Read by `Gguf::open`, which every command calls before it looks at its engine flags.
+    if let Some((_, sm)) = m.subcommand() && let Ok(Some(p)) = sm.try_get_one::<PathBuf>("ple") {
+        // SAFETY: no other thread runs yet.
+        unsafe { std::env::set_var("STRATA_PLE", p) };
     }
     let Some(cmd) = <Cli as clap::FromArgMatches>::from_arg_matches(&m).unwrap_or_else(|e| e.exit()).cmd else {
         // Started without arguments, as by a double click: keep the window open on an error so it can be read.
@@ -2275,6 +2293,17 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                                 }
                             }
                             return reply(json!({"object": "list", "data": data}), "200 OK");
+                        }
+                        // llama-server's server properties: clients with a llama.cpp provider (maki, issue #131) read
+                        // the context length here.
+                        Ok(r) if r.method == "GET" && r.path.split('?').next() == Some("/props") && (k.read().unwrap().any() || serve::host_ok(&r.host, &a, &allowed)) => {
+                            let state = st.lock().unwrap();
+                            let alias = state.model.clone().unwrap_or_else(|| state.file.clone());
+                            let b = json!({"role": "model", "model_alias": alias, "model_path": state.file, "total_slots": state.slots.max(1),
+                                "default_generation_settings": {"n_ctx": state.ctx, "params": {}}, "n_ctx_train": state.ctx_train,
+                                "build_info": concat!("rustingstrata ", env!("CARGO_PKG_VERSION"))});
+                            drop(state);
+                            return reply(b, "200 OK");
                         }
                         _ => {}
                     }
@@ -3305,6 +3334,8 @@ fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut log
     // `ahead`: the next token when `spec_step` or `step_greedy` already picked it.
     // `start`: the first token whose text is not emitted yet (the text before it ends on a whole character).
     let (mut out, mut start, mut row, mut ahead, mut stopped) = (Vec::new(), 0, 0, None, false);
+    // Set if this client's slot turned out to have no drafter: the rest of the reply then uses one-token steps.
+    let mut plain = false;
     let (mut in_think, budget) = think_cap.unwrap_or((false, 0));
     let (mut saw_close, mut tail) = (false, String::new());
     // With a logit_bias or grammar every token is picked from the logits here: no speculation, no argmax on the GPU.
@@ -3327,6 +3358,24 @@ fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut log
                 let (toks, nx) = g.ngram_spec_step(next, smp)?;
                 ahead = Some(nx);
                 toks
+            }
+            Runner::Slot(c) if free && c.spec() && !plain => {
+                // K4v under `--parallel`: the model thread drafts/verifies/rolls back with the slot's drafter and
+                // returns the accepted tokens (`next` plus accepted drafts). The sampler travels with the job so its
+                // RNG and penalty state advance exactly as the model thread sampled.
+                match c.spec_step(next, smp.clone()) {
+                    Ok((toks, nx, s2)) => { *smp = s2; ahead = Some(nx); toks }
+                    // The drafter is gone (its slot cache was reclaimed): the check ran before any state change, so
+                    // the same token can go through a plain step. The request thread's sampler was only cloned.
+                    Err(e) if e.downcast_ref::<NoSpecDrafter>().is_some() => {
+                        say!("warning: {e}; decoding one token at a time in this slot");
+                        plain = true;
+                        if smp.temp <= 0.0 { ahead = Some(c.step(next, false)?.0); vec![next] }
+                        else { logits = c.step(next, true)?.1; vec![next] }
+                    }
+                    // A forward that failed after the slot moved is not retried: the slot's state is unknown.
+                    Err(e) => return Err(e),
+                }
             }
             // Greedy without MTP: the argmax on the GPU, so only the token id is copied back, not the logits.
             Runner::Gpu(g) if free && smp.temp <= 0.0 => { ahead = Some(g.step_greedy(next)?); vec![next] }
@@ -4188,6 +4237,22 @@ enum Job {
     Image { p: vision::Prompt, embs: Vec<Vec<Vec<f32>>>, owner: u64, gone: std::sync::Arc<std::sync::atomic::AtomicBool>, back: std::sync::mpsc::Sender<anyhow::Result<(Vec<f32>, usize, usize, Instant)>> },
     /// One decode step in a slot the request holds; answers the greedy next token and the logits if `logits`.
     Step { slot: usize, token: u32, logits: bool, back: std::sync::mpsc::Sender<anyhow::Result<(u32, Vec<f32>)>> },
+    /// One speculative decode step (K4v/ngram) in a slot the request holds: `GpuModel::ngram_spec_step` drafts from
+    /// `token`, verifies the draft on the model thread, rolls back a rejected suffix and returns the accepted tokens
+    /// (starting with `token`), the next token to feed and the sampler carrying the RNG/penalty state. The sampler
+    /// moves with the job because the model thread samples the verify; it comes back even when no draft was made.
+    SpecStep { slot: usize, token: u32, sampler: Sampler,
+               back: std::sync::mpsc::Sender<anyhow::Result<(Vec<u32>, u32, Sampler)>> },
+    /// Speculative verification in a slot the request holds: run `tokens` in one forward and answer the logits of each
+    /// position (an empty list when `logits` is false, though the model still verifies). Like `Step`, this advances the
+    /// slot's position and history by `tokens.len()`; the request thread then samples/accepts and sends `Rollback` for
+    /// any rejected suffix. Queued apart from `Step` so that it never shares a forward with normal decode.
+    #[allow(dead_code)] // Wired into the request thread's K4v decode loop in the next milestone.
+    Verify { slot: usize, tokens: Vec<u32>, logits: bool, back: std::sync::mpsc::Sender<anyhow::Result<Vec<Vec<f32>>>> },
+    /// Drop the suffix of the last `Verify` in a slot: keep the `keep` tokens that began at position `start`, where
+    /// `start` is the slot's position before that verify (`GpuModel::rollback`). The request holds the slot.
+    #[allow(dead_code)] // Wired into the request thread's K4v decode loop in the next milestone.
+    Rollback { slot: usize, start: usize, keep: usize, back: std::sync::mpsc::Sender<anyhow::Result<()>> },
     /// The request is done with its slot.
     Done(usize),
     /// Explicit slot save/restore/erase; answered with the JSON body of the HTTP route.
@@ -4198,8 +4263,9 @@ enum Job {
 
 /// A request's handle on the model under `--parallel`; dropping it frees the slot.
 /// `conn` is the request's connection, watched while the chat waits for a slot; `started` is when the model took
-/// the chat, after that wait.
-struct Client { tx: std::sync::mpsc::Sender<Job>, slot: Option<usize>, owner: u64, conn: Option<TcpStream>, started: Option<Instant> }
+/// the chat, after that wait. `spec` enables K4v speculative decode for this request's slot (several slots and an
+/// ngram `--spec-type`; MTP stays single-slot).
+struct Client { tx: std::sync::mpsc::Sender<Job>, slot: Option<usize>, owner: u64, conn: Option<TcpStream>, started: Option<Instant>, spec: bool }
 
 impl Client {
     fn chat(&mut self, ids: &[u32], sys: usize, keep: usize) -> anyhow::Result<(Vec<f32>, usize)> {
@@ -4260,11 +4326,64 @@ impl Client {
         self.tx.send(Job::Step { slot, token, logits, back }).map_err(|_| anyhow::anyhow!("model gone"))?;
         r.recv()?
     }
+    /// Whether this request's slot does K4v speculative decode (`Sched::run_spec`).
+    fn spec(&self) -> bool { self.spec }
+    /// Run one speculative decode step in this client's slot: the model thread drafts from `token` with the slot's
+    /// ngram drafter, verifies the draft, rolls back what the sampler rejects and answers the accepted tokens
+    /// (starting with `token`), the next token to feed and the sampler with its updated RNG/penalty state. The slot
+    /// stays held for the whole call, so no `Step` for it runs in between. If the slot has no drafter the error is
+    /// [`NoSpecDrafter`], raised before any sequence state changes: `decode` falls back to one-token steps.
+    fn spec_step(&mut self, token: u32, sampler: Sampler) -> anyhow::Result<(Vec<u32>, u32, Sampler)> {
+        let slot = self.slot.context("spec step before chat")?;
+        let (back, r) = std::sync::mpsc::channel();
+        self.tx.send(Job::SpecStep { slot, token, sampler, back }).map_err(|_| anyhow::anyhow!("model gone"))?;
+        r.recv()?
+    }
+    /// Run `tokens` through this client's slot in one verify forward (see `Job::Verify`); answers the logits of every
+    /// position, or an empty list when `logits` is false. This **advances** the slot's position and history by
+    /// `tokens.len()`; after sampling, the caller must `rollback` any rejected suffix before the next model job.
+    /// `start` for that rollback is this slot's position before the call (the request thread's count of prompt plus
+    /// accepted tokens fed so far).
+    #[allow(dead_code)] // Wired into the request thread's K4v decode loop in the next milestone.
+    fn verify(&mut self, tokens: &[u32], logits: bool) -> anyhow::Result<Vec<Vec<f32>>> {
+        let slot = self.slot.context("verify before chat")?;
+        let (back, r) = std::sync::mpsc::channel();
+        self.tx.send(Job::Verify { slot, tokens: tokens.to_vec(), logits, back }).map_err(|_| anyhow::anyhow!("model gone"))?;
+        r.recv()?
+    }
+    /// Keep only the first `keep` tokens of the verify that began at `start` in this client's slot (`keep >= 1`,
+    /// `start + keep <=` the slot's current position). Call it after sampling when the rejected draft suffix is not the
+    /// last accepted token; without it the slot's history/KV/recurrent state keeps the whole verify.
+    #[allow(dead_code)] // Wired into the request thread's K4v decode loop in the next milestone.
+    fn rollback(&mut self, start: usize, keep: usize) -> anyhow::Result<()> {
+        let slot = self.slot.context("rollback before chat")?;
+        let (back, r) = std::sync::mpsc::channel();
+        self.tx.send(Job::Rollback { slot, start, keep, back }).map_err(|_| anyhow::anyhow!("model gone"))?;
+        r.recv()?
+    }
 }
 
 impl Drop for Client {
     fn drop(&mut self) { if let Some(s) = self.slot { let _ = self.tx.send(Job::Done(s)); } }
 }
+
+/// The slot has no ngram drafter, so a `Job::SpecStep` cannot run. `Sched::run_spec` checks this before it touches the
+/// slot, so `decode` may safely retry the same token with a plain `Step`; the type lets it tell that case apart from a
+/// forward that failed after the slot had already moved.
+#[derive(Debug)]
+struct NoSpecDrafter(usize);
+
+impl std::fmt::Display for NoSpecDrafter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "slot {} has no ngram drafter (its cache was reclaimed, or `--spec-type` is off)", self.0)
+    }
+}
+
+impl std::error::Error for NoSpecDrafter {}
+
+/// Whether a request on the `--parallel` slot path uses K4v speculative decode: several slots and an ngram
+/// `--spec-type`. MTP is not enabled with several slots (`resolve_flags` forces it off), so it never reaches here.
+fn wants_parallel_spec(parallel: usize, spec_type: &str) -> bool { parallel > 1 && spec_type != "none" }
 
 /// The model thread's view of the slots under `--parallel` (`Serving::serve_slots`).
 #[derive(Default)]
@@ -4280,6 +4399,9 @@ struct Sched {
     /// Chat jobs waiting for a free slot, and decode steps waiting for a forward (since the first came).
     chats: std::collections::VecDeque<Job>,
     steps: Vec<(usize, u32, bool, std::sync::mpsc::Sender<anyhow::Result<(u32, Vec<f32>)>>)>,
+    /// Speculative `Job::Verify`/`Job::Rollback` jobs, in arrival order and apart from `steps`: `run` drains these
+    /// one at a time, synchronously, before any batched forward, so a verify never interleaves with `step_rows`.
+    spec: std::collections::VecDeque<Job>,
     since: Option<Instant>,
     /// Explicit slot operations, deferred while their slot is held or prefilling.
     controls: std::collections::VecDeque<Control>,
@@ -4290,6 +4412,23 @@ struct Sched {
 }
 
 enum Control { Action(SlotAction, std::sync::mpsc::Sender<anyhow::Result<Value>>), Info(std::sync::mpsc::Sender<anyhow::Result<Value>>) }
+
+/// Check a `Job::Verify` batch against the model's per-forward limit before the slot is touched.
+fn check_verify(nt: usize, tmax: usize) -> anyhow::Result<()> {
+    anyhow::ensure!((1..=tmax).contains(&nt), "verify: {nt} tokens (1 to {tmax})");
+    Ok(())
+}
+
+/// Check a `Job::Rollback` against the slot's current position before it is touched: `keep` must be at least one token,
+/// fit in one verify batch, and stay inside the history that ends at `pos`. `GpuModel::rollback` checks the same
+/// bounds plus its recurrent snapshots; the scheduler checks them first so an invalid job changes nothing.
+fn check_rollback(pos: usize, start: usize, keep: usize, tmax: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(keep >= 1, "rollback: keep 0 of verify at {start}");
+    anyhow::ensure!(keep <= tmax, "rollback: keep {keep} of verify at {start} (at most {tmax} tokens per verify)");
+    anyhow::ensure!(start.checked_add(keep).is_some_and(|end| end <= pos),
+        "rollback: keep {keep} of verify at {start} (pos {pos})");
+    Ok(())
+}
 
 impl Sched {
     /// How long a decode step waits for the other decoding slots' steps to share its forward.
@@ -4326,6 +4465,7 @@ impl Sched {
             match j {
                 Job::Done(s) => { self.held[s] = false; self.tick += 1; self.freed[s] = self.tick; }
                 Job::Step { slot, token, logits, back } => { self.since.get_or_insert_with(Instant::now); self.steps.push((slot, token, logits, back)); }
+                j @ (Job::Verify { .. } | Job::Rollback { .. } | Job::SpecStep { .. }) => self.spec.push_back(j),
                 Job::Slot { action, back } => self.controls.push_back(Control::Action(action, back)),
                 Job::Slots { back } => self.controls.push_back(Control::Info(back)),
                 c => self.chats.push_back(c),
@@ -4334,6 +4474,84 @@ impl Sched {
     }
 
     fn ready(&self) -> bool { self.since.is_some_and(|t| self.steps.len() >= self.decoding() || t.elapsed() >= Self::GATHER) }
+
+    /// Whether a verify/rollback is waiting (the serving loop runs the scheduler for it even with no steps queued).
+    fn spec_pending(&self) -> bool { !self.spec.is_empty() }
+
+    /// Run the queued verifies/rollbacks/spec-steps, one at a time and synchronously, before the next batched forward.
+    /// A failure goes back to its requester only: the scheduler keeps serving the other slots and a later chat
+    /// resets/reuses the failed slot as usual.
+    ///
+    /// The slot stays held by its request for the whole verify → sample → rollback sequence (`held[slot]`), so no chat
+    /// can take it and a `Client` never has a `Step` and a `Verify` in flight at once. A queued step for the same slot
+    /// would break that contract, so the job is rejected before the model runs instead of corrupting the position.
+    ///
+    /// `SpecStep` runs a whole K4v step (draft, verify, rollback, accept) for one slot, so the other slots wait for
+    /// it: phase 1 trades batched decode throughput on busy servers for a single-slot mode that reuses the existing,
+    /// tested path. `docs/PARALLEL-SPEC.md` §6 has the batched `verify_rows` follow-up.
+    fn spec_jobs(&mut self, g: &mut GpuModel) {
+        let n = self.held.len();
+        while let Some(job) = self.spec.pop_front() {
+            match job {
+                Job::Verify { slot, tokens, logits, back } => {
+                    let _ = back.send(self.run_verify(g, slot, &tokens, logits, n));
+                }
+                Job::Rollback { slot, start, keep, back } => {
+                    let _ = back.send(self.run_rollback(g, slot, start, keep, n));
+                }
+                Job::SpecStep { slot, token, sampler, back } => {
+                    let _ = back.send(self.run_spec(g, slot, token, sampler, n));
+                }
+                _ => unreachable!("only verify/rollback/spec-step jobs are queued here"),
+            }
+        }
+    }
+
+    fn run_verify(&self, g: &mut GpuModel, slot: usize, tokens: &[u32], logits: bool, n: usize)
+        -> anyhow::Result<Vec<Vec<f32>>> {
+        anyhow::ensure!(slot < n, "verify: invalid slot {slot}");
+        anyhow::ensure!(self.held[slot], "verify: slot {slot} is not held by a request");
+        anyhow::ensure!(!self.steps.iter().any(|s| s.0 == slot), "verify: slot {slot} has a queued decode step");
+        check_verify(tokens.len(), g.tmax())?;
+        g.use_slot(slot);
+        let rows = g.verify(tokens)?;
+        Ok(if logits { rows } else { vec![] })
+    }
+
+    fn run_rollback(&self, g: &mut GpuModel, slot: usize, start: usize, keep: usize, n: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(slot < n, "rollback: invalid slot {slot}");
+        anyhow::ensure!(self.held[slot], "rollback: slot {slot} is not held by a request");
+        anyhow::ensure!(!self.steps.iter().any(|s| s.0 == slot), "rollback: slot {slot} has a queued decode step");
+        check_rollback(g.slot_pos(slot), start, keep, g.tmax())?;
+        g.use_slot(slot);
+        g.rollback(start, keep)
+    }
+
+    /// One K4v speculative step for a held slot: `GpuModel::ngram_spec_step` drafts from the slot's own drafter,
+    /// verifies `[token, drafts..]`, rolls back the rejected suffix and accepts the kept tokens in that drafter (and
+    /// in the slot's history/KV). The passed sampler is moved in and returned with its RNG and penalty state advanced
+    /// exactly as the model thread used it, so the request thread's token stream stays distribution-correct.
+    ///
+    /// Every check that can fail without changing sequence state runs first; the missing-drafter case is
+    /// [`NoSpecDrafter`], which the request thread turns into the normal one-token path.
+    fn run_spec(&self, g: &mut GpuModel, slot: usize, token: u32, mut sampler: Sampler, n: usize)
+        -> anyhow::Result<(Vec<u32>, u32, Sampler)> {
+        anyhow::ensure!(slot < n, "spec step: invalid slot {slot}");
+        anyhow::ensure!(self.held[slot], "spec step: slot {slot} is not held by a request");
+        anyhow::ensure!(!self.steps.iter().any(|s| s.0 == slot), "spec step: slot {slot} has a queued decode step");
+        if !g.slot_ngram_any(slot) { return Err(anyhow::Error::new(NoSpecDrafter(slot))); }
+        g.use_slot(slot);
+        // A plain `Step` (a grammar/logit_bias reply, or the thinking-budget close tokens) advances the slot's history
+        // without telling its drafter. Re-seat a drafter that fell behind so drafting keeps using the real context;
+        // this only affects which drafts are proposed, never the accepted stream.
+        let stale = g.ngram.as_ref().is_some_and(|ng| ng.history.as_slice() != g.slot_tokens(slot));
+        if stale {
+            let hist = g.slot_tokens(slot).to_vec();
+            if let Some(ng) = g.ngram.as_mut() { ng.begin(&hist); }
+        }
+        let (toks, next) = g.ngram_spec_step(token, &mut sampler)?;
+        Ok((toks, next, sampler))
+    }
 
     /// Run queued slot-file operations whose slot is idle; keep the others for the next loop. The model thread is
     /// blocked while a save/restore streams (an explicit admin action).
@@ -4460,6 +4678,11 @@ impl Sched {
     /// (fewer graphs to capture).
     fn run(&mut self, g: &mut GpuModel) {
         g.set_active(&self.active());
+        // A verify advances its slot's position and history, so it runs alone, before the forward below; the queue is
+        // drained one job at a time (never interleaved with `step_rows`).
+        self.spec_jobs(g);
+        // A verify may have run inside the gather window: do not start the forward with only some decoding slots in.
+        if !self.ready() { return; }
         // ponytail: fixed row count from which the GEMM forward (`step_batch`) replaces the matvec one; `calibrate`
         // should measure it per model and machine. STRATA_BATCH_MIN overrides. With experts 16: below it the step of
         // `STEP_ROWS` rows, whose missed experts the CPU worker runs beside the GPU, was faster (Qwen3.6-35B-A3B, RTX 3060).
@@ -4510,6 +4733,9 @@ impl Serving {
         let (last, mut idle, mut wake) = (std::sync::Mutex::new(Instant::now()), false, None);
         let rx = self.rx.lock().unwrap();
         let n = g.slots();
+        // K4v for the request threads: several slots and an ngram `--spec-type`. The model thread owns the per-slot
+        // drafters; each `Client` just asks for `Job::SpecStep`.
+        let spec = wants_parallel_spec(e.parallel, &e.spec_type);
         // The scheduler's last-used order, kept after the scope for the shutdown checkpoint.
         let mut recency = Vec::new();
         std::thread::scope(|sc| {
@@ -4529,7 +4755,7 @@ impl Serving {
                             let (tx, tok, tpl, name, path, next, live, last) = (tx.clone(), &**tok, *tpl, name.clone(), path.clone(), &next, &live, &last);
                             sc.spawn(move || {
                                 let chat = self.wants_model(&q);
-                                let mut l = Loaded { r: Runner::Slot(Client { tx, slot: None, owner: 0, conn: None, started: None }), tok, tpl, name, path };
+                                let mut l = Loaded { r: Runner::Slot(Client { tx, slot: None, owner: 0, conn: None, started: None, spec }), tok, tpl, name, path };
                                 let mut nx = None;
                                 // A panic still gives back the counts below, so the model thread can switch models.
                                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(c, q, Some(&mut l), e, self, i, &mut nx)))
@@ -4678,7 +4904,7 @@ impl Serving {
                             let end = Instant::now() + t0.elapsed();
                             while s.decoding() > 0 && Instant::now() < end {
                                 s.take(&jobs, s.wait().min(end.saturating_duration_since(Instant::now())));
-                                if s.ready() { s.run(g); }
+                                if s.ready() || s.spec_pending() { s.run(g); }
                             }
                             t0 = Instant::now();
                             Ok(())
@@ -4722,7 +4948,7 @@ impl Serving {
                     }
                     gpu_model_stats(g, &mut self.stats.lock().unwrap());
                 }
-                if s.ready() { s.run(g); }
+                if s.ready() || s.spec_pending() { s.run(g); }
             }
             recency = s.freed.clone();
         });
@@ -5464,7 +5690,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, mut l: Option<&mu
                 Err(err) => return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})),
             };
             let n = room(e, ids.len(), req.max_tokens.unwrap_or(usize::MAX).min(s.max_tokens));
-            if n == 0 { return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("prompt of {} tokens fills the context", ids.len()), "type": "invalid_request_error"}})); }
+            if n == 0 { return send(&mut w, "400 Bad Request", json!({"error": {"message": serve::too_long(ids.len(), e.ctx), "type": "invalid_request_error"}})); }
             // The message history the prompt extends (`Runner::chat` computes the same `keep`). The archive is a
             // single-slot path here: `--parallel` chats go through `Sched`, not `Runner::Gpu`.
             let chat_history = if vision_prompt.is_none() {
@@ -5677,6 +5903,29 @@ mod interface_tests {
 #[cfg(test)]
 mod flag_tests {
     use super::{calibrated_split, resolve_flags, vram_margins};
+
+    /// K4v on the `--parallel` path needs more than one slot and an ngram `--spec-type`; `none` (the default) and
+    /// a single slot keep the old paths (single-slot ngram lives in `Runner::Gpu::ngram`).
+    #[test]
+    fn parallel_spec_needs_several_slots_and_a_drafter() {
+        assert!(!super::wants_parallel_spec(1, "ngram-map-k4v"));
+        assert!(super::wants_parallel_spec(2, "ngram-map-k4v"));
+        assert!(super::wants_parallel_spec(3, "ngram-map-k4v"));
+        assert!(super::wants_parallel_spec(3, "ngram-simple"));
+        assert!(!super::wants_parallel_spec(3, "none"));
+        // A plain one-slot server with a drafter is not the `Client` path at all.
+        assert!(!super::wants_parallel_spec(1, "none"));
+    }
+
+    /// The missing-drafter error stays recognizable across the job channel so `decode` can fall back safely.
+    #[test]
+    fn no_spec_drafter_error_downcasts() {
+        let e: anyhow::Error = anyhow::Error::new(super::NoSpecDrafter(2));
+        assert!(e.downcast_ref::<super::NoSpecDrafter>().is_some());
+        assert!(format!("{e}").contains("slot 2 has no ngram drafter"));
+        let other = anyhow::anyhow!("decode failed");
+        assert!(other.downcast_ref::<super::NoSpecDrafter>().is_none());
+    }
 
     #[test]
     fn calibrated_split_needs_the_same_devices_in_the_same_order() {
@@ -6410,5 +6659,29 @@ mod archive_shutdown_tests {
         assert!(shutdown_budget(now - Duration::from_secs(31), Duration::from_secs(30)).is_none());
         // Exactly at the deadline counts as spent: the next slot is skipped.
         assert!(shutdown_budget(now - Duration::from_millis(5), Duration::from_millis(5)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod spec_job_tests {
+    use super::{check_rollback, check_verify};
+
+    #[test]
+    fn a_verify_batch_fits_one_forward() {
+        assert!(check_verify(1, 4).is_ok());
+        assert!(check_verify(4, 4).is_ok());
+        assert!(check_verify(0, 4).is_err(), "a verify needs at least one token");
+        assert!(check_verify(5, 4).is_err(), "more tokens than the model verifies in one forward");
+    }
+
+    #[test]
+    fn a_rollback_keeps_a_nonempty_prefix_inside_the_history() {
+        // Three tokens were verified at position 10, so the slot is now at 13 (one batch is at most 4).
+        assert!(check_rollback(13, 10, 1, 4).is_ok());
+        assert!(check_rollback(13, 10, 3, 4).is_ok());
+        assert!(check_rollback(13, 10, 0, 4).is_err(), "keep must be at least one token");
+        assert!(check_rollback(13, 10, 4, 4).is_err(), "only three tokens were verified");
+        assert!(check_rollback(13, 14, 1, 4).is_err(), "start is past the history");
+        assert!(check_rollback(13, usize::MAX, 2, 4).is_err(), "an overflowing start is rejected");
     }
 }

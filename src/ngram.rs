@@ -1206,6 +1206,13 @@ impl Drop for NgramDrafter {
 mod tests {
     use super::*;
 
+    /// The per-slot storage moves drafters between slots; `NgramDrafter` must stay `Send`.
+    #[test]
+    fn ngram_drafter_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<NgramDrafter>();
+    }
+
     #[test]
     fn ngram_simple_finds_exact_match_and_respects_draft_max() {
         // Build a 100-token sequence with a repeated 30-token block.

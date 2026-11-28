@@ -95,8 +95,12 @@ layer, which removes the 65-80 ms stalls at the chunk boundaries.
   | 512 | 0.4 s | 16.4 s |
 
   Prefilled in one piece, the same prompt took 6.5 s to its first token, and the three streams stopped for all of it.
-- **MTP drafting is off** (`--mtp` is ignored). With several cards (`--device 0,1`), the slots work over the split
-  layers too (see [Several GPUs](#several-gpus)).
+- **MTP drafting is off** (`--mtp` is ignored) with `--parallel > 1`. The ngram lookup drafters
+  (`--spec-type`, including `ngram-map-k4v`) now work with parallel slots: one drafter per slot, verified one slot
+  at a time, so a draft step pauses the batched forward model-wide. On the V100/Ornith trial, a repeated-text
+  prompt went from 120.3 to 162.7 decode tok/s with identical greedy output; measure your own mix. MTP parallel
+  remains single-slot-only for now. With several cards (`--device 0,1`), the slots work over the split layers too
+  (see [Several GPUs](#several-gpus)).
 - **Conversation cache.** Each slot keeps the state of its last conversation, and a request that continues a
   conversation goes to the slot that holds it. Other conversations are parked in host memory (`--cache-ram`) as
   without `--parallel`. Keys still only reuse their own conversations.
