@@ -4209,6 +4209,16 @@ enum Job {
     Image { p: vision::Prompt, embs: Vec<Vec<Vec<f32>>>, owner: u64, gone: std::sync::Arc<std::sync::atomic::AtomicBool>, back: std::sync::mpsc::Sender<anyhow::Result<(Vec<f32>, usize, usize, Instant)>> },
     /// One decode step in a slot the request holds; answers the greedy next token and the logits if `logits`.
     Step { slot: usize, token: u32, logits: bool, back: std::sync::mpsc::Sender<anyhow::Result<(u32, Vec<f32>)>> },
+    /// Speculative verification in a slot the request holds: run `tokens` in one forward and answer the logits of each
+    /// position (an empty list when `logits` is false, though the model still verifies). Like `Step`, this advances the
+    /// slot's position and history by `tokens.len()`; the request thread then samples/accepts and sends `Rollback` for
+    /// any rejected suffix. Queued apart from `Step` so that it never shares a forward with normal decode.
+    #[allow(dead_code)] // Wired into the request thread's K4v decode loop in the next milestone.
+    Verify { slot: usize, tokens: Vec<u32>, logits: bool, back: std::sync::mpsc::Sender<anyhow::Result<Vec<Vec<f32>>>> },
+    /// Drop the suffix of the last `Verify` in a slot: keep the `keep` tokens that began at position `start`, where
+    /// `start` is the slot's position before that verify (`GpuModel::rollback`). The request holds the slot.
+    #[allow(dead_code)] // Wired into the request thread's K4v decode loop in the next milestone.
+    Rollback { slot: usize, start: usize, keep: usize, back: std::sync::mpsc::Sender<anyhow::Result<()>> },
     /// The request is done with its slot.
     Done(usize),
     /// Explicit slot save/restore/erase; answered with the JSON body of the HTTP route.
@@ -4281,6 +4291,28 @@ impl Client {
         self.tx.send(Job::Step { slot, token, logits, back }).map_err(|_| anyhow::anyhow!("model gone"))?;
         r.recv()?
     }
+    /// Run `tokens` through this client's slot in one verify forward (see `Job::Verify`); answers the logits of every
+    /// position, or an empty list when `logits` is false. This **advances** the slot's position and history by
+    /// `tokens.len()`; after sampling, the caller must `rollback` any rejected suffix before the next model job.
+    /// `start` for that rollback is this slot's position before the call (the request thread's count of prompt plus
+    /// accepted tokens fed so far).
+    #[allow(dead_code)] // Wired into the request thread's K4v decode loop in the next milestone.
+    fn verify(&mut self, tokens: &[u32], logits: bool) -> anyhow::Result<Vec<Vec<f32>>> {
+        let slot = self.slot.context("verify before chat")?;
+        let (back, r) = std::sync::mpsc::channel();
+        self.tx.send(Job::Verify { slot, tokens: tokens.to_vec(), logits, back }).map_err(|_| anyhow::anyhow!("model gone"))?;
+        r.recv()?
+    }
+    /// Keep only the first `keep` tokens of the verify that began at `start` in this client's slot (`keep >= 1`,
+    /// `start + keep <=` the slot's current position). Call it after sampling when the rejected draft suffix is not the
+    /// last accepted token; without it the slot's history/KV/recurrent state keeps the whole verify.
+    #[allow(dead_code)] // Wired into the request thread's K4v decode loop in the next milestone.
+    fn rollback(&mut self, start: usize, keep: usize) -> anyhow::Result<()> {
+        let slot = self.slot.context("rollback before chat")?;
+        let (back, r) = std::sync::mpsc::channel();
+        self.tx.send(Job::Rollback { slot, start, keep, back }).map_err(|_| anyhow::anyhow!("model gone"))?;
+        r.recv()?
+    }
 }
 
 impl Drop for Client {
@@ -4301,6 +4333,9 @@ struct Sched {
     /// Chat jobs waiting for a free slot, and decode steps waiting for a forward (since the first came).
     chats: std::collections::VecDeque<Job>,
     steps: Vec<(usize, u32, bool, std::sync::mpsc::Sender<anyhow::Result<(u32, Vec<f32>)>>)>,
+    /// Speculative `Job::Verify`/`Job::Rollback` jobs, in arrival order and apart from `steps`: `run` drains these
+    /// one at a time, synchronously, before any batched forward, so a verify never interleaves with `step_rows`.
+    spec: std::collections::VecDeque<Job>,
     since: Option<Instant>,
     /// Explicit slot operations, deferred while their slot is held or prefilling.
     controls: std::collections::VecDeque<Control>,
@@ -4311,6 +4346,23 @@ struct Sched {
 }
 
 enum Control { Action(SlotAction, std::sync::mpsc::Sender<anyhow::Result<Value>>), Info(std::sync::mpsc::Sender<anyhow::Result<Value>>) }
+
+/// Check a `Job::Verify` batch against the model's per-forward limit before the slot is touched.
+fn check_verify(nt: usize, tmax: usize) -> anyhow::Result<()> {
+    anyhow::ensure!((1..=tmax).contains(&nt), "verify: {nt} tokens (1 to {tmax})");
+    Ok(())
+}
+
+/// Check a `Job::Rollback` against the slot's current position before it is touched: `keep` must be at least one token,
+/// fit in one verify batch, and stay inside the history that ends at `pos`. `GpuModel::rollback` checks the same
+/// bounds plus its recurrent snapshots; the scheduler checks them first so an invalid job changes nothing.
+fn check_rollback(pos: usize, start: usize, keep: usize, tmax: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(keep >= 1, "rollback: keep 0 of verify at {start}");
+    anyhow::ensure!(keep <= tmax, "rollback: keep {keep} of verify at {start} (at most {tmax} tokens per verify)");
+    anyhow::ensure!(start.checked_add(keep).is_some_and(|end| end <= pos),
+        "rollback: keep {keep} of verify at {start} (pos {pos})");
+    Ok(())
+}
 
 impl Sched {
     /// How long a decode step waits for the other decoding slots' steps to share its forward.
@@ -4347,6 +4399,7 @@ impl Sched {
             match j {
                 Job::Done(s) => { self.held[s] = false; self.tick += 1; self.freed[s] = self.tick; }
                 Job::Step { slot, token, logits, back } => { self.since.get_or_insert_with(Instant::now); self.steps.push((slot, token, logits, back)); }
+                j @ (Job::Verify { .. } | Job::Rollback { .. }) => self.spec.push_back(j),
                 Job::Slot { action, back } => self.controls.push_back(Control::Action(action, back)),
                 Job::Slots { back } => self.controls.push_back(Control::Info(back)),
                 c => self.chats.push_back(c),
@@ -4355,6 +4408,51 @@ impl Sched {
     }
 
     fn ready(&self) -> bool { self.since.is_some_and(|t| self.steps.len() >= self.decoding() || t.elapsed() >= Self::GATHER) }
+
+    /// Whether a verify/rollback is waiting (the serving loop runs the scheduler for it even with no steps queued).
+    fn spec_pending(&self) -> bool { !self.spec.is_empty() }
+
+    /// Run the queued verifies/rollbacks, one at a time and synchronously, before the next batched forward. A failure
+    /// goes back to its requester only: the scheduler keeps serving the other slots and a later chat resets/reuses the
+    /// failed slot as usual.
+    ///
+    /// The slot stays held by its request for the whole verify → sample → rollback sequence (`held[slot]`), so no chat
+    /// can take it and a `Client` never has a `Step` and a `Verify` in flight at once. A queued step for the same slot
+    /// would break that contract, so the job is rejected before the model runs instead of corrupting the position.
+    fn spec_jobs(&mut self, g: &mut GpuModel) {
+        let n = self.held.len();
+        while let Some(job) = self.spec.pop_front() {
+            match job {
+                Job::Verify { slot, tokens, logits, back } => {
+                    let _ = back.send(self.run_verify(g, slot, &tokens, logits, n));
+                }
+                Job::Rollback { slot, start, keep, back } => {
+                    let _ = back.send(self.run_rollback(g, slot, start, keep, n));
+                }
+                _ => unreachable!("only verify/rollback jobs are queued here"),
+            }
+        }
+    }
+
+    fn run_verify(&self, g: &mut GpuModel, slot: usize, tokens: &[u32], logits: bool, n: usize)
+        -> anyhow::Result<Vec<Vec<f32>>> {
+        anyhow::ensure!(slot < n, "verify: invalid slot {slot}");
+        anyhow::ensure!(self.held[slot], "verify: slot {slot} is not held by a request");
+        anyhow::ensure!(!self.steps.iter().any(|s| s.0 == slot), "verify: slot {slot} has a queued decode step");
+        check_verify(tokens.len(), g.tmax())?;
+        g.use_slot(slot);
+        let rows = g.verify(tokens)?;
+        Ok(if logits { rows } else { vec![] })
+    }
+
+    fn run_rollback(&self, g: &mut GpuModel, slot: usize, start: usize, keep: usize, n: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(slot < n, "rollback: invalid slot {slot}");
+        anyhow::ensure!(self.held[slot], "rollback: slot {slot} is not held by a request");
+        anyhow::ensure!(!self.steps.iter().any(|s| s.0 == slot), "rollback: slot {slot} has a queued decode step");
+        check_rollback(g.slot_pos(slot), start, keep, g.tmax())?;
+        g.use_slot(slot);
+        g.rollback(start, keep)
+    }
 
     /// Run queued slot-file operations whose slot is idle; keep the others for the next loop. The model thread is
     /// blocked while a save/restore streams (an explicit admin action).
@@ -4481,6 +4579,11 @@ impl Sched {
     /// (fewer graphs to capture).
     fn run(&mut self, g: &mut GpuModel) {
         g.set_active(&self.active());
+        // A verify advances its slot's position and history, so it runs alone, before the forward below; the queue is
+        // drained one job at a time (never interleaved with `step_rows`).
+        self.spec_jobs(g);
+        // A verify may have run inside the gather window: do not start the forward with only some decoding slots in.
+        if !self.ready() { return; }
         // ponytail: fixed row count from which the GEMM forward (`step_batch`) replaces the matvec one; `calibrate`
         // should measure it per model and machine. STRATA_BATCH_MIN overrides. With experts 16: below it the step of
         // `STEP_ROWS` rows, whose missed experts the CPU worker runs beside the GPU, was faster (Qwen3.6-35B-A3B, RTX 3060).
@@ -4699,7 +4802,7 @@ impl Serving {
                             let end = Instant::now() + t0.elapsed();
                             while s.decoding() > 0 && Instant::now() < end {
                                 s.take(&jobs, s.wait().min(end.saturating_duration_since(Instant::now())));
-                                if s.ready() { s.run(g); }
+                                if s.ready() || s.spec_pending() { s.run(g); }
                             }
                             t0 = Instant::now();
                             Ok(())
@@ -4743,7 +4846,7 @@ impl Serving {
                     }
                     gpu_model_stats(g, &mut self.stats.lock().unwrap());
                 }
-                if s.ready() { s.run(g); }
+                if s.ready() || s.spec_pending() { s.run(g); }
             }
             recency = s.freed.clone();
         });
@@ -6431,5 +6534,29 @@ mod archive_shutdown_tests {
         assert!(shutdown_budget(now - Duration::from_secs(31), Duration::from_secs(30)).is_none());
         // Exactly at the deadline counts as spent: the next slot is skipped.
         assert!(shutdown_budget(now - Duration::from_millis(5), Duration::from_millis(5)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod spec_job_tests {
+    use super::{check_rollback, check_verify};
+
+    #[test]
+    fn a_verify_batch_fits_one_forward() {
+        assert!(check_verify(1, 4).is_ok());
+        assert!(check_verify(4, 4).is_ok());
+        assert!(check_verify(0, 4).is_err(), "a verify needs at least one token");
+        assert!(check_verify(5, 4).is_err(), "more tokens than the model verifies in one forward");
+    }
+
+    #[test]
+    fn a_rollback_keeps_a_nonempty_prefix_inside_the_history() {
+        // Three tokens were verified at position 10, so the slot is now at 13 (one batch is at most 4).
+        assert!(check_rollback(13, 10, 1, 4).is_ok());
+        assert!(check_rollback(13, 10, 3, 4).is_ok());
+        assert!(check_rollback(13, 10, 0, 4).is_err(), "keep must be at least one token");
+        assert!(check_rollback(13, 10, 4, 4).is_err(), "only three tokens were verified");
+        assert!(check_rollback(13, 14, 1, 4).is_err(), "start is past the history");
+        assert!(check_rollback(13, usize::MAX, 2, 4).is_err(), "an overflowing start is rejected");
     }
 }
