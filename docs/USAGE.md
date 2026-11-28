@@ -135,7 +135,8 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   it to how many drafts are accepted.
 - `--spec-type LIST` drafts from text that is already in the context, with no draft model: a comma-separated
   list of `suffix`, `ngram-simple`, `ngram-map-k`, `ngram-map-k4v`, `ngram-mod`, `ngram-cache`. It works with
-  `--parallel > 1` (one drafter per slot, verified one slot at a time; MTP itself stays single-slot). It pays on
+  `--parallel > 1` (one drafter per slot, verified one slot at a time; `--mtp` also works there and combines with
+  the lookup in the hybrid path). It pays on
   output that repeats the prompt (code edits, quoting, structured data). It combines with `--mtp`,
   `--mtp-model` and `--draft-model`: the lookup drafts when it finds a match (next to a DFlash draft, only on a
   long match) and the model drafts otherwise.

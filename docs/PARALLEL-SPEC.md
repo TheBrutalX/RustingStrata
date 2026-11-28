@@ -1,6 +1,6 @@
 # Parallel speculative decoding (MTP and K4v)
 
-**Status: K4v implemented for `--parallel > 1`; MTP parallel is still pending.** Today `--parallel > 1` disables both MTP (`--mtp`) and the ngram
+**Status: K4v and MTP implemented for `--parallel > 1` (serial speculative path).** Today `--parallel > 1` disables both MTP (`--mtp`) and the ngram
 drafter (`--spec-type ngram-map-k4v`): `resolve_flags` forces the draft count to 0, and `Engine::load` only attaches
 `NgramDrafter` when `parallel <= 1`. Batched decode (`step_rows`) has no path that verifies draft tokens for several
 slots.
@@ -180,10 +180,32 @@ Three concurrent requests all returned 200; the spec run logs one accepted-draft
 drafted. This is phase 1: one speculative slot at a time, so aggregate throughput under heavy concurrency still
 needs a benchmark against the batched non-spec path.
 
-MTP parallel is the next phase: the MTP head's `saved_x`/`pend`/`pos` is still a single sequence and `use_slot`
-does not swap it; `resolve_flags` still forces MTP off when `parallel > 1`.
+## 11. MTP result (phase 2)
 
-## 11. Acceptance
+Landed on `feat/parallel-mtp`:
+
+- the MTP head's scalar state is per slot (`saved_x`, `pos`, `pend`, adapt window/skip, shortlist flags); its
+  per-layer K/V caches were already per slot;
+- `resolve_flags` allows `--mtp` with `parallel > 1`; `Engine::load` threads `k` through `load_slots_kv_mtp`;
+- `Job::SpecStep` carries the hidden `row`; the scheduler calls `g.spec_step` for MTP and `hybrid_spec_step` when both
+  MTP and an ngram drafter are present; normal `Step`s run serially when `mtp_active()`, because the batched path
+  rejects the head;
+- `mtp_active()` is tail-aware for a layer split.
+
+Measured on the same V100/Ornith repeated-text prompt, 96 greedy tokens:
+
+| run | decode | drafts |
+|---|---:|---:|
+| no spec | 120.2 tok/s | - |
+| MTP `--mtp 2` | 155.1 tok/s | 53/88 (60.2%) |
+| K4v (`ngram-map-k4v`) | 162.7 tok/s | 34/34 (100%) |
+| MTP + K4v hybrid | **176.5 tok/s** | ngram 56/80 (70%) |
+
+All replies were byte-identical to the no-spec run. Three concurrent MTP requests with `parallel 3` all returned
+200; the per-slot state survived the switch. The speculative slot is processed serially (phase 1): batched decode
+pauses for the verify, so aggregate throughput under many simultaneous streams still needs a dedicated benchmark.
+
+## 12. Acceptance
 
 - K4v works with `parallel 3`, produces the same tokens as non-spec, and improves decode tok/s for a
   draft-friendly conversation.
